@@ -10,6 +10,7 @@ import {
   markLaunchStarted,
   resolveLaunch,
   sessionsOn,
+  slotsOn,
   unresolvedLaunches,
   hasLaunchRecordFor,
   restoreAttemptCount,
@@ -161,7 +162,7 @@ describe("Constraint 1: a listing failure makes the whole cycle a no-op", () => 
 });
 
 describe("the full silent-restore lifecycle", () => {
-  test("an on-record session absent from a successful listing is restored via --resume, then its rotated session id is learned and recorded on the next cycle", async () => {
+  test("an on-record session absent from a successful listing is restored via --resume of its DURABLE id, which never changes; only the live id updates once a listing reveals it (fixed after live review — see session-slots.ts's own module comment)", async () => {
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
     await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
@@ -187,7 +188,7 @@ describe("the full silent-restore lifecycle", () => {
       expect(sessionsOn(afterCycle1.state, key)).toEqual(["old-session-id"]);
     }
 
-    // Cycle 2: the listing now includes the launched short id -> the pending launch resolves, replacing the old id with the rotated one. The rotated session has no pid yet (matches measurement 3), so it is "not-verifiable" and is correctly NOT restored again.
+    // Cycle 2: the listing now includes the launched short id -> the pending launch resolves, learning the LIVE id. The durable id (what --resume takes) is UNCHANGED — this is the actual fix; before it, the durable id was overwritten with the rotated one, which the live review found could itself be unresumable. The rotated session has no pid yet (matches measurement 3), so it is "not-verifiable" and is correctly NOT restored again.
     const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, sessionSlotsDegraded: result1.sessionSlotsDegraded }, deps);
     expect(result2.restored).toEqual([]);
     expect(fake.listing).toHaveLength(1); // no second launch
@@ -195,8 +196,10 @@ describe("the full silent-restore lifecycle", () => {
     const afterCycle2 = await loadSlots(join(dir, "session-slots.json"));
     expect(afterCycle2.status).toBe("loaded");
     if (afterCycle2.status === "loaded") {
-      expect(sessionsOn(afterCycle2.state, key)).toEqual([fake.listing[0]!.sessionId]);
-      expect(sessionsOn(afterCycle2.state, key)).not.toContain("old-session-id");
+      // Durable id (what a future --resume would use) is untouched.
+      expect(sessionsOn(afterCycle2.state, key)).toEqual(["old-session-id"]);
+      // But the live id used for liveness checks now reflects the listing.
+      expect(slotsOn(afterCycle2.state, key)).toEqual([{ durableSessionId: "old-session-id", liveSessionId: fake.listing[0]!.sessionId }]);
     }
   });
 
@@ -226,6 +229,77 @@ describe("the full silent-restore lifecycle", () => {
     const result = await runReconcileCycle(initialDaemonState(), deps);
     expect(result.restored).toEqual([]);
     expect(launchCalls).toBe(0);
+  });
+});
+
+describe("regression (BAKR-12 PR #9 review): the daemon must always resume the DURABLE id, never a rotated live id that may itself be unresumable", () => {
+  test("reproduces the live incident: resuming the ROTATED id fails ('No conversation found'), resuming the ORIGINAL durable id keeps succeeding — the daemon must always pass the durable id to --resume, across every restore cycle", async () => {
+    const dir = await makeTempDir();
+    const key = "/claimed/dir" as ClaimKey;
+    await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
+    const DURABLE_ID = "03df9926-durable-conversation";
+    let slots = emptySessionSlots();
+    slots = beginLaunch(slots, key, undefined, "seed-attempt", 1);
+    slots = markLaunchStarted(slots, "seed-attempt", "seed-short");
+    slots = resolveLaunch(slots, "seed-short", DURABLE_ID);
+    await saveSlots(join(dir, "session-slots.json"), slots);
+
+    // Models the reviewer's exact live trace: --resume <DURABLE_ID> always
+    // succeeds and rotates to a fresh live id; --resume of anything ELSE
+    // (i.e. a rotated id, if the daemon mistakenly tried to resume one)
+    // fails outright, exactly like their observed
+    // "exit 1 before init — No conversation found" job state. The rotated
+    // session never sticks around in the listing (as in the earlier
+    // convergence-bound test), so every cycle looks like "absent" and
+    // triggers another restore attempt.
+    const launchArgvs: string[][] = [];
+    let rotationCounter = 0;
+    let pendingEntry: { id: string; sessionId: string } | undefined;
+    const runCommand = async (argv: string[]) => {
+      if (argv[0] === "claude" && argv[1] === "agents") {
+        const listing = pendingEntry
+          ? [{ id: pendingEntry.id, sessionId: pendingEntry.sessionId, cwd: key, startedAt: 1, kind: "background" }]
+          : [];
+        pendingEntry = undefined;
+        return { exitCode: 0, stdout: JSON.stringify(listing), stderr: "" };
+      }
+      if (argv[0] === "systemd-run") {
+        launchArgvs.push(argv);
+        const resumeIdx = argv.indexOf("--resume");
+        const resumedId = resumeIdx === -1 ? undefined : argv[resumeIdx + 1];
+        if (resumedId !== DURABLE_ID) {
+          // The exact failure the reviewer observed when the daemon (pre-fix) resumed a rotated id instead of the durable one.
+          return { exitCode: 1, stdout: "", stderr: `exit 1 before init — No conversation found with session ID: ${resumedId}` };
+        }
+        rotationCounter += 1;
+        const shortId = `short-${rotationCounter}`;
+        const rotatedId = `rotated-${rotationCounter}`;
+        pendingEntry = { id: shortId, sessionId: rotatedId };
+        return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
+      }
+      throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
+    };
+
+    const deps = baseDeps(dir, runCommand);
+    let state = initialDaemonState();
+    for (let i = 0; i < 8; i++) {
+      const result = await runReconcileCycle(state, deps);
+      state = { claimDegraded: result.claimDegraded, sessionSlotsDegraded: result.sessionSlotsDegraded };
+    }
+
+    // Every single launch attempt resumed the DURABLE id — never a rotated one.
+    expect(launchArgvs.length).toBeGreaterThan(0);
+    for (const argv of launchArgvs) {
+      const resumeIdx = argv.indexOf("--resume");
+      expect(argv[resumeIdx + 1]).toBe(DURABLE_ID);
+    }
+
+    // The durable id on record is still exactly the original — never overwritten with a rotated (and here, unresumable-if-tried) id.
+    const finalState = await loadSlots(join(dir, "session-slots.json"));
+    expect(finalState.status).toBe("loaded");
+    if (finalState.status === "loaded") {
+      expect(sessionsOn(finalState.state, key)).toEqual([DURABLE_ID]);
+    }
   });
 });
 

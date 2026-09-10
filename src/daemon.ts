@@ -23,7 +23,7 @@ import { list as listClaims, emptyStore, type ClaimStoreState } from "./claim-mo
 import { load as loadSlots, save as saveSlots } from "./session-slots-store";
 import {
   emptySessionSlots,
-  sessionsOn,
+  slotsOn,
   beginLaunch,
   markLaunchStarted,
   markLaunchFailed,
@@ -215,7 +215,10 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
     if (found === undefined) continue; // not listed yet — try again next cycle
     sessionSlotsState = resolveLaunch(sessionSlotsState, pending.launchShortId, found.sessionId);
     slotsChangedThisPass = true;
-    log("info", `resolved launch attempt ${pending.attemptId} for "${pending.key}": short id ${pending.launchShortId} -> session ${found.sessionId}`);
+    log(
+      "info",
+      `resolved launch attempt ${pending.attemptId} for "${pending.key}": short id ${pending.launchShortId} -> live session ${found.sessionId}${pending.priorSessionId !== undefined ? ` (durable id ${pending.priorSessionId} unchanged)` : " (new slot)"}`
+    );
   }
 
   for (const unresolved of unresolvedLaunches(sessionSlotsState)) {
@@ -234,19 +237,25 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   const restored: { key: ClaimKey; sessionId: string }[] = [];
   for (const claimEntry of listClaims(claimState)) {
     const key = claimEntry.key;
-    for (const sessionId of sessionsOn(sessionSlotsState, key)) {
+    for (const slot of slotsOn(sessionSlotsState, key)) {
+      const sessionId = slot.durableSessionId; // what --resume always takes, and what identifies this slot across its whole life (see session-slots.ts's own module comment on why this is split from liveSessionId)
       if (hasLaunchRecordFor(sessionSlotsState, key, sessionId)) {
-        // A launch for exactly this session is already in flight (pending
-        // resolution) or permanently unresolved (Constraint 2) — either
-        // way, `onByKey` will not change until that record resolves, so
-        // without this guard every cycle in between would look identical
-        // to "never restored" and attempt a duplicate launch. Already
-        // logged above (pendingLaunches / unresolvedLaunches loops).
+        // A launch for exactly this DURABLE session is already in flight
+        // (pending resolution) or permanently unresolved (Constraint 2) —
+        // either way, the slot will not change until that record
+        // resolves, so without this guard every cycle in between would
+        // look identical to "never restored" and attempt a duplicate
+        // launch. Already logged above (pendingLaunches / unresolvedLaunches
+        // loops).
         continue;
       }
-      const entry = sessions.find((s) => s.sessionId === sessionId);
+      // Liveness is checked against the LIVE id (the last one a listing
+      // actually reported), never the durable one — a listing reports
+      // claude's current, possibly-rotated session id, not the
+      // conversation's own stable identity.
+      const entry = sessions.find((s) => s.sessionId === slot.liveSessionId);
       const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
-      const verdict = decideLiveness(sessionId, entry, pidVerifiedAlive);
+      const verdict = decideLiveness(slot.liveSessionId, entry, pidVerifiedAlive);
 
       if (verdict.status === "alive") {
         if (restoreAttemptCount(sessionSlotsState, key) > 0) {
@@ -271,14 +280,18 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       // BUT: a resume can "succeed" at the `launch()` surface — exit 0,
       // print an ordinary `backgrounded · <id>` line — while actually being
       // the ticket's own measurement 5: a silent, empty session with no
-      // real conversation. `resolveLaunch` cannot tell the difference (see
-      // its own doc), so it faithfully rotates `onByKey` to that new,
-      // equally-phantom id — which is *also* absent next cycle (no pid, no
-      // real content), triggering another "restore", forever. Live
-      // incident: BAKR-12 PR #7 review round 3, ~180 spawns/hour observed
-      // for one stuck slot before this bound existed. `hasLaunchRecordFor`
-      // above cannot see this loop — it matches on `(key, priorSessionId)`,
-      // and the id is different every cycle.
+      // real conversation. Before the durable/live split (session-slots.ts's
+      // own module comment), `resolveLaunch` could not tell the difference
+      // and overwrote the on-record id with the just-rotated, possibly-
+      // unresumable one — live incident, BAKR-12 PR #9: resuming that
+      // rotated id then failed outright ("No conversation found"), so the
+      // slot became permanently unrestorable by the very act of a
+      // "successful" restore, and the next cycle's "absent" reading
+      // relaunched it again, forever. `durableSessionId` no longer moves,
+      // which fixes the identity half of this; this bound is the
+      // convergence half, kept as an independent line of defence because a
+      // resume can still keep failing for a durable id too (measurement 5
+      // doesn't say why, and neither do we).
       //
       // The bound: after MAX_CONSECUTIVE_UNVERIFIED_RESTORES restore
       // attempts for this KEY (not this session id — see
@@ -319,7 +332,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       const result = await launch(key, ["--resume", sessionId], { runCommand: deps.runCommand });
       if (result.ok) {
         sessionSlotsState = markLaunchStarted(sessionSlotsState, attemptId, result.id);
-        log("info", `"${key}": restore launched for session ${sessionId} -> short id ${result.id}; awaiting a future listing to learn its rotated session id`);
+        log("info", `"${key}": restore launched, resuming durable session ${sessionId} -> short id ${result.id}; awaiting a future listing to learn its (possibly-rotated) live session id`);
         restored.push({ key, sessionId });
       } else {
         sessionSlotsState = markLaunchFailed(sessionSlotsState, attemptId, result.error);

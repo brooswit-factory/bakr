@@ -76,12 +76,20 @@ ever submitted on restore.
 answer to "which claude session ids should be running in this claimed
 directory" — deliberately NOT `claim-model.ts`'s `agentIds` field (which
 ships no mutator, on purpose, and stays that way). Anonymous slots only: no
-names, no on/off/archive/rename verbs, no per-agent metadata beyond the
-session id itself and the bookkeeping needed to survive a crash mid-launch
-(see the module's own comment on `LaunchRecord`). Persisted at
+names, no on/off/archive/rename verbs, no per-agent metadata beyond two
+raw identities per slot and the bookkeeping needed to survive a crash
+mid-launch (see the module's own comment on `LaunchRecord`). Persisted at
 `$XDG_STATE_HOME/bakr/session-slots.json`, alongside `claims.json`, with
 the identical missing/malformed/loaded discipline the claim store uses
 (see "The three constraints" below).
+
+**Two ids per slot, not one** — found necessary live: a `durableSessionId`
+(the only thing `--resume` can reliably take, fixed for the slot's whole
+life) and a `liveSessionId` (the ephemeral id a listing reports right now,
+used only to check liveness). Conflating the two into one field is what
+let an earlier build overwrite a slot's resumable identity with a just-
+rotated id that could itself fail to resume — see `session-slots.ts`'s own
+module comment for the live trace that found this.
 
 ## The three constraints this story had to rule on
 
