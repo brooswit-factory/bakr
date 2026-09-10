@@ -19,13 +19,41 @@ if [[ ! -f "$UNIT_SRC" ]]; then
   exit 1
 fi
 
+# BAKR-13 (review of PR #10, defect 3): the unit's ExecStart is a template
+# (see systemd/bakr.service's own comment) — %h alone cannot express "this
+# clone's location" or "this install's bun", so both must be resolved and
+# substituted HERE, into the copy actually written, never left for the
+# reader to fill in and never left as the one clone path this repo happens
+# to have been scaffolded at.
+ENTRY_POINT="$REPO_ROOT/src/index.ts"
+BUN_PATH="$(command -v bun || true)"
+
+# Refuse loudly rather than install a unit whose ExecStart cannot possibly
+# run — this is the exact failure the review demonstrated: the previous
+# installer copied the unit verbatim, never checked ExecStart resolved, and
+# reported success anyway while the installed unit could only ever fail at
+# boot (Restart=on-failure retrying it every 5s, forever).
+if [[ -z "$BUN_PATH" ]]; then
+  echo "error: no \`bun\` found on PATH — cannot resolve the ExecStart this unit needs; install bun and re-run" >&2
+  exit 1
+fi
+if [[ ! -f "$ENTRY_POINT" ]]; then
+  echo "error: ExecStart target does not exist: $ENTRY_POINT — refusing to install a unit that cannot start" >&2
+  exit 1
+fi
+
 mkdir -p "$UNIT_DEST_DIR"
 
-if [[ -f "$UNIT_DEST" ]] && cmp -s "$UNIT_SRC" "$UNIT_DEST"; then
+RENDERED_UNIT="$(sed \
+  -e "s|@@BUN_PATH@@|$BUN_PATH|g" \
+  -e "s|@@REPO_ROOT@@|$REPO_ROOT|g" \
+  "$UNIT_SRC")"
+
+if [[ -f "$UNIT_DEST" ]] && [[ "$RENDERED_UNIT" == "$(cat "$UNIT_DEST")" ]]; then
   echo "unit already installed and up to date: $UNIT_DEST"
 else
-  cp "$UNIT_SRC" "$UNIT_DEST"
-  echo "installed unit: $UNIT_SRC -> $UNIT_DEST"
+  printf '%s\n' "$RENDERED_UNIT" > "$UNIT_DEST"
+  echo "installed unit: $UNIT_SRC -> $UNIT_DEST (ExecStart resolved to: $BUN_PATH run $ENTRY_POINT)"
 fi
 
 systemctl --user daemon-reload

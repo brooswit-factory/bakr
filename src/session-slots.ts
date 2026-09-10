@@ -100,33 +100,46 @@ export interface SessionSlotsState {
   readonly onByKey: { readonly [key: string]: readonly Slot[] };
   readonly launches: readonly LaunchRecord[];
   /**
-   * Consecutive restore attempts for a claimed directory that have not yet
-   * produced a verifiably-alive session — keyed by directory rather than by
-   * session id, for the same churn reason the module comment above
-   * explains for `Slot` itself: even with the durable/live split, a
-   * directory-keyed counter is the more robust bound (it survives any
-   * churn in either id) and it is what the story's own review asked for.
+   * Consecutive restore attempts that have not yet produced a
+   * verifiably-alive session — keyed by the slot's own DURABLE session id,
+   * NOT by claimed directory (BAKR-13, review of PR #10, defect 1).
+   *
+   * Directory-keying was the original design and its own doc comment
+   * justified it as surviving "churn in either id." That reason expired
+   * with BAKR-12 PR #9's durable/live split: the durable id no longer
+   * churns, so there is nothing left for directory-keying to defend
+   * against, and it has an active cost instead — a directory holding one
+   * healthy slot and one whose resume keeps silently failing shares ONE
+   * counter, so the healthy slot's every-cycle "verified alive" reset the
+   * failing slot's count before it could ever reach the bound, and the
+   * unbounded spawn loop this counter exists to stop came back. Keying by
+   * durable session id instead gives each slot its own independent budget:
+   * a sibling's liveness can only reset ITS OWN entry, never a failing
+   * slot's.
    */
-  readonly restoreAttemptCounts: { readonly [key: string]: number };
+  readonly restoreAttemptCounts: { readonly [durableSessionId: string]: number };
 }
 
 export function emptySessionSlots(): SessionSlotsState {
   return { onByKey: {}, launches: [], restoreAttemptCounts: {} };
 }
 
-export function restoreAttemptCount(state: SessionSlotsState, key: ClaimKey): number {
-  return state.restoreAttemptCounts[key] ?? 0;
+export function restoreAttemptCount(state: SessionSlotsState, durableSessionId: string): number {
+  return state.restoreAttemptCounts[durableSessionId] ?? 0;
 }
 
-export function recordRestoreAttempt(state: SessionSlotsState, key: ClaimKey): SessionSlotsState {
-  return { ...state, restoreAttemptCounts: { ...state.restoreAttemptCounts, [key]: restoreAttemptCount(state, key) + 1 } };
+export function recordRestoreAttempt(state: SessionSlotsState, durableSessionId: string): SessionSlotsState {
+  return {
+    ...state,
+    restoreAttemptCounts: { ...state.restoreAttemptCounts, [durableSessionId]: restoreAttemptCount(state, durableSessionId) + 1 },
+  };
 }
 
-/** Called once a session for `key` is independently verified alive — the saga that bounded retry exists to interrupt is over, so the next genuine failure gets the full budget again. A no-op (not merely harmless, structurally absent from the object) when there is nothing to reset. */
-export function resetRestoreAttempts(state: SessionSlotsState, key: ClaimKey): SessionSlotsState {
-  if (!(key in state.restoreAttemptCounts)) return state;
+/** Called once the slot identified by `durableSessionId` is independently verified alive — the saga that bounded retry exists to interrupt is over, so the next genuine failure gets the full budget again. A no-op (not merely harmless, structurally absent from the object) when there is nothing to reset. Resetting by durable session id (not by directory) means a sibling slot's own reset can never touch this one's count. */
+export function resetRestoreAttempts(state: SessionSlotsState, durableSessionId: string): SessionSlotsState {
+  if (!(durableSessionId in state.restoreAttemptCounts)) return state;
   const restoreAttemptCounts = { ...state.restoreAttemptCounts };
-  delete restoreAttemptCounts[key];
+  delete restoreAttemptCounts[durableSessionId];
   return { ...state, restoreAttemptCounts };
 }
 
@@ -234,13 +247,21 @@ export function beginLaunch(
   now: number
 ): SessionSlotsState {
   const record: LaunchRecord = { attemptId, key, priorSessionId, attemptedAt: now, launchShortId: undefined, error: undefined };
-  const withRecord = { ...state, launches: [...state.launches, record] };
-  // A FRESH launch (no priorSessionId — never the daemon's own restore
-  // path, which always resumes a specific durable id) is a deliberate new
-  // registration for this directory, e.g. via the demo harness. It gets a
-  // clean retry budget rather than inheriting an exhausted count left by an
-  // earlier, unrelated restore saga for the same key.
-  return priorSessionId === undefined ? resetRestoreAttempts(withRecord, key) : withRecord;
+  // Under the old directory-keyed counter, a FRESH launch (no
+  // priorSessionId — never the daemon's own restore path, which always
+  // resumes a specific durable id) reset the counter for this directory, so
+  // a deliberate new registration (e.g. via the demo harness) would not
+  // inherit an exhausted count left by an earlier, unrelated restore saga
+  // for the same directory. Now that `restoreAttemptCounts` is keyed by
+  // DURABLE session id (BAKR-13, defect 1) that reasoning no longer
+  // applies, and applying it as written would be actively wrong: `key`
+  // here is a claimed directory, not a session id, so resetting by it
+  // would touch the wrong map entry entirely (or none). A fresh launch
+  // also has no durable id yet to key a count by — the slot it will
+  // become does not exist until `resolveLaunch` creates it — so there is
+  // nothing for a fresh launch to reset in the first place; it starts at
+  // zero by construction, same as any session id never before seen.
+  return { ...state, launches: [...state.launches, record] };
 }
 
 function updateLaunch(state: SessionSlotsState, attemptId: string, update: (record: LaunchRecord) => LaunchRecord): SessionSlotsState {
@@ -431,6 +452,19 @@ export function parseSessionSlotsState(source: string): ParseResult {
   // freeze writes until a human hand-edits the file. A PRESENT-but-wrong
   // value (not an object of numbers) is still rejected as malformed below
   // — this is a default for absence, not a loosening of the shape check.
+  //
+  // BAKR-13 (defect 1) rekeyed this map's semantics from claimed-directory
+  // to durable-session-id, but not its WIRE SHAPE — still `{ [string]:
+  // number }` either way, so this parser needs no change and a store
+  // written by the pre-BAKR-13 code loads exactly as it did before. Its
+  // old directory-keyed entries simply never match a durable session id
+  // going forward (a claimed directory path and a claude session id look
+  // nothing alike), so they sit inert — read once, never written back
+  // out under their old key, never causing a parse error — until this
+  // process's own writes eventually replace the whole file. This is
+  // conservative, not lossy: the practical effect is that any in-progress
+  // restore saga at upgrade time gets a fresh budget, the same safe
+  // direction `missing` already takes for a first run.
   const restoreAttemptCountsField = isPlainObject(parsed) ? parsed["restoreAttemptCounts"] : undefined;
   const onByKeyRaw = isPlainObject(parsed) ? parsed["onByKey"] : undefined;
   const onByKeyShapeOk = isPlainObject(onByKeyRaw) && Object.values(onByKeyRaw).every((v) => Array.isArray(v));

@@ -38,14 +38,33 @@ NOT do yet" below).
 ## Running the daemon
 
 ```
-bun run scripts/install.sh   # idempotent: installs the unit, enables it, enables linger
+./scripts/install.sh   # idempotent: installs the unit, enables it, enables linger
 systemctl --user start bakr.service
 journalctl --user -u bakr.service   # NOT the system-level journalctl — see below
 ```
 
+`scripts/install.sh` is a **bash** script (already executable in this repo,
+`chmod 755`) — `bun run scripts/install.sh` does NOT work: `bun run` hands a
+`.sh` file to Bun's own shell, not bash, and this script uses bash-only
+syntax (`set -euo pipefail`, `${BASH_SOURCE[0]}`, `[[ ]]`), so it fails
+immediately with `Unknown conditional expression operation: -f` and installs
+nothing (found in BAKR-1's review of PR #10). `bash scripts/install.sh`
+works identically to `./scripts/install.sh` if you prefer to spell it out.
+
 `scripts/install.sh` does not start the service itself — that is a
 separate, explicit step, so "installed" and "running" stay observably
 distinct.
+
+**Works from any clone location, not only `~/code/brooswit-factory/bakr`.**
+`systemd/bakr.service`'s `ExecStart` is a template (`@@BUN_PATH@@ run
+@@REPO_ROOT@@/src/index.ts`); the installer resolves `bun`'s real path
+(`command -v bun`) and this clone's real root, substitutes both into the
+copy it writes, and **refuses to install — no unit written, nothing
+enabled — if either does not resolve** (no `bun` on `PATH`, or no
+`src/index.ts` at the resolved root), rather than reporting success for a
+unit that can only ever fail at boot (found in BAKR-1's review of PR #10:
+the previous installer copied the unit verbatim and reported success
+regardless).
 
 **One sharp edge, confirmed the hard way (BAKR-7/BAKR-8):** for a systemd
 *user* unit, the system-level `journalctl -u bakr.service` (no `--user`)

@@ -23,6 +23,8 @@ import type { ClaimKey } from "../../src/claim-key-resolve";
 
 const KEY_A = "/home/alice/project" as ClaimKey;
 const KEY_B = "/home/alice/other" as ClaimKey;
+const SESSION_A = "durable-session-a";
+const SESSION_B = "durable-session-b";
 
 describe("sessionsOn / claimedKeysWithSlots", () => {
   test("an empty store has no sessions on and no keys", () => {
@@ -208,46 +210,57 @@ describe("promoteUnresolvableLaunches: closes the crash-mid-launch wedge (review
   });
 });
 
-describe("restoreAttemptCount / recordRestoreAttempt / resetRestoreAttempts: the bounded-retry mechanism (review round 3 fix)", () => {
-  test("a fresh store has zero attempts recorded for any key", () => {
-    expect(restoreAttemptCount(emptySessionSlots(), KEY_A)).toBe(0);
+describe("restoreAttemptCount / recordRestoreAttempt / resetRestoreAttempts: the bounded-retry mechanism, keyed by DURABLE SESSION ID (BAKR-13 defect 1 — was keyed by claimed directory)", () => {
+  test("a fresh store has zero attempts recorded for any session id", () => {
+    expect(restoreAttemptCount(emptySessionSlots(), SESSION_A)).toBe(0);
   });
 
-  test("recordRestoreAttempt increments, independently per key", () => {
+  test("recordRestoreAttempt increments, independently per session id", () => {
     let state = emptySessionSlots();
-    state = recordRestoreAttempt(state, KEY_A);
-    state = recordRestoreAttempt(state, KEY_A);
-    state = recordRestoreAttempt(state, KEY_B);
-    expect(restoreAttemptCount(state, KEY_A)).toBe(2);
-    expect(restoreAttemptCount(state, KEY_B)).toBe(1);
+    state = recordRestoreAttempt(state, SESSION_A);
+    state = recordRestoreAttempt(state, SESSION_A);
+    state = recordRestoreAttempt(state, SESSION_B);
+    expect(restoreAttemptCount(state, SESSION_A)).toBe(2);
+    expect(restoreAttemptCount(state, SESSION_B)).toBe(1);
   });
 
-  test("resetRestoreAttempts brings a key back to zero and is a true no-op (identical object) when already zero", () => {
+  test("resetRestoreAttempts brings a session id back to zero and is a true no-op (identical object) when already zero", () => {
     let state = emptySessionSlots();
-    state = recordRestoreAttempt(state, KEY_A);
-    state = resetRestoreAttempts(state, KEY_A);
-    expect(restoreAttemptCount(state, KEY_A)).toBe(0);
+    state = recordRestoreAttempt(state, SESSION_A);
+    state = resetRestoreAttempts(state, SESSION_A);
+    expect(restoreAttemptCount(state, SESSION_A)).toBe(0);
 
     const before = state;
-    state = resetRestoreAttempts(state, KEY_A);
+    state = resetRestoreAttempts(state, SESSION_A);
     expect(state).toBe(before);
   });
 
-  test("beginLaunch with priorSessionId undefined (a FRESH launch, never the daemon's own restore path) resets an exhausted key's count — a deliberate new registration gets a clean budget", () => {
+  test("resetRestoreAttempts for one session id never touches another's count — this is what stops an alive sibling slot from defeating a failing slot's bound (BAKR-13 defect 1)", () => {
     let state = emptySessionSlots();
-    state = recordRestoreAttempt(state, KEY_A);
-    state = recordRestoreAttempt(state, KEY_A);
-    expect(restoreAttemptCount(state, KEY_A)).toBe(2);
+    state = recordRestoreAttempt(state, SESSION_A);
+    state = recordRestoreAttempt(state, SESSION_A);
+    state = recordRestoreAttempt(state, SESSION_B);
+    state = resetRestoreAttempts(state, SESSION_A); // e.g. SESSION_A's slot just verified alive
+    expect(restoreAttemptCount(state, SESSION_A)).toBe(0);
+    expect(restoreAttemptCount(state, SESSION_B)).toBe(1); // SESSION_B's own count is untouched
+  });
+
+  test("beginLaunch with priorSessionId undefined (a FRESH launch, never the daemon's own restore path) does not touch restoreAttemptCounts at all — keyed by durable session id now, and a fresh launch has no durable id yet to key by, so it starts at zero by construction (BAKR-13 defect 1: the old directory-keyed reset here would have wiped a FAILING SIBLING slot's count)", () => {
+    let state = emptySessionSlots();
+    state = recordRestoreAttempt(state, SESSION_A);
+    state = recordRestoreAttempt(state, SESSION_A);
+    expect(restoreAttemptCount(state, SESSION_A)).toBe(2);
 
     state = beginLaunch(state, KEY_A, undefined, "fresh-attempt", 1000);
-    expect(restoreAttemptCount(state, KEY_A)).toBe(0);
+    // Unrelated entries are untouched by a fresh launch into the same (or any) directory.
+    expect(restoreAttemptCount(state, SESSION_A)).toBe(2);
   });
 
   test("beginLaunch with a priorSessionId DEFINED (the daemon's own restore path) does NOT reset the count — that would defeat the bound", () => {
     let state = emptySessionSlots();
-    state = recordRestoreAttempt(state, KEY_A);
-    state = beginLaunch(state, KEY_A, "some-prior-id", "restore-attempt", 1000);
-    expect(restoreAttemptCount(state, KEY_A)).toBe(1);
+    state = recordRestoreAttempt(state, SESSION_A);
+    state = beginLaunch(state, KEY_A, SESSION_A, "restore-attempt", 1000);
+    expect(restoreAttemptCount(state, SESSION_A)).toBe(1);
   });
 });
 
