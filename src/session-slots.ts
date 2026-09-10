@@ -346,17 +346,27 @@ export function parseSessionSlotsState(source: string): ParseResult {
     return { ok: false, error: `session slots store is not valid JSON: ${err instanceof Error ? err.message : String(err)}` };
   }
 
+  // `restoreAttemptCounts` is OPTIONAL in the persisted shape, deliberately
+  // (review, PR #8 round 2): it was added after SESSION_SLOTS_VERSION 1
+  // already shipped (merged in PR #7), and a field whose absence has an
+  // obvious, correct default — zero attempts recorded for every key — must
+  // not turn an ordinary version-1-to-version-1 upgrade into Constraint 3's
+  // "malformed" path, which would silently disable restore entirely and
+  // freeze writes until a human hand-edits the file. A PRESENT-but-wrong
+  // value (not an object of numbers) is still rejected as malformed below
+  // — this is a default for absence, not a loosening of the shape check.
+  const restoreAttemptCountsField = isPlainObject(parsed) ? parsed["restoreAttemptCounts"] : undefined;
   if (
     !isPlainObject(parsed) ||
     parsed["version"] !== SESSION_SLOTS_VERSION ||
     !isValidOnByKey(parsed["onByKey"]) ||
     !Array.isArray(parsed["launches"]) ||
-    !isValidRestoreAttemptCounts(parsed["restoreAttemptCounts"])
+    (restoreAttemptCountsField !== undefined && !isValidRestoreAttemptCounts(restoreAttemptCountsField))
   ) {
     return {
       ok: false,
       error:
-        "session slots store does not have the expected { version: 1, onByKey: {...}, launches: [...], restoreAttemptCounts: {...} } shape",
+        "session slots store does not have the expected { version: 1, onByKey: {...}, launches: [...], restoreAttemptCounts?: {...} } shape",
     };
   }
 
@@ -375,5 +385,8 @@ export function parseSessionSlotsState(source: string): ParseResult {
     });
   }
 
-  return { ok: true, state: { onByKey: parsed["onByKey"], launches, restoreAttemptCounts: parsed["restoreAttemptCounts"] } };
+  return {
+    ok: true,
+    state: { onByKey: parsed["onByKey"], launches, restoreAttemptCounts: (restoreAttemptCountsField as Record<string, number> | undefined) ?? {} },
+  };
 }

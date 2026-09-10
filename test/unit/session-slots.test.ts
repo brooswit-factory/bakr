@@ -328,4 +328,35 @@ describe("wire format round-trip", () => {
     const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: { "/x": [1, 2] }, launches: [] }));
     expect(result.ok).toBe(false);
   });
+
+  describe("restoreAttemptCounts is OPTIONAL in the persisted shape (review, PR #8 round 2: backward compat with the store PR #7 already shipped)", () => {
+    test("a store with no restoreAttemptCounts field at all (the exact shape the pre-fix version serialized) parses successfully, defaulting to {}", () => {
+      const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: {}, launches: [] }));
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(restoreAttemptCount(result.state, KEY_A)).toBe(0);
+      }
+    });
+
+    test("a store with on-sessions but no restoreAttemptCounts field still parses, and the count for any key defaults to zero (not an error)", () => {
+      const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: { [KEY_A]: ["session-1"] }, launches: [] }));
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(sessionsOn(result.state, KEY_A)).toEqual(["session-1"]);
+        expect(restoreAttemptCount(result.state, KEY_A)).toBe(0);
+      }
+    });
+
+    test("a PRESENT but invalid restoreAttemptCounts is still rejected as malformed — this is a default for ABSENCE, not a loosened shape check", () => {
+      const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: {}, launches: [], restoreAttemptCounts: { [KEY_A]: "not-a-number" } }));
+      expect(result.ok).toBe(false);
+    });
+
+    test("a present and valid restoreAttemptCounts round-trips normally", () => {
+      let state = emptySessionSlots();
+      state = recordRestoreAttempt(state, KEY_A);
+      state = recordRestoreAttempt(state, KEY_A);
+      expectRoundTrips(state);
+    });
+  });
 });
