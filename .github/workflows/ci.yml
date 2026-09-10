@@ -1,0 +1,24 @@
+name: ci
+on:
+  pull_request:
+  # Taken from brooswit-factory/candlestix (src for this workaround:
+  # .github/workflows/ci.yml on its main branch): a brand-new org gates
+  # pull_request-triggered runs so they queue with zero jobs, so CI also runs
+  # on any pushed branch and can be dispatched by hand.
+  push:
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Pinned to the declared engines.bun floor in package.json, not
+          # "latest" — this is the job that proves the floor is actually
+          # tested. See README.md for where that floor came from.
+          bun-version: "1.3.11"
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build
