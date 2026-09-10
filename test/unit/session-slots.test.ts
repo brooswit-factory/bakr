@@ -9,6 +9,9 @@ import {
   parseSessionSlotsState,
   pendingLaunches,
   promoteUnresolvableLaunches,
+  recordRestoreAttempt,
+  resetRestoreAttempts,
+  restoreAttemptCount,
   resolveLaunch,
   serializeSessionSlotsState,
   sessionsOn,
@@ -183,6 +186,49 @@ describe("promoteUnresolvableLaunches: closes the crash-mid-launch wedge (review
   });
 });
 
+describe("restoreAttemptCount / recordRestoreAttempt / resetRestoreAttempts: the bounded-retry mechanism (review round 3 fix)", () => {
+  test("a fresh store has zero attempts recorded for any key", () => {
+    expect(restoreAttemptCount(emptySessionSlots(), KEY_A)).toBe(0);
+  });
+
+  test("recordRestoreAttempt increments, independently per key", () => {
+    let state = emptySessionSlots();
+    state = recordRestoreAttempt(state, KEY_A);
+    state = recordRestoreAttempt(state, KEY_A);
+    state = recordRestoreAttempt(state, KEY_B);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(2);
+    expect(restoreAttemptCount(state, KEY_B)).toBe(1);
+  });
+
+  test("resetRestoreAttempts brings a key back to zero and is a true no-op (identical object) when already zero", () => {
+    let state = emptySessionSlots();
+    state = recordRestoreAttempt(state, KEY_A);
+    state = resetRestoreAttempts(state, KEY_A);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(0);
+
+    const before = state;
+    state = resetRestoreAttempts(state, KEY_A);
+    expect(state).toBe(before);
+  });
+
+  test("beginLaunch with priorSessionId undefined (a FRESH launch, never the daemon's own restore path) resets an exhausted key's count — a deliberate new registration gets a clean budget", () => {
+    let state = emptySessionSlots();
+    state = recordRestoreAttempt(state, KEY_A);
+    state = recordRestoreAttempt(state, KEY_A);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(2);
+
+    state = beginLaunch(state, KEY_A, undefined, "fresh-attempt", 1000);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(0);
+  });
+
+  test("beginLaunch with a priorSessionId DEFINED (the daemon's own restore path) does NOT reset the count — that would defeat the bound", () => {
+    let state = emptySessionSlots();
+    state = recordRestoreAttempt(state, KEY_A);
+    state = beginLaunch(state, KEY_A, "some-prior-id", "restore-attempt", 1000);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(1);
+  });
+});
+
 describe("hasLaunchRecordFor: the duplicate-restore guard", () => {
   test("false when there is no launch record for that (key, priorSessionId) pair", () => {
     expect(hasLaunchRecordFor(emptySessionSlots(), KEY_A, "session-x")).toBe(false);
@@ -281,5 +327,36 @@ describe("wire format round-trip", () => {
   test("a malformed onByKey entry is reported as a typed error", () => {
     const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: { "/x": [1, 2] }, launches: [] }));
     expect(result.ok).toBe(false);
+  });
+
+  describe("restoreAttemptCounts is OPTIONAL in the persisted shape (review, PR #8 round 2: backward compat with the store PR #7 already shipped)", () => {
+    test("a store with no restoreAttemptCounts field at all (the exact shape the pre-fix version serialized) parses successfully, defaulting to {}", () => {
+      const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: {}, launches: [] }));
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(restoreAttemptCount(result.state, KEY_A)).toBe(0);
+      }
+    });
+
+    test("a store with on-sessions but no restoreAttemptCounts field still parses, and the count for any key defaults to zero (not an error)", () => {
+      const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: { [KEY_A]: ["session-1"] }, launches: [] }));
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(sessionsOn(result.state, KEY_A)).toEqual(["session-1"]);
+        expect(restoreAttemptCount(result.state, KEY_A)).toBe(0);
+      }
+    });
+
+    test("a PRESENT but invalid restoreAttemptCounts is still rejected as malformed — this is a default for ABSENCE, not a loosened shape check", () => {
+      const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: {}, launches: [], restoreAttemptCounts: { [KEY_A]: "not-a-number" } }));
+      expect(result.ok).toBe(false);
+    });
+
+    test("a present and valid restoreAttemptCounts round-trips normally", () => {
+      let state = emptySessionSlots();
+      state = recordRestoreAttempt(state, KEY_A);
+      state = recordRestoreAttempt(state, KEY_A);
+      expectRoundTrips(state);
+    });
   });
 });

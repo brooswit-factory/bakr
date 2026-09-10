@@ -32,11 +32,24 @@ import {
   unresolvedLaunches,
   hasLaunchRecordFor,
   promoteUnresolvableLaunches,
+  restoreAttemptCount,
+  recordRestoreAttempt,
+  resetRestoreAttempts,
   type SessionSlotsState,
 } from "./session-slots";
 import { listBackgroundSessions, decideLiveness, isPidAlive, launch, type RunCommand } from "./spawn";
 import type { ClaimKey } from "./claim-key-resolve";
 import { log } from "./log";
+
+/**
+ * A small number, per the story's own reviewer: enough that one slow
+ * listing or one transient hiccup doesn't trip it, small enough that the
+ * live incident this bound closes — an unbounded spawn loop when a resume
+ * silently fails (ticket measurement 5) — costs at most this many process
+ * spawns per claimed directory, ever, rather than continuing indefinitely.
+ * See the bound's own call site for the full incident writeup.
+ */
+const MAX_CONSECUTIVE_UNVERIFIED_RESTORES = 3;
 
 export interface DaemonDeps {
   readonly runCommand: RunCommand;
@@ -235,7 +248,16 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
       const verdict = decideLiveness(sessionId, entry, pidVerifiedAlive);
 
-      if (verdict.status === "alive") continue;
+      if (verdict.status === "alive") {
+        if (restoreAttemptCount(sessionSlotsState, key) > 0) {
+          // The saga bounded retry exists to interrupt is over: this
+          // directory has a verified-alive session again. Reset so a
+          // future, unrelated failure gets the full retry budget.
+          sessionSlotsState = resetRestoreAttempts(sessionSlotsState, key);
+          await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
+        }
+        continue;
+      }
       if (verdict.status === "not-verifiable") {
         log("warn", `"${key}": session ${sessionId} ${verdict.reason} — not restoring this cycle to avoid a duplicate; re-checked next cycle`);
         continue;
@@ -245,8 +267,50 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       // ITSELF succeeded this cycle (the listing-failed case already
       // returned above) — this is the one case Constraint 1 says "may lead
       // to a restore."
+      //
+      // BUT: a resume can "succeed" at the `launch()` surface — exit 0,
+      // print an ordinary `backgrounded · <id>` line — while actually being
+      // the ticket's own measurement 5: a silent, empty session with no
+      // real conversation. `resolveLaunch` cannot tell the difference (see
+      // its own doc), so it faithfully rotates `onByKey` to that new,
+      // equally-phantom id — which is *also* absent next cycle (no pid, no
+      // real content), triggering another "restore", forever. Live
+      // incident: BAKR-12 PR #7 review round 3, ~180 spawns/hour observed
+      // for one stuck slot before this bound existed. `hasLaunchRecordFor`
+      // above cannot see this loop — it matches on `(key, priorSessionId)`,
+      // and the id is different every cycle.
+      //
+      // The bound: after MAX_CONSECUTIVE_UNVERIFIED_RESTORES restore
+      // attempts for this KEY (not this session id — see
+      // restoreAttemptCounts's own doc) with none independently verified
+      // alive in between, give up on the CURRENT on-record id rather than
+      // issuing another launch. This is deliberately the "bound it" option
+      // the story's reviewer offered rather than "detect it" (reading
+      // claude's own `~/.claude/jobs/<id>/state.json`): it does not depend
+      // on an undocumented internal shape, and per the reviewer's own
+      // framing, the loop is a defect regardless of how often — or why — a
+      // resume actually fails, so bounding closes it without needing to
+      // know why.
+      const attemptsSoFar = restoreAttemptCount(sessionSlotsState, key);
+      if (attemptsSoFar >= MAX_CONSECUTIVE_UNVERIFIED_RESTORES) {
+        const giveUpAttemptId = deps.generateAttemptId();
+        sessionSlotsState = beginLaunch(sessionSlotsState, key, sessionId, giveUpAttemptId, deps.now());
+        sessionSlotsState = markLaunchFailed(
+          sessionSlotsState,
+          giveUpAttemptId,
+          `gave up after ${attemptsSoFar} consecutive restore attempts for this claimed directory, none independently verified alive — likely a silently-failing resume (ticket measurement 5); never retried automatically (BAKR-8 Constraint 2)`
+        );
+        await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
+        log(
+          "error",
+          `"${key}": giving up on restoring session ${sessionId} after ${attemptsSoFar} consecutive unverified restore attempts — the daemon must converge, not spawn unboundedly; see the unresolved-launch log for this attempt`
+        );
+        continue;
+      }
+
       const attemptId = deps.generateAttemptId();
       sessionSlotsState = beginLaunch(sessionSlotsState, key, sessionId, attemptId, deps.now());
+      sessionSlotsState = recordRestoreAttempt(sessionSlotsState, key);
       // Persisted BEFORE launch() is invoked — Constraint 2's "record the
       // intent to launch before invoking launch(), and persist it," so a
       // daemon crash mid-launch still leaves a durable trace.
