@@ -420,7 +420,8 @@ describe("regression (PR #7 review round 3): a resume that 'succeeds' but is act
     const afterSuccess = await loadSlots(join(dir, "session-slots.json"));
     expect(afterSuccess.status).toBe("loaded");
     if (afterSuccess.status === "loaded") {
-      expect(restoreAttemptCount(afterSuccess.state, key)).toBe(0); // reset after verified-alive
+      // Keyed by the slot's DURABLE session id ("seed-session-id" — never changes across restores, see session-slots.ts), not by the claimed directory.
+      expect(restoreAttemptCount(afterSuccess.state, "seed-session-id")).toBe(0); // reset after verified-alive
     }
 
     // Now it genuinely goes down and starts failing again — must get the FULL budget, not an already-exhausted one.
@@ -432,6 +433,70 @@ describe("regression (PR #7 review round 3): a resume that 'succeeds' but is act
     }
     // In this scenario every "restore" resolves to a listed-but-unverified session that never disappears (still listed, just no pid) -> not-verifiable, not unknown -> never even reaches the bound, only one launch. This asserts the budget was available at all (not pre-exhausted from before the reset), not the bound's own convergence (covered above).
     expect(launchCalls).toBe(launchCallsBeforeSecondSaga + 1);
+  });
+});
+
+describe("regression (BAKR-1 review of PR #10, defect 1): an alive SIBLING slot in the same claimed directory must not defeat the bound", () => {
+  // Adapted from the reviewer's own scratch reproduction (BAKR-13 ticket) into
+  // this file's existing helpers. Same phantom-resume model as the
+  // measurement-5 regression test above, plus one extra slot in the SAME
+  // claimed directory that is verifiably alive (real pid) every cycle. Before
+  // the fix, `restoreAttemptCounts` was keyed by claimed directory, so the
+  // alive sibling's every-cycle "verified alive" reset the SAME counter the
+  // failing slot needed to reach the bound — the failing slot never gave up.
+  // Falsifier: this run passes if launchCalls stays <= 3, exactly like the
+  // control (no sibling) case; before the fix it did not.
+  async function run(withAliveSibling: boolean): Promise<number> {
+    const dir = await makeTempDir();
+    const key = "/claimed/dir" as ClaimKey;
+    await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
+    let slots = emptySessionSlots();
+    if (withAliveSibling) {
+      slots = beginLaunch(slots, key, undefined, "sib-attempt", 1);
+      slots = markLaunchStarted(slots, "sib-attempt", "sib-short");
+      slots = resolveLaunch(slots, "sib-short", "sibling-alive-session");
+    }
+    slots = beginLaunch(slots, key, undefined, "seed-attempt", 1);
+    slots = markLaunchStarted(slots, "seed-attempt", "seed-short");
+    slots = resolveLaunch(slots, "seed-short", "seed-session-id");
+    await saveSlots(join(dir, "session-slots.json"), slots);
+
+    let launchCalls = 0;
+    let pendingEntry: { id: string; sessionId: string } | undefined;
+    const runCommand = async (argv: string[]) => {
+      if (argv[0] === "claude" && argv[1] === "agents") {
+        const listing: object[] = [];
+        if (withAliveSibling) {
+          listing.push({ id: "sib-short", sessionId: "sibling-alive-session", cwd: key, startedAt: 1, kind: "background", pid: process.pid });
+        }
+        if (pendingEntry) listing.push({ id: pendingEntry.id, sessionId: pendingEntry.sessionId, cwd: key, startedAt: 1, kind: "background" });
+        pendingEntry = undefined;
+        return { exitCode: 0, stdout: JSON.stringify(listing), stderr: "" };
+      }
+      if (argv[0] === "systemd-run") {
+        launchCalls += 1;
+        const shortId = `short-${launchCalls}`;
+        pendingEntry = { id: shortId, sessionId: `phantom-session-${shortId}` };
+        return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
+      }
+      throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
+    };
+
+    const deps = baseDeps(dir, runCommand);
+    let state = initialDaemonState();
+    for (let i = 0; i < 30; i++) {
+      const r = await runReconcileCycle(state, deps);
+      state = { claimDegraded: r.claimDegraded, sessionSlotsDegraded: r.sessionSlotsDegraded };
+    }
+    return launchCalls;
+  }
+
+  test("CONTROL: single-slot directory converges (reproduces the existing measurement-5 regression test)", async () => {
+    expect(await run(false)).toBeLessThanOrEqual(3);
+  });
+
+  test("REPRO: an alive sibling slot in the same claimed directory must not defeat the bound", async () => {
+    expect(await run(true)).toBeLessThanOrEqual(3);
   });
 });
 

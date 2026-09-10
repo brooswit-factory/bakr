@@ -46,8 +46,9 @@ import { log } from "./log";
  * listing or one transient hiccup doesn't trip it, small enough that the
  * live incident this bound closes — an unbounded spawn loop when a resume
  * silently fails (ticket measurement 5) — costs at most this many process
- * spawns per claimed directory, ever, rather than continuing indefinitely.
- * See the bound's own call site for the full incident writeup.
+ * spawns per slot (keyed by its own durable session id — BAKR-13 defect 1),
+ * ever, rather than continuing indefinitely. See the bound's own call site
+ * for the full incident writeup.
  */
 const MAX_CONSECUTIVE_UNVERIFIED_RESTORES = 3;
 
@@ -258,11 +259,17 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       const verdict = decideLiveness(slot.liveSessionId, entry, pidVerifiedAlive);
 
       if (verdict.status === "alive") {
-        if (restoreAttemptCount(sessionSlotsState, key) > 0) {
-          // The saga bounded retry exists to interrupt is over: this
-          // directory has a verified-alive session again. Reset so a
-          // future, unrelated failure gets the full retry budget.
-          sessionSlotsState = resetRestoreAttempts(sessionSlotsState, key);
+        if (restoreAttemptCount(sessionSlotsState, sessionId) > 0) {
+          // The saga bounded retry exists to interrupt is over: THIS SLOT
+          // (keyed by its own durable session id, not the directory —
+          // BAKR-13 defect 1) has a verified-alive session again. Reset so
+          // a future, unrelated failure gets the full retry budget. Keying
+          // by durable session id rather than by `key` (the claimed
+          // directory) is what keeps this reset from also wiping a
+          // FAILING sibling slot's count in the same directory — that
+          // sibling's count lives under its own durable session id and is
+          // untouched here.
+          sessionSlotsState = resetRestoreAttempts(sessionSlotsState, sessionId);
           await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
         }
         continue;
@@ -294,24 +301,25 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       // doesn't say why, and neither do we).
       //
       // The bound: after MAX_CONSECUTIVE_UNVERIFIED_RESTORES restore
-      // attempts for this KEY (not this session id — see
-      // restoreAttemptCounts's own doc) with none independently verified
-      // alive in between, give up on the CURRENT on-record id rather than
-      // issuing another launch. This is deliberately the "bound it" option
-      // the story's reviewer offered rather than "detect it" (reading
-      // claude's own `~/.claude/jobs/<id>/state.json`): it does not depend
-      // on an undocumented internal shape, and per the reviewer's own
-      // framing, the loop is a defect regardless of how often — or why — a
-      // resume actually fails, so bounding closes it without needing to
-      // know why.
-      const attemptsSoFar = restoreAttemptCount(sessionSlotsState, key);
+      // attempts for THIS SLOT's own durable session id (BAKR-13 defect 1
+      // — was keyed by claimed directory; see restoreAttemptCounts's own
+      // doc for why that let an alive sibling slot defeat the bound) with
+      // none independently verified alive in between, give up on the
+      // CURRENT on-record id rather than issuing another launch. This is
+      // deliberately the "bound it" option the story's reviewer offered
+      // rather than "detect it" (reading claude's own
+      // `~/.claude/jobs/<id>/state.json`): it does not depend on an
+      // undocumented internal shape, and per the reviewer's own framing,
+      // the loop is a defect regardless of how often — or why — a resume
+      // actually fails, so bounding closes it without needing to know why.
+      const attemptsSoFar = restoreAttemptCount(sessionSlotsState, sessionId);
       if (attemptsSoFar >= MAX_CONSECUTIVE_UNVERIFIED_RESTORES) {
         const giveUpAttemptId = deps.generateAttemptId();
         sessionSlotsState = beginLaunch(sessionSlotsState, key, sessionId, giveUpAttemptId, deps.now());
         sessionSlotsState = markLaunchFailed(
           sessionSlotsState,
           giveUpAttemptId,
-          `gave up after ${attemptsSoFar} consecutive restore attempts for this claimed directory, none independently verified alive — likely a silently-failing resume (ticket measurement 5); never retried automatically (BAKR-8 Constraint 2)`
+          `gave up after ${attemptsSoFar} consecutive restore attempts for this session, none independently verified alive — likely a silently-failing resume (ticket measurement 5); never retried automatically (BAKR-8 Constraint 2)`
         );
         await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
         log(
@@ -323,7 +331,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
 
       const attemptId = deps.generateAttemptId();
       sessionSlotsState = beginLaunch(sessionSlotsState, key, sessionId, attemptId, deps.now());
-      sessionSlotsState = recordRestoreAttempt(sessionSlotsState, key);
+      sessionSlotsState = recordRestoreAttempt(sessionSlotsState, sessionId);
       // Persisted BEFORE launch() is invoked — Constraint 2's "record the
       // intent to launch before invoking launch(), and persist it," so a
       // daemon crash mid-launch still leaves a durable trace.

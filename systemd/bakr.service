@@ -17,7 +17,16 @@ Type=simple
 # unit's inherited PATH. Spelled out explicitly rather than assumed
 # inherited from a login shell, which a systemd user unit does not have.
 Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=%h/.bun/bin/bun run %h/code/brooswit-factory/bakr/src/index.ts
+# ExecStart is a TEMPLATE: scripts/install.sh substitutes both placeholders
+# with the real, resolved paths for the machine and clone it is installing
+# onto (BAKR-13, review of PR #10 defect 3) before ever copying this file to
+# $HOME/.config/systemd/user/ — a clone at any path, not only
+# ~/code/brooswit-factory/bakr, and whatever `bun` install.sh itself
+# resolved. The %h Environment=PATH line above is untouched by that
+# substitution and stays systemd-native: it is for subprocesses THIS
+# process spawns (e.g. `claude`), not for finding bun itself, so the
+# reasoning above for why it exists keeps holding regardless.
+ExecStart=@@BUN_PATH@@ run @@REPO_ROOT@@/src/index.ts
 Restart=on-failure
 RestartSec=5
 
