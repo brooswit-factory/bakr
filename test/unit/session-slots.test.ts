@@ -9,6 +9,9 @@ import {
   parseSessionSlotsState,
   pendingLaunches,
   promoteUnresolvableLaunches,
+  recordRestoreAttempt,
+  resetRestoreAttempts,
+  restoreAttemptCount,
   resolveLaunch,
   serializeSessionSlotsState,
   sessionsOn,
@@ -180,6 +183,49 @@ describe("promoteUnresolvableLaunches: closes the crash-mid-launch wedge (review
 
     expect(hasLaunchRecordFor(state, KEY_A, "prior-id")).toBe(true);
     expect(unresolvedLaunches(state)).toHaveLength(1);
+  });
+});
+
+describe("restoreAttemptCount / recordRestoreAttempt / resetRestoreAttempts: the bounded-retry mechanism (review round 3 fix)", () => {
+  test("a fresh store has zero attempts recorded for any key", () => {
+    expect(restoreAttemptCount(emptySessionSlots(), KEY_A)).toBe(0);
+  });
+
+  test("recordRestoreAttempt increments, independently per key", () => {
+    let state = emptySessionSlots();
+    state = recordRestoreAttempt(state, KEY_A);
+    state = recordRestoreAttempt(state, KEY_A);
+    state = recordRestoreAttempt(state, KEY_B);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(2);
+    expect(restoreAttemptCount(state, KEY_B)).toBe(1);
+  });
+
+  test("resetRestoreAttempts brings a key back to zero and is a true no-op (identical object) when already zero", () => {
+    let state = emptySessionSlots();
+    state = recordRestoreAttempt(state, KEY_A);
+    state = resetRestoreAttempts(state, KEY_A);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(0);
+
+    const before = state;
+    state = resetRestoreAttempts(state, KEY_A);
+    expect(state).toBe(before);
+  });
+
+  test("beginLaunch with priorSessionId undefined (a FRESH launch, never the daemon's own restore path) resets an exhausted key's count — a deliberate new registration gets a clean budget", () => {
+    let state = emptySessionSlots();
+    state = recordRestoreAttempt(state, KEY_A);
+    state = recordRestoreAttempt(state, KEY_A);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(2);
+
+    state = beginLaunch(state, KEY_A, undefined, "fresh-attempt", 1000);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(0);
+  });
+
+  test("beginLaunch with a priorSessionId DEFINED (the daemon's own restore path) does NOT reset the count — that would defeat the bound", () => {
+    let state = emptySessionSlots();
+    state = recordRestoreAttempt(state, KEY_A);
+    state = beginLaunch(state, KEY_A, "some-prior-id", "restore-attempt", 1000);
+    expect(restoreAttemptCount(state, KEY_A)).toBe(1);
   });
 });
 

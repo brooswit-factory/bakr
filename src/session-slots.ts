@@ -66,10 +66,39 @@ export interface LaunchRecord {
 export interface SessionSlotsState {
   readonly onByKey: { readonly [key: string]: readonly string[] };
   readonly launches: readonly LaunchRecord[];
+  /**
+   * Consecutive restore attempts for a claimed directory that have not yet
+   * produced a verifiably-alive session — keyed by directory rather than by
+   * session id, because a resume that "succeeds" but is actually the
+   * measurement-5 silent-empty-session failure still causes `resolveLaunch`
+   * to rotate `onByKey` to a brand-new id every cycle (see daemon.ts's own
+   * bound-checking comment for the live incident this closes). A per-
+   * (key, sessionId) counter would never see the same pair twice and would
+   * never trip; this counter survives exactly that churn because it is
+   * keyed by the one thing that does NOT change cycle to cycle: the
+   * directory itself.
+   */
+  readonly restoreAttemptCounts: { readonly [key: string]: number };
 }
 
 export function emptySessionSlots(): SessionSlotsState {
-  return { onByKey: {}, launches: [] };
+  return { onByKey: {}, launches: [], restoreAttemptCounts: {} };
+}
+
+export function restoreAttemptCount(state: SessionSlotsState, key: ClaimKey): number {
+  return state.restoreAttemptCounts[key] ?? 0;
+}
+
+export function recordRestoreAttempt(state: SessionSlotsState, key: ClaimKey): SessionSlotsState {
+  return { ...state, restoreAttemptCounts: { ...state.restoreAttemptCounts, [key]: restoreAttemptCount(state, key) + 1 } };
+}
+
+/** Called once a session for `key` is independently verified alive — the saga that bounded retry exists to interrupt is over, so the next genuine failure gets the full budget again. A no-op (not merely harmless, structurally absent from the object) when there is nothing to reset. */
+export function resetRestoreAttempts(state: SessionSlotsState, key: ClaimKey): SessionSlotsState {
+  if (!(key in state.restoreAttemptCounts)) return state;
+  const restoreAttemptCounts = { ...state.restoreAttemptCounts };
+  delete restoreAttemptCounts[key];
+  return { ...state, restoreAttemptCounts };
 }
 
 export function sessionsOn(state: SessionSlotsState, key: ClaimKey): readonly string[] {
@@ -163,7 +192,13 @@ export function beginLaunch(
   now: number
 ): SessionSlotsState {
   const record: LaunchRecord = { attemptId, key, priorSessionId, attemptedAt: now, launchShortId: undefined, error: undefined };
-  return { ...state, launches: [...state.launches, record] };
+  const withRecord = { ...state, launches: [...state.launches, record] };
+  // A FRESH launch (no priorSessionId — never the daemon's own restore
+  // path, which always resumes a specific id) is a deliberate new
+  // registration for this directory, e.g. via the demo harness. It gets a
+  // clean retry budget rather than inheriting an exhausted count left by an
+  // earlier, unrelated restore saga for the same key.
+  return priorSessionId === undefined ? resetRestoreAttempts(withRecord, key) : withRecord;
 }
 
 function updateLaunch(state: SessionSlotsState, attemptId: string, update: (record: LaunchRecord) => LaunchRecord): SessionSlotsState {
@@ -223,7 +258,7 @@ export function resolveLaunch(state: SessionSlotsState, launchShortId: string, r
         ? existing
         : [...existing, resolvedSessionId];
 
-  return { onByKey: { ...state.onByKey, [record.key]: next }, launches };
+  return { ...state, onByKey: { ...state.onByKey, [record.key]: next }, launches };
 }
 
 // --- Wire format -----------------------------------------------------
@@ -243,6 +278,7 @@ interface PersistedSessionSlots {
   readonly version: typeof SESSION_SLOTS_VERSION;
   readonly onByKey: { readonly [key: string]: readonly string[] };
   readonly launches: readonly PersistedLaunchRecord[];
+  readonly restoreAttemptCounts: { readonly [key: string]: number };
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -252,6 +288,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function isValidOnByKey(value: unknown): value is Record<string, readonly string[]> {
   if (!isPlainObject(value)) return false;
   return Object.values(value).every((v) => Array.isArray(v) && v.every((id) => typeof id === "string"));
+}
+
+function isValidRestoreAttemptCounts(value: unknown): value is Record<string, number> {
+  if (!isPlainObject(value)) return false;
+  return Object.values(value).every((v) => typeof v === "number");
 }
 
 function isValidPersistedLaunchRecord(value: unknown): value is PersistedLaunchRecord {
@@ -275,7 +316,12 @@ export function serializeSessionSlotsState(state: SessionSlotsState): string {
     launchShortId: l.launchShortId ?? null,
     error: l.error ?? null,
   }));
-  const persisted: PersistedSessionSlots = { version: SESSION_SLOTS_VERSION, onByKey: state.onByKey, launches };
+  const persisted: PersistedSessionSlots = {
+    version: SESSION_SLOTS_VERSION,
+    onByKey: state.onByKey,
+    launches,
+    restoreAttemptCounts: state.restoreAttemptCounts,
+  };
   return JSON.stringify(persisted, null, 2);
 }
 
@@ -304,11 +350,13 @@ export function parseSessionSlotsState(source: string): ParseResult {
     !isPlainObject(parsed) ||
     parsed["version"] !== SESSION_SLOTS_VERSION ||
     !isValidOnByKey(parsed["onByKey"]) ||
-    !Array.isArray(parsed["launches"])
+    !Array.isArray(parsed["launches"]) ||
+    !isValidRestoreAttemptCounts(parsed["restoreAttemptCounts"])
   ) {
     return {
       ok: false,
-      error: "session slots store does not have the expected { version: 1, onByKey: {...}, launches: [...] } shape",
+      error:
+        "session slots store does not have the expected { version: 1, onByKey: {...}, launches: [...], restoreAttemptCounts: {...} } shape",
     };
   }
 
@@ -327,5 +375,5 @@ export function parseSessionSlotsState(source: string): ParseResult {
     });
   }
 
-  return { ok: true, state: { onByKey: parsed["onByKey"], launches } };
+  return { ok: true, state: { onByKey: parsed["onByKey"], launches, restoreAttemptCounts: parsed["restoreAttemptCounts"] } };
 }

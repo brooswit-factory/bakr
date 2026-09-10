@@ -4,7 +4,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claim, emptyStore } from "../../src/claim-model";
 import { save as saveClaims } from "../../src/claim-store-io";
-import { beginLaunch, emptySessionSlots, markLaunchStarted, resolveLaunch, sessionsOn, unresolvedLaunches, hasLaunchRecordFor } from "../../src/session-slots";
+import {
+  beginLaunch,
+  emptySessionSlots,
+  markLaunchStarted,
+  resolveLaunch,
+  sessionsOn,
+  unresolvedLaunches,
+  hasLaunchRecordFor,
+  restoreAttemptCount,
+} from "../../src/session-slots";
 import { save as saveSlots, load as loadSlots } from "../../src/session-slots-store";
 import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
 import type { ClaimKey } from "../../src/claim-key-resolve";
@@ -217,6 +226,138 @@ describe("the full silent-restore lifecycle", () => {
     const result = await runReconcileCycle(initialDaemonState(), deps);
     expect(result.restored).toEqual([]);
     expect(launchCalls).toBe(0);
+  });
+});
+
+describe("regression (PR #7 review round 3): a resume that 'succeeds' but is actually a silent empty session (measurement 5) must not loop forever", () => {
+  test("reproduces the live incident: every resume exits 0 but is a phantom session with no pid that vanishes by the next listing — the daemon must converge, not spawn unboundedly", async () => {
+    const dir = await makeTempDir();
+    const key = "/claimed/dir" as ClaimKey;
+    await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
+    let slots = emptySessionSlots();
+    slots = beginLaunch(slots, key, undefined, "seed-attempt", 1);
+    slots = markLaunchStarted(slots, "seed-attempt", "seed-short");
+    slots = resolveLaunch(slots, "seed-short", "seed-session-id");
+    await saveSlots(join(dir, "session-slots.json"), slots);
+
+    // Models the exact failure mode from the live incident: `launch()`
+    // always reports ok:true (exit 0, ordinary `backgrounded · <id>` line —
+    // claude's own CLI is silent about the underlying resume having
+    // failed, per the ticket's measurement 5), but the resulting session
+    // has no pid, and — critically — it is gone from the listing entirely
+    // by the NEXT cycle, exactly like the reviewer's own live trace, which
+    // is what makes each cycle look like "genuinely absent" (verdict
+    // "unknown") rather than merely "not yet verified" (verdict
+    // "not-verifiable"), and is why `hasLaunchRecordFor` alone cannot stop
+    // it: the session id is different every time.
+    let launchCalls = 0;
+    let pendingEntry: { id: string; sessionId: string } | undefined;
+    const runCommand = async (argv: string[]) => {
+      if (argv[0] === "claude" && argv[1] === "agents") {
+        const listing = pendingEntry
+          ? [{ id: pendingEntry.id, sessionId: pendingEntry.sessionId, cwd: key, startedAt: 1, kind: "background" }]
+          : [];
+        pendingEntry = undefined; // vanishes after being listed exactly once, unverified
+        return { exitCode: 0, stdout: JSON.stringify(listing), stderr: "" };
+      }
+      if (argv[0] === "systemd-run") {
+        launchCalls += 1;
+        const shortId = `short-${launchCalls}`;
+        const sessionId = `phantom-session-${shortId}`;
+        pendingEntry = { id: shortId, sessionId };
+        return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
+      }
+      throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
+    };
+
+    const deps = baseDeps(dir, runCommand);
+
+    // Run well past where the pre-fix code would still be looping (10
+    // cycles; the bound must have kicked in long before this).
+    let state = initialDaemonState();
+    for (let i = 0; i < 10; i++) {
+      const result = await runReconcileCycle(state, deps);
+      state = { claimDegraded: result.claimDegraded, sessionSlotsDegraded: result.sessionSlotsDegraded };
+    }
+
+    // Convergence: launch() was called a bounded number of times, not once per cycle.
+    expect(launchCalls).toBeLessThanOrEqual(3);
+    expect(launchCalls).toBeGreaterThan(0); // it did genuinely try — this isn't a test that passes by accident
+
+    // The daemon gave up honestly: the slot is now permanently unresolved and logged, never silently dropped.
+    const finalState = await loadSlots(join(dir, "session-slots.json"));
+    expect(finalState.status).toBe("loaded");
+    if (finalState.status === "loaded") {
+      expect(unresolvedLaunches(finalState.state).length).toBeGreaterThan(0);
+    }
+
+    // Run several MORE cycles and confirm it truly stays converged — not merely slow.
+    const launchCallsAtConvergence = launchCalls;
+    for (let i = 0; i < 5; i++) {
+      const result = await runReconcileCycle(state, deps);
+      state = { claimDegraded: result.claimDegraded, sessionSlotsDegraded: result.sessionSlotsDegraded };
+    }
+    expect(launchCalls).toBe(launchCallsAtConvergence);
+  });
+
+  test("a genuinely successful restore (verified alive) resets the count, so a LATER, unrelated failure gets the full retry budget again", async () => {
+    const dir = await makeTempDir();
+    const key = "/claimed/dir" as ClaimKey;
+    await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
+    let slots = emptySessionSlots();
+    slots = beginLaunch(slots, key, undefined, "seed-attempt", 1);
+    slots = markLaunchStarted(slots, "seed-attempt", "seed-short");
+    slots = resolveLaunch(slots, "seed-short", "seed-session-id");
+    await saveSlots(join(dir, "session-slots.json"), slots);
+
+    // Cycle 1: restore "seed-session-id" -> a REAL, verifiable success (has our own, genuinely-alive pid).
+    let phase = 1;
+    let launchCalls = 0;
+    const runCommand = async (argv: string[]) => {
+      if (argv[0] === "claude" && argv[1] === "agents") {
+        if (phase === 1) {
+          return { exitCode: 0, stdout: "[]", stderr: "" };
+        }
+        if (phase === 2) {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify([{ id: "real-short", sessionId: "real-session-id", cwd: key, startedAt: 1, kind: "background", pid: process.pid }]),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "[]", stderr: "" }; // phase 3+: it "dies" for real, starting a fresh failure saga
+      }
+      if (argv[0] === "systemd-run") {
+        launchCalls += 1;
+        if (phase === 1) return { exitCode: 0, stdout: "backgrounded · real-short (idle)\n", stderr: "" };
+        return { exitCode: 0, stdout: `backgrounded · new-short-${launchCalls} (idle)\n`, stderr: "" };
+      }
+      throw new Error("unexpected argv");
+    };
+
+    const deps = baseDeps(dir, runCommand);
+    let state = initialDaemonState();
+
+    await runReconcileCycle(state, deps); // issues the restore
+    phase = 2;
+    const r2 = await runReconcileCycle(state, deps); // resolves it AND verifies it alive (real pid) in the same cycle
+    state = { claimDegraded: r2.claimDegraded, sessionSlotsDegraded: r2.sessionSlotsDegraded };
+
+    const afterSuccess = await loadSlots(join(dir, "session-slots.json"));
+    expect(afterSuccess.status).toBe("loaded");
+    if (afterSuccess.status === "loaded") {
+      expect(restoreAttemptCount(afterSuccess.state, key)).toBe(0); // reset after verified-alive
+    }
+
+    // Now it genuinely goes down and starts failing again — must get the FULL budget, not an already-exhausted one.
+    phase = 3;
+    const launchCallsBeforeSecondSaga = launchCalls;
+    for (let i = 0; i < 10; i++) {
+      const r = await runReconcileCycle(state, deps);
+      state = { claimDegraded: r.claimDegraded, sessionSlotsDegraded: r.sessionSlotsDegraded };
+    }
+    // In this scenario every "restore" resolves to a listed-but-unverified session that never disappears (still listed, just no pid) -> not-verifiable, not unknown -> never even reaches the bound, only one launch. This asserts the budget was available at all (not pre-exhausted from before the reset), not the bound's own convergence (covered above).
+    expect(launchCalls).toBe(launchCallsBeforeSecondSaga + 1);
   });
 });
 
