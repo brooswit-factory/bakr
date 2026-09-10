@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claim, emptyStore } from "../../src/claim-model";
 import { save as saveClaims } from "../../src/claim-store-io";
-import { beginLaunch, emptySessionSlots, markLaunchStarted, resolveLaunch, sessionsOn } from "../../src/session-slots";
+import { beginLaunch, emptySessionSlots, markLaunchStarted, resolveLaunch, sessionsOn, unresolvedLaunches, hasLaunchRecordFor } from "../../src/session-slots";
 import { save as saveSlots, load as loadSlots } from "../../src/session-slots-store";
 import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
 import type { ClaimKey } from "../../src/claim-key-resolve";
@@ -217,6 +217,61 @@ describe("the full silent-restore lifecycle", () => {
     const result = await runReconcileCycle(initialDaemonState(), deps);
     expect(result.restored).toEqual([]);
     expect(launchCalls).toBe(0);
+  });
+});
+
+describe("regression (PR #7 review): a crash mid-launch must not silently wedge a session's restore forever", () => {
+  test("a record left with no launchShortId and no error (the exact on-disk shape for the whole duration of launch()) is recovered, logged, and never silently blocks restore going forward", async () => {
+    const dir = await makeTempDir();
+    const key = "/claimed/dir" as ClaimKey;
+    await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
+
+    // Simulate the exact crash window the review demonstrated: beginLaunch's
+    // own saveSlots already happened, but the process ended before
+    // launch() returned — so markLaunchStarted/markLaunchFailed never ran.
+    let slots = emptySessionSlots();
+    slots = beginLaunch(slots, key, "stale-prior-session", "wedged-attempt", 1000);
+    expect(hasLaunchRecordFor(slots, key, "stale-prior-session")).toBe(true);
+    await saveSlots(join(dir, "session-slots.json"), slots);
+
+    // Before the fix, sessionsOn was empty here too, so there's nothing to
+    // "restore" via the normal path in this exact scenario — the bug is
+    // that the record is invisible to BOTH pendingLaunches (no shortId to
+    // resolve) and unresolvedLaunches (no error yet) on the very next load.
+    const reloadedBefore = await loadSlots(join(dir, "session-slots.json"));
+    expect(reloadedBefore.status).toBe("loaded");
+    if (reloadedBefore.status === "loaded") {
+      expect(unresolvedLaunches(reloadedBefore.state)).toHaveLength(0); // not yet logged anywhere — this is the wedge
+    }
+
+    let launchCalls = 0;
+    const deps = baseDeps(dir, async (argv) => {
+      if (argv[0] === "systemd-run") launchCalls += 1;
+      return { exitCode: 0, stdout: "[]", stderr: "" };
+    });
+
+    const result = await runReconcileCycle(initialDaemonState(), deps);
+
+    // The record must now be reported (Constraint 2's every-cycle error
+    // log) rather than silently invisible, and must never be retried
+    // automatically.
+    const reloadedAfter = await loadSlots(join(dir, "session-slots.json"));
+    expect(reloadedAfter.status).toBe("loaded");
+    if (reloadedAfter.status === "loaded") {
+      expect(unresolvedLaunches(reloadedAfter.state)).toHaveLength(1);
+      expect(unresolvedLaunches(reloadedAfter.state)[0]?.error).toMatch(/ended before this launch's outcome was recorded/);
+    }
+    expect(launchCalls).toBe(0); // never auto-retried
+    expect(result.restored).toEqual([]);
+
+    // And it stays reported, cycle after cycle — never silently re-swallowed.
+    const result2 = await runReconcileCycle({ claimDegraded: result.claimDegraded, sessionSlotsDegraded: result.sessionSlotsDegraded }, deps);
+    expect(result2.restored).toEqual([]);
+    expect(launchCalls).toBe(0);
+    const reloadedStill = await loadSlots(join(dir, "session-slots.json"));
+    if (reloadedStill.status === "loaded") {
+      expect(unresolvedLaunches(reloadedStill.state)).toHaveLength(1);
+    }
   });
 });
 

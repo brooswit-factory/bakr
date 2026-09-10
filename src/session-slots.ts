@@ -91,6 +91,47 @@ export function unresolvedLaunches(state: SessionSlotsState): readonly LaunchRec
 }
 
 /**
+ * Promotes every record still missing BOTH `launchShortId` and `error` to
+ * permanently unresolved, with `reason` as its error.
+ *
+ * Such a record can only be produced by a crash between `beginLaunch`'s
+ * own `saveSlots` and `launch()` returning (see daemon.ts) — the window is
+ * not narrow: it spans the entire `launch()` call, a `systemd-run` + `claude
+ * --bg` invocation with a real timeout. Without this promotion, that
+ * record is a silent trap door: `pendingLaunches`' own consumer in
+ * daemon.ts skips it forever (no `launchShortId` to look up in a listing),
+ * `hasLaunchRecordFor` still matches it and blocks a fresh restore attempt
+ * for the same session, and `unresolvedLaunches` excludes it (no `error`
+ * yet) — so it is never resolvable, never restorable, and never logged.
+ * That agent would silently never come back, on this boot or any future
+ * one, found only by a human reading source rather than a log line.
+ *
+ * Safe to call unconditionally on every load (not only at true process
+ * startup, see daemon.ts's own call site): a record legitimately in this
+ * shape only ever exists in memory, mid-cycle, between `beginLaunch` and
+ * its own `markLaunchStarted`/`markLaunchFailed` a few lines later in the
+ * SAME cycle — the daemon loads the store once per cycle, at the start,
+ * before any such record could exist yet. So any record already on disk in
+ * this shape by the time a `load()` call sees it is necessarily left over
+ * from a run that ended (crashed, was killed) before it could finish
+ * recording the outcome — exactly Constraint 2's "cannot distinguish
+ * never-detached from detached-then-the-wrapper-failed": there is no way
+ * to know whether the launch actually happened, so — the safe direction —
+ * it is treated as possibly orphaned and reported, never silently dropped
+ * and never auto-retried (`markLaunchFailed` never clears; see that
+ * function's own doc).
+ */
+export function promoteUnresolvableLaunches(state: SessionSlotsState, reason: string): SessionSlotsState {
+  let next = state;
+  for (const record of state.launches) {
+    if (record.launchShortId === undefined && record.error === undefined) {
+      next = markLaunchFailed(next, record.attemptId, reason);
+    }
+  }
+  return next;
+}
+
+/**
  * True when a launch attempt for exactly this `(key, priorSessionId)` pair
  * already exists — whether still pending resolution or permanently
  * unresolved. A caller deciding whether to restore a session must check

@@ -8,6 +8,7 @@ import {
   markLaunchStarted,
   parseSessionSlotsState,
   pendingLaunches,
+  promoteUnresolvableLaunches,
   resolveLaunch,
   serializeSessionSlotsState,
   sessionsOn,
@@ -103,6 +104,81 @@ describe("failed launches: permanently unresolved, never auto-cleared", () => {
     const before = state;
     state = resolveLaunch(state, "short-1", "session-uuid-1");
     expect(state).toEqual(before);
+    expect(unresolvedLaunches(state)).toHaveLength(1);
+  });
+});
+
+describe("promoteUnresolvableLaunches: closes the crash-mid-launch wedge (review fix, PR #7)", () => {
+  test("a record with no launchShortId and no error is promoted to unresolved", () => {
+    let state = emptySessionSlots();
+    state = beginLaunch(state, KEY_A, "prior-id", "attempt-1", 1000);
+    expect(pendingLaunches(state)).toHaveLength(1);
+    expect(unresolvedLaunches(state)).toHaveLength(0);
+
+    state = promoteUnresolvableLaunches(state, "crashed mid-launch");
+
+    expect(pendingLaunches(state)).toHaveLength(0);
+    expect(unresolvedLaunches(state)).toHaveLength(1);
+    expect(unresolvedLaunches(state)[0]?.error).toBe("crashed mid-launch");
+    // The stale prior id is untouched — a promoted record behaves exactly like any other permanently-failed launch.
+    expect(sessionsOn(state, KEY_A)).toEqual([]);
+  });
+
+  test("does not touch a record that already has a launchShortId (genuinely in flight, not wedged)", () => {
+    let state = emptySessionSlots();
+    state = beginLaunch(state, KEY_A, undefined, "attempt-1", 1000);
+    state = markLaunchStarted(state, "attempt-1", "short-1");
+
+    const before = state;
+    state = promoteUnresolvableLaunches(state, "crashed mid-launch");
+
+    expect(state).toEqual(before);
+    expect(pendingLaunches(state)).toHaveLength(1);
+    expect(unresolvedLaunches(state)).toHaveLength(0);
+  });
+
+  test("does not touch a record that already has an error (already permanently unresolved)", () => {
+    let state = emptySessionSlots();
+    state = beginLaunch(state, KEY_A, undefined, "attempt-1", 1000);
+    state = markLaunchFailed(state, "attempt-1", "original failure reason");
+
+    state = promoteUnresolvableLaunches(state, "crashed mid-launch");
+
+    expect(unresolvedLaunches(state)[0]?.error).toBe("original failure reason"); // not overwritten
+  });
+
+  test("a no-op when there is nothing to promote", () => {
+    const state = emptySessionSlots();
+    expect(promoteUnresolvableLaunches(state, "crashed mid-launch")).toEqual(state);
+  });
+
+  test("promotes multiple wedged records independently, leaves unrelated records alone", () => {
+    let state = emptySessionSlots();
+    state = beginLaunch(state, KEY_A, undefined, "wedged-1", 1000); // wedged: no shortId, no error
+    state = beginLaunch(state, KEY_B, undefined, "wedged-2", 1000); // wedged too
+    state = beginLaunch(state, KEY_A, undefined, "in-flight", 2000);
+    state = markLaunchStarted(state, "in-flight", "short-x"); // genuinely in flight, must survive
+
+    state = promoteUnresolvableLaunches(state, "crashed mid-launch");
+
+    expect(unresolvedLaunches(state)).toHaveLength(2);
+    expect(pendingLaunches(state)).toHaveLength(1);
+    expect(pendingLaunches(state)[0]?.attemptId).toBe("in-flight");
+  });
+
+  test("once promoted, a wedged record's session is no longer blocked from restore by hasLaunchRecordFor once it's gone through the full unresolved lifecycle — but the guard still holds while it's the current record for that (key, priorSessionId)", () => {
+    // This documents the actual current behaviour: promotion does NOT clear
+    // hasLaunchRecordFor for the (key, priorSessionId) pair — it converts
+    // the record from silently-blocking to loudly-blocking (Constraint 2's
+    // "never retried automatically"), which is the whole point: the fix is
+    // about VISIBILITY, not about resuming the retry.
+    let state = emptySessionSlots();
+    state = beginLaunch(state, KEY_A, "prior-id", "wedged-1", 1000);
+    expect(hasLaunchRecordFor(state, KEY_A, "prior-id")).toBe(true);
+
+    state = promoteUnresolvableLaunches(state, "crashed mid-launch");
+
+    expect(hasLaunchRecordFor(state, KEY_A, "prior-id")).toBe(true);
     expect(unresolvedLaunches(state)).toHaveLength(1);
   });
 });

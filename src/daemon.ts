@@ -31,6 +31,7 @@ import {
   pendingLaunches,
   unresolvedLaunches,
   hasLaunchRecordFor,
+  promoteUnresolvableLaunches,
   type SessionSlotsState,
 } from "./session-slots";
 import { listBackgroundSessions, decideLiveness, isPidAlive, launch, type RunCommand } from "./spawn";
@@ -154,6 +155,29 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   }
 
   let sessionSlotsState = loadedSlots;
+
+  // A record still missing BOTH `launchShortId` and `error` can only be a
+  // leftover from a crash mid-`launch()` in a PRIOR run of this process
+  // (see promoteUnresolvableLaunches's own doc for why this is safe to do
+  // unconditionally on every load) — promote it to permanently unresolved
+  // BEFORE anything else touches the store this cycle, so it is reported
+  // rather than silently wedged forever (review fix, BAKR-12 PR #7:
+  // without this, such a record was neither resolvable, nor restorable,
+  // nor ever logged).
+  const wedgedRecords = sessionSlotsState.launches.filter((l) => l.launchShortId === undefined && l.error === undefined);
+  if (wedgedRecords.length > 0) {
+    sessionSlotsState = promoteUnresolvableLaunches(
+      sessionSlotsState,
+      "the daemon process ended before this launch's outcome was recorded (crashed, or was killed, mid-launch) — cannot distinguish never-detached from detached-then-the-wrapper-failed (BAKR-8 Constraint 2)"
+    );
+    await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
+    for (const record of wedgedRecords) {
+      log(
+        "error",
+        `recovered an unresolvable launch record for "${record.key}" (attempt ${record.attemptId}, ${new Date(record.attemptedAt).toISOString()}) left by a prior run that ended mid-launch — marked permanently unresolved, never retried automatically (BAKR-8 Constraint 2)`
+      );
+    }
+  }
 
   let sessions;
   try {
