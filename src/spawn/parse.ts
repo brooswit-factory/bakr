@@ -57,6 +57,25 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * parse, same reasoning: one odd entry (a future claude version adding a
  * field, an entry mid-write) should not blind this substrate to every
  * other, valid entry.
+ *
+ * BAKR-12 hardening (Constraint 1 of the daemon story, BAKR-8): the
+ * per-entry skip above is correct for a single odd entry, but not for the
+ * SYSTEMATIC case — if a future `claude` renames or drops `id` (or any
+ * other required field) on every entry, every `kind:"background"` entry
+ * fails validation and this function used to return `[]` just like a
+ * genuinely-empty listing would. A caller reading that `[]` cannot tell
+ * "nothing is running" from "the parser can no longer read what claude is
+ * telling it" — and boot restore is exactly where that ambiguity is most
+ * dangerous: a spurious empty listing there means relaunching duplicates
+ * beside sessions that are, in fact, alive (see the daemon's own restore
+ * module). So: if the raw array contained at least one `kind ===
+ * "background"` entry but NONE of them survived field validation, this now
+ * throws instead of returning `[]` — matching this same file's own
+ * discipline for a non-array top level. A raw array with zero background
+ * entries to begin with is unaffected and still returns `[]` normally,
+ * because there genuinely is nothing to report. This is a change to
+ * merged, reviewed code (BAKR-11) — the throw-on-systematic-failure
+ * behaviour did not exist before BAKR-12.
  */
 export function parseAgentsJson(raw: string): BackgroundSessionInfo[] {
   const parsed: unknown = JSON.parse(raw);
@@ -64,10 +83,12 @@ export function parseAgentsJson(raw: string): BackgroundSessionInfo[] {
     throw new Error("expected `claude agents --json` to print a JSON array");
   }
 
+  let backgroundCandidates = 0;
   const result: BackgroundSessionInfo[] = [];
   for (const item of parsed) {
     if (!isPlainObject(item)) continue;
     if (item["kind"] !== "background") continue;
+    backgroundCandidates += 1;
     const { id, sessionId, cwd, startedAt } = item;
     if (typeof id !== "string" || typeof sessionId !== "string" || typeof cwd !== "string" || typeof startedAt !== "number") {
       continue;
@@ -76,6 +97,13 @@ export function parseAgentsJson(raw: string): BackgroundSessionInfo[] {
     const state = typeof item["state"] === "string" ? (item["state"] as string) : undefined;
     result.push({ id, sessionId, cwd, startedAt, pid, state });
   }
+
+  if (backgroundCandidates > 0 && result.length === 0) {
+    throw new Error(
+      `\`claude agents --json\` listed ${backgroundCandidates} background entr${backgroundCandidates === 1 ? "y" : "ies"}, but none survived field validation — this looks like a systematic shape change (e.g. a renamed/dropped field), not one odd entry, so this is reported as a parse failure rather than an empty list (BAKR-12 Constraint 1)`
+    );
+  }
+
   return result;
 }
 

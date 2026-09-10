@@ -51,3 +51,13 @@ export function resolveStateHome(inputs: XdgInputs): string {
 export function claimsPath(inputs: XdgInputs): string {
   return join(resolveStateHome(inputs), "bakr", "claims.json");
 }
+
+/**
+ * `$XDG_STATE_HOME/bakr/session-slots.json` — BAKR-12's own thin "which
+ * session ids are on" store (see session-slots.ts), deliberately alongside
+ * `claims.json` rather than inside the working tree, same directory, same
+ * durability rationale as the claim store above.
+ */
+export function sessionSlotsPath(inputs: XdgInputs): string {
+  return join(resolveStateHome(inputs), "bakr", "session-slots.json");
+}

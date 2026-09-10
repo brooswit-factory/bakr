@@ -41,6 +41,35 @@ describe("parseAgentsJson", () => {
   });
 });
 
+describe("parseAgentsJson — Constraint 1 hardening (BAKR-12): systematic vs. individual failure", () => {
+  test("throws when every background entry fails validation (a systematic shape change), instead of returning []", () => {
+    const raw = JSON.stringify([
+      { id: "bad-1", kind: "background" }, // missing cwd/startedAt/sessionId
+      { id: "bad-2", kind: "background" }, // same
+    ]);
+    expect(() => parseAgentsJson(raw)).toThrow(/none survived field validation/);
+  });
+
+  test("still returns [] when there are zero background candidates at all — nothing systematic to report", () => {
+    const raw = JSON.stringify([{ pid: 1, cwd: "/a", kind: "interactive", startedAt: 1, sessionId: "s1", name: "x" }]);
+    expect(parseAgentsJson(raw)).toEqual([]);
+  });
+
+  test("does not throw when at least one background entry survives, even if others fail — the individual-skip path is unaffected", () => {
+    const raw = JSON.stringify([
+      { id: "good", cwd: "/b", kind: "background", startedAt: 2, sessionId: "s2" },
+      { id: "bad", kind: "background" },
+    ]);
+    expect(() => parseAgentsJson(raw)).not.toThrow();
+    expect(parseAgentsJson(raw)).toHaveLength(1);
+  });
+
+  test("a single malformed background entry (the only one present) also throws — the systematic case is not gated on count", () => {
+    const raw = JSON.stringify([{ id: "bad", kind: "background" }]);
+    expect(() => parseAgentsJson(raw)).toThrow();
+  });
+});
+
 describe("filterExactCwd", () => {
   const sessions = [
     { id: "a", sessionId: "sa", cwd: "/home/op/project", startedAt: 1, pid: 1, state: undefined },

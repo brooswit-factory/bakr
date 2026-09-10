@@ -31,6 +31,7 @@ export function currentXdgInputs(): xdg.XdgInputs {
 }
 
 export const claimsPath = (): string => xdg.claimsPath(currentXdgInputs());
+export const sessionSlotsPath = (): string => xdg.sessionSlotsPath(currentXdgInputs());
 
 /** The real `lstat`/`readlink`, for wiring into `resolveClaimKey` (see claim-key-resolve.ts). */
 export const realResolveInputs: ResolveInputs = {
