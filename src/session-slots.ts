@@ -8,17 +8,39 @@
 // paths.ts / session-slots-store.ts).
 //
 // Kept to exactly what restore needs and nothing else: an ANONYMOUS
-// collection of claude's own session ids per claimed directory — no names,
-// no user-visible ids, no on/off/archive/rename verbs, no per-agent
-// metadata beyond the raw identity and the bookkeeping this module's own
-// Constraint 2 handling requires (see LaunchRecord below). The ticket's own
-// word for this shape is "slots" — used here as the file's name, not as a
+// collection of "slots" per claimed directory — no names, no user-visible
+// ids, no on/off/archive/rename verbs, no per-agent metadata beyond the
+// two raw identities below and the bookkeeping this module's own
+// Constraint 2 handling requires (see LaunchRecord). The ticket's own word
+// for this shape is "slots" — used here as the file's name, not as a
 // euphemism for a lifecycle vocabulary.
 //
-// A session id here is claude's OWN identity (the full UUID
-// spawn/parse.ts's BackgroundSessionInfo.sessionId reports), never a
-// bakr-minted one — this is what keeps bakr out of BAKR-2's durable-id
-// design entirely, per the ticket's own steer.
+// TWO ids per slot, not one — found necessary live (BAKR-12 PR #9,
+// verified by the story on 2026-09-10): claude's own session identity
+// splits into a DURABLE conversation id (the only thing `--resume` can
+// reliably take — the reviewer's own live trace showed a resume of a
+// FRESH resume's rotated id fail with "No conversation found", while
+// resuming the ORIGINAL id kept succeeding even after already being
+// resumed twice) and a LIVE session id (the ephemeral thing that shows up
+// in `claude agents --json` right now, useful only for checking liveness
+// this cycle). The two conflated into one field is what made the daemon's
+// earlier restore-spawn loop possible in the first place: each successful
+// restore overwrote the record with the just-rotated live id, which then
+// could not itself be resumed, so the NEXT cycle found it absent and
+// "restored" it again — round and round. `durableSessionId` is written
+// once, at slot creation, and NEVER changes; `liveSessionId` is the only
+// field a restore's resolution updates. Both remain claude's OWN ids
+// (never bakr-minted), keeping bakr out of BAKR-2's durable-id design.
+//
+// Honest, disclosed limit carried over from the story's own finding: this
+// split fixes the SPECIFIC observed failure (resuming a rotated id
+// fails, resuming the original succeeds), not every possible one — the
+// story's own live probing saw a rotated id resume successfully on a
+// different occasion, so a slot's restorability may depend on some
+// property of claude's own session handling neither this codebase nor the
+// story has pinned down. When it goes the wrong way even for the durable
+// id, Constraint 2's bounded-retry give-up (see daemon.ts) is still what
+// catches it — this module does not claim to solve that deeper mystery.
 //
 // The wire format (parse/serialize) mirrors claim-model.ts's own section,
 // which itself mirrors the versioned-envelope / pure-parse-never-throws
@@ -29,6 +51,17 @@
 // differ.
 
 import type { ClaimKey } from "./claim-key-resolve";
+
+/**
+ * One anonymous slot: a durable conversation id (what `--resume` takes,
+ * fixed for the slot's whole life) and the last-known live session id
+ * (what a listing reports right now, used only to check liveness). See
+ * the module comment for why these are two fields, not one.
+ */
+export interface Slot {
+  readonly durableSessionId: string;
+  readonly liveSessionId: string;
+}
 
 /**
  * One launch attempt this daemon is responsible for, tracked from BEFORE
@@ -56,7 +89,7 @@ import type { ClaimKey } from "./claim-key-resolve";
 export interface LaunchRecord {
   readonly attemptId: string;
   readonly key: ClaimKey;
-  /** The session id this launch was resuming, or `undefined` for a fresh launch (no prior session). */
+  /** The DURABLE session id this launch was resuming (always what was passed to `--resume`), or `undefined` for a fresh launch (no prior session). Never the live/rotated id. */
   readonly priorSessionId: string | undefined;
   readonly attemptedAt: number;
   readonly launchShortId: string | undefined;
@@ -64,19 +97,15 @@ export interface LaunchRecord {
 }
 
 export interface SessionSlotsState {
-  readonly onByKey: { readonly [key: string]: readonly string[] };
+  readonly onByKey: { readonly [key: string]: readonly Slot[] };
   readonly launches: readonly LaunchRecord[];
   /**
    * Consecutive restore attempts for a claimed directory that have not yet
    * produced a verifiably-alive session — keyed by directory rather than by
-   * session id, because a resume that "succeeds" but is actually the
-   * measurement-5 silent-empty-session failure still causes `resolveLaunch`
-   * to rotate `onByKey` to a brand-new id every cycle (see daemon.ts's own
-   * bound-checking comment for the live incident this closes). A per-
-   * (key, sessionId) counter would never see the same pair twice and would
-   * never trip; this counter survives exactly that churn because it is
-   * keyed by the one thing that does NOT change cycle to cycle: the
-   * directory itself.
+   * session id, for the same churn reason the module comment above
+   * explains for `Slot` itself: even with the durable/live split, a
+   * directory-keyed counter is the more robust bound (it survives any
+   * churn in either id) and it is what the story's own review asked for.
    */
   readonly restoreAttemptCounts: { readonly [key: string]: number };
 }
@@ -101,8 +130,14 @@ export function resetRestoreAttempts(state: SessionSlotsState, key: ClaimKey): S
   return { ...state, restoreAttemptCounts };
 }
 
-export function sessionsOn(state: SessionSlotsState, key: ClaimKey): readonly string[] {
+/** The full slot objects (durable + live id) for a claimed directory — what the daemon's own reconcile loop iterates. */
+export function slotsOn(state: SessionSlotsState, key: ClaimKey): readonly Slot[] {
   return state.onByKey[key] ?? [];
+}
+
+/** Durable session ids only, for callers that just want "what's registered" (e.g. the demo harness's own status print). */
+export function sessionsOn(state: SessionSlotsState, key: ClaimKey): readonly string[] {
+  return slotsOn(state, key).map((s) => s.durableSessionId);
 }
 
 export function claimedKeysWithSlots(state: SessionSlotsState): readonly ClaimKey[] {
@@ -163,15 +198,21 @@ export function promoteUnresolvableLaunches(state: SessionSlotsState, reason: st
 /**
  * True when a launch attempt for exactly this `(key, priorSessionId)` pair
  * already exists — whether still pending resolution or permanently
- * unresolved. A caller deciding whether to restore a session must check
- * this FIRST: without it, a restore whose launch succeeded but is still
- * awaiting a listing to reveal its rotated session id (see `resolveLaunch`)
- * would look, cycle after cycle, exactly like a session that still needs
- * restoring — because `onByKey` does not get updated until resolution — and
- * a naive caller would launch a duplicate every cycle until resolution
+ * unresolved. `priorSessionId` here is always a DURABLE id (see
+ * `LaunchRecord`'s own doc) — since a slot's durable id never changes, this
+ * guard now correctly matches across cycles for the SAME slot even while
+ * its live id churns, which is what actually stops the restore-spawn loop
+ * found in review; the bounded-retry counter (`restoreAttemptCounts`) is
+ * kept as a second, independent line of defence rather than removed.
+ *
+ * A caller deciding whether to restore a session must check this FIRST:
+ * without it, a restore whose launch succeeded but is still awaiting a
+ * listing to reveal its rotated live id (see `resolveLaunch`) would look,
+ * cycle after cycle, exactly like a session that still needs restoring —
+ * because the slot's live id does not update until resolution — and a
+ * naive caller would launch a duplicate every cycle until resolution
  * catches up. The same check is what makes Constraint 2's "never retried
- * automatically" true for a permanently-failed attempt, for the identical
- * reason: `priorSessionId` never left `onByKey` after a failure either.
+ * automatically" true for a permanently-failed attempt.
  */
 export function hasLaunchRecordFor(state: SessionSlotsState, key: ClaimKey, priorSessionId: string): boolean {
   return state.launches.some((l) => l.key === key && l.priorSessionId === priorSessionId);
@@ -182,7 +223,8 @@ export function hasLaunchRecordFor(state: SessionSlotsState, key: ClaimKey, prio
  * caller must persist the returned state to disk before calling `launch()`,
  * not after, for this to actually close Constraint 2's gap. Returns the
  * minted `attemptId` the caller must hand back to `markLaunchStarted` /
- * `markLaunchFailed` once `launch()` settles.
+ * `markLaunchFailed` once `launch()` settles. `priorSessionId`, when given,
+ * must be a slot's DURABLE id — this is what gets passed to `--resume`.
  */
 export function beginLaunch(
   state: SessionSlotsState,
@@ -194,7 +236,7 @@ export function beginLaunch(
   const record: LaunchRecord = { attemptId, key, priorSessionId, attemptedAt: now, launchShortId: undefined, error: undefined };
   const withRecord = { ...state, launches: [...state.launches, record] };
   // A FRESH launch (no priorSessionId — never the daemon's own restore
-  // path, which always resumes a specific id) is a deliberate new
+  // path, which always resumes a specific durable id) is a deliberate new
   // registration for this directory, e.g. via the demo harness. It gets a
   // clean retry budget rather than inheriting an exhausted count left by an
   // earlier, unrelated restore saga for the same key.
@@ -220,43 +262,47 @@ export function markLaunchFailed(state: SessionSlotsState, attemptId: string, er
 }
 
 /**
- * Re-verified live on this workspace (claude 2.1.267, 2026-09-10, BAKR-12):
- * the ticket's own measurement 4 says a resume always rotates to a NEW
- * session id. A live restore-after-stop cycle run here reproduced that
- * once (old id -> a different new id), but a second one — resuming a
- * session that had been cleanly `claude stop`-ped — resolved back to the
- * SAME session id it started with, matching the `--help` text's own
- * wording more closely ("continues that session ... under the same ID, or
- * starts a copy"). This function does not need to care which happens: the
- * branch below is a no-op when `resolvedSessionId === priorSessionId`
- * (`existing.map` replaces the old id with the identical value), so both
- * outcomes are handled correctly without any special-casing.
- *
  * A later listing found `launchShortId` with session id `resolvedSessionId`
- * — finalizes the matching pending record: removes it from `launches`, and
- * either REPLACES `priorSessionId` with `resolvedSessionId` in `onByKey`
- * (the restore/rotation case — session ids rotate on every resume, so the
- * stale id must not linger) or, when `priorSessionId` is `undefined` (a
- * fresh launch), ADDS `resolvedSessionId` to `onByKey[key]`. A no-op if no
- * pending record matches `launchShortId` — total, like claim-model.ts's own
- * mutators, rather than an error a reconcile cycle would have to guard.
+ * — finalizes the matching pending record and removes it from `launches`.
+ *
+ * - Fresh launch (`priorSessionId === undefined`): creates a NEW slot with
+ *   `durableSessionId === liveSessionId === resolvedSessionId` — at the
+ *   moment of a fresh launch, the two identities are, definitionally, the
+ *   same thing (no restore has happened yet to reveal a rotation). Skips
+ *   creating a duplicate slot if one with this durable id already exists.
+ * - Restore (`priorSessionId` defined — always a durable id): finds the
+ *   slot whose `durableSessionId === priorSessionId` and updates ONLY its
+ *   `liveSessionId` to `resolvedSessionId`. **`durableSessionId` is never
+ *   overwritten here** — this is the fix for the live incident the module
+ *   comment describes: overwriting it with a rotated id that might not
+ *   itself be resumable is what caused the restore-spawn loop. If no
+ *   matching slot is found (should not happen in normal operation — a
+ *   defensive fallback, not an expected path), a new slot is created
+ *   rather than the update being silently lost.
+ *
+ * A no-op if no pending record matches `launchShortId` — total, like
+ * claim-model.ts's own mutators, rather than an error a reconcile cycle
+ * would have to guard.
  */
 export function resolveLaunch(state: SessionSlotsState, launchShortId: string, resolvedSessionId: string): SessionSlotsState {
   const record = state.launches.find((l) => l.launchShortId === launchShortId && l.error === undefined);
   if (record === undefined) return state;
 
   const launches = state.launches.filter((l) => l.attemptId !== record.attemptId);
-  const existing = state.onByKey[record.key] ?? [];
-  const next =
-    record.priorSessionId !== undefined
-      ? existing.includes(record.priorSessionId)
-        ? existing.map((id) => (id === record.priorSessionId ? resolvedSessionId : id))
-        : existing.includes(resolvedSessionId)
-          ? existing
-          : [...existing, resolvedSessionId]
-      : existing.includes(resolvedSessionId)
-        ? existing
-        : [...existing, resolvedSessionId];
+  const existing = slotsOn(state, record.key);
+
+  let next: readonly Slot[];
+  if (record.priorSessionId !== undefined) {
+    const index = existing.findIndex((s) => s.durableSessionId === record.priorSessionId);
+    next =
+      index === -1
+        ? [...existing, { durableSessionId: record.priorSessionId, liveSessionId: resolvedSessionId }]
+        : existing.map((s, i) => (i === index ? { ...s, liveSessionId: resolvedSessionId } : s));
+  } else {
+    next = existing.some((s) => s.durableSessionId === resolvedSessionId)
+      ? existing
+      : [...existing, { durableSessionId: resolvedSessionId, liveSessionId: resolvedSessionId }];
+  }
 
   return { ...state, onByKey: { ...state.onByKey, [record.key]: next }, launches };
 }
@@ -274,9 +320,14 @@ interface PersistedLaunchRecord {
   readonly error: string | null;
 }
 
+interface PersistedSlot {
+  readonly durableSessionId: string;
+  readonly liveSessionId: string;
+}
+
 interface PersistedSessionSlots {
   readonly version: typeof SESSION_SLOTS_VERSION;
-  readonly onByKey: { readonly [key: string]: readonly string[] };
+  readonly onByKey: { readonly [key: string]: readonly PersistedSlot[] };
   readonly launches: readonly PersistedLaunchRecord[];
   readonly restoreAttemptCounts: { readonly [key: string]: number };
 }
@@ -285,9 +336,30 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isValidOnByKey(value: unknown): value is Record<string, readonly string[]> {
-  if (!isPlainObject(value)) return false;
-  return Object.values(value).every((v) => Array.isArray(v) && v.every((id) => typeof id === "string"));
+function isValidPersistedSlot(value: unknown): value is PersistedSlot {
+  return isPlainObject(value) && typeof value["durableSessionId"] === "string" && typeof value["liveSessionId"] === "string";
+}
+
+/**
+ * Accepts EITHER the current per-entry shape (`{durableSessionId,
+ * liveSessionId}`) OR the legacy pre-durable/live-split shape (a bare
+ * session id string, written by every build up to and including PR #8) —
+ * a legacy string `s` is treated as `{durableSessionId: s, liveSessionId:
+ * s}`, which is exactly what that string meant before this split existed.
+ * Applying the SAME lesson the previous review round taught (a routine
+ * upgrade must not trip Constraint 3's malformed path over a field whose
+ * old value has an obvious, correct reading in the new shape) — proactively
+ * this time, rather than after another live incident. `serializeSessionSlotsState`
+ * always writes the current shape; this is read-compat only, one direction.
+ */
+function normalizeSlotEntry(value: unknown): Slot | undefined {
+  if (typeof value === "string") {
+    return { durableSessionId: value, liveSessionId: value };
+  }
+  if (isValidPersistedSlot(value)) {
+    return value;
+  }
+  return undefined;
 }
 
 function isValidRestoreAttemptCounts(value: unknown): value is Record<string, number> {
@@ -316,9 +388,13 @@ export function serializeSessionSlotsState(state: SessionSlotsState): string {
     launchShortId: l.launchShortId ?? null,
     error: l.error ?? null,
   }));
+  const onByKey: Record<string, PersistedSlot[]> = {};
+  for (const [key, slots] of Object.entries(state.onByKey)) {
+    onByKey[key] = slots.map((s) => ({ durableSessionId: s.durableSessionId, liveSessionId: s.liveSessionId }));
+  }
   const persisted: PersistedSessionSlots = {
     version: SESSION_SLOTS_VERSION,
-    onByKey: state.onByKey,
+    onByKey,
     launches,
     restoreAttemptCounts: state.restoreAttemptCounts,
   };
@@ -356,10 +432,13 @@ export function parseSessionSlotsState(source: string): ParseResult {
   // value (not an object of numbers) is still rejected as malformed below
   // — this is a default for absence, not a loosening of the shape check.
   const restoreAttemptCountsField = isPlainObject(parsed) ? parsed["restoreAttemptCounts"] : undefined;
+  const onByKeyRaw = isPlainObject(parsed) ? parsed["onByKey"] : undefined;
+  const onByKeyShapeOk = isPlainObject(onByKeyRaw) && Object.values(onByKeyRaw).every((v) => Array.isArray(v));
+
   if (
     !isPlainObject(parsed) ||
     parsed["version"] !== SESSION_SLOTS_VERSION ||
-    !isValidOnByKey(parsed["onByKey"]) ||
+    !onByKeyShapeOk ||
     !Array.isArray(parsed["launches"]) ||
     (restoreAttemptCountsField !== undefined && !isValidRestoreAttemptCounts(restoreAttemptCountsField))
   ) {
@@ -368,6 +447,19 @@ export function parseSessionSlotsState(source: string): ParseResult {
       error:
         "session slots store does not have the expected { version: 1, onByKey: {...}, launches: [...], restoreAttemptCounts?: {...} } shape",
     };
+  }
+
+  const onByKey: Record<string, Slot[]> = {};
+  for (const [key, rawSlots] of Object.entries(onByKeyRaw as Record<string, unknown[]>)) {
+    const slots: Slot[] = [];
+    for (const rawSlot of rawSlots) {
+      const normalized = normalizeSlotEntry(rawSlot);
+      if (normalized === undefined) {
+        return { ok: false, error: `an on-set entry for "${key}" does not have the expected shape: ${JSON.stringify(rawSlot)}` };
+      }
+      slots.push(normalized);
+    }
+    onByKey[key] = slots;
   }
 
   const launches: LaunchRecord[] = [];
@@ -387,6 +479,6 @@ export function parseSessionSlotsState(source: string): ParseResult {
 
   return {
     ok: true,
-    state: { onByKey: parsed["onByKey"], launches, restoreAttemptCounts: (restoreAttemptCountsField as Record<string, number> | undefined) ?? {} },
+    state: { onByKey, launches, restoreAttemptCounts: (restoreAttemptCountsField as Record<string, number> | undefined) ?? {} },
   };
 }

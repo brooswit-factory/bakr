@@ -15,6 +15,7 @@ import {
   resolveLaunch,
   serializeSessionSlotsState,
   sessionsOn,
+  slotsOn,
   unresolvedLaunches,
   type SessionSlotsState,
 } from "../../src/session-slots";
@@ -54,28 +55,49 @@ describe("fresh-launch lifecycle: begin -> started -> resolve", () => {
   });
 });
 
-describe("restore/rotation lifecycle: the resolved id REPLACES the prior one", () => {
-  test("resolving a restore replaces priorSessionId with the new session id, never appends alongside it", () => {
+describe("restore/rotation lifecycle: the DURABLE id never moves; only liveSessionId updates (fixed after live review — see session-slots.ts's own module comment)", () => {
+  test("resolving a restore updates liveSessionId only — durableSessionId (what --resume takes) is UNCHANGED", () => {
     let state = emptySessionSlots();
     state = beginLaunch(state, KEY_A, undefined, "attempt-1", 1000);
     state = markLaunchStarted(state, "attempt-1", "short-1");
-    state = resolveLaunch(state, "short-1", "session-uuid-OLD");
-    expect(sessionsOn(state, KEY_A)).toEqual(["session-uuid-OLD"]);
+    state = resolveLaunch(state, "short-1", "session-uuid-DURABLE");
+    expect(sessionsOn(state, KEY_A)).toEqual(["session-uuid-DURABLE"]);
+    expect(slotsOn(state, KEY_A)).toEqual([{ durableSessionId: "session-uuid-DURABLE", liveSessionId: "session-uuid-DURABLE" }]);
 
-    state = beginLaunch(state, KEY_A, "session-uuid-OLD", "attempt-2", 2000);
+    // A restore resumes the durable id and the listing reveals a ROTATED live id.
+    state = beginLaunch(state, KEY_A, "session-uuid-DURABLE", "attempt-2", 2000);
     state = markLaunchStarted(state, "attempt-2", "short-2");
-    state = resolveLaunch(state, "short-2", "session-uuid-NEW");
+    state = resolveLaunch(state, "short-2", "session-uuid-ROTATED");
 
-    expect(sessionsOn(state, KEY_A)).toEqual(["session-uuid-NEW"]);
-    expect(sessionsOn(state, KEY_A)).not.toContain("session-uuid-OLD");
+    // sessionsOn (durable ids) is untouched — this is the actual fix.
+    expect(sessionsOn(state, KEY_A)).toEqual(["session-uuid-DURABLE"]);
+    // But the live id used for liveness checks did update.
+    expect(slotsOn(state, KEY_A)).toEqual([{ durableSessionId: "session-uuid-DURABLE", liveSessionId: "session-uuid-ROTATED" }]);
   });
 
-  test("a restore whose priorSessionId is not (or no longer) present in onByKey still adds the new id rather than dropping it", () => {
+  test("a restore whose priorSessionId no longer matches any existing slot still records something rather than silently dropping it (defensive fallback, not an expected path)", () => {
     let state = emptySessionSlots();
     state = beginLaunch(state, KEY_A, "session-uuid-STALE", "attempt-1", 1000);
     state = markLaunchStarted(state, "attempt-1", "short-1");
     state = resolveLaunch(state, "short-1", "session-uuid-NEW");
-    expect(sessionsOn(state, KEY_A)).toEqual(["session-uuid-NEW"]);
+    // No slot with durableSessionId "session-uuid-STALE" existed beforehand — the fallback creates one rather than losing the update.
+    expect(slotsOn(state, KEY_A)).toEqual([{ durableSessionId: "session-uuid-STALE", liveSessionId: "session-uuid-NEW" }]);
+  });
+
+  test("resuming the SAME durable id repeatedly (multiple restore sagas) never creates a second slot", () => {
+    let state = emptySessionSlots();
+    state = beginLaunch(state, KEY_A, undefined, "attempt-1", 1000);
+    state = markLaunchStarted(state, "attempt-1", "short-1");
+    state = resolveLaunch(state, "short-1", "durable-1");
+
+    for (let i = 2; i <= 4; i++) {
+      state = beginLaunch(state, KEY_A, "durable-1", `attempt-${i}`, 1000 * i);
+      state = markLaunchStarted(state, `attempt-${i}`, `short-${i}`);
+      state = resolveLaunch(state, `short-${i}`, `rotated-${i}`);
+    }
+
+    expect(sessionsOn(state, KEY_A)).toEqual(["durable-1"]); // still exactly one slot
+    expect(slotsOn(state, KEY_A)).toEqual([{ durableSessionId: "durable-1", liveSessionId: "rotated-4" }]); // live id reflects the latest rotation
   });
 });
 
@@ -357,6 +379,54 @@ describe("wire format round-trip", () => {
       state = recordRestoreAttempt(state, KEY_A);
       state = recordRestoreAttempt(state, KEY_A);
       expectRoundTrips(state);
+    });
+  });
+
+  describe("onByKey accepts the LEGACY pre-durable/live-split shape (bare id strings) proactively — applying the same lesson learned above before another live incident forces it", () => {
+    test("a legacy bare-string on-set entry (written by every build up to and including PR #8) parses, normalized to durableSessionId === liveSessionId === that string", () => {
+      const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: { [KEY_A]: ["legacy-session-id"] }, launches: [] }));
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(sessionsOn(result.state, KEY_A)).toEqual(["legacy-session-id"]);
+        expect(slotsOn(result.state, KEY_A)).toEqual([{ durableSessionId: "legacy-session-id", liveSessionId: "legacy-session-id" }]);
+      }
+    });
+
+    test("the current shape ({durableSessionId, liveSessionId}) parses directly, without normalization changing it", () => {
+      const result = parseSessionSlotsState(
+        JSON.stringify({ version: 1, onByKey: { [KEY_A]: [{ durableSessionId: "d1", liveSessionId: "l1" }] }, launches: [] })
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(slotsOn(result.state, KEY_A)).toEqual([{ durableSessionId: "d1", liveSessionId: "l1" }]);
+      }
+    });
+
+    test("legacy and current shapes can coexist in the same onByKey array (e.g. a store written partly by an old build, partly by this one)", () => {
+      const result = parseSessionSlotsState(
+        JSON.stringify({ version: 1, onByKey: { [KEY_A]: ["legacy-id", { durableSessionId: "d2", liveSessionId: "l2" }] }, launches: [] })
+      );
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(slotsOn(result.state, KEY_A)).toEqual([
+          { durableSessionId: "legacy-id", liveSessionId: "legacy-id" },
+          { durableSessionId: "d2", liveSessionId: "l2" },
+        ]);
+      }
+    });
+
+    test("an on-set entry that is neither a string nor a valid {durableSessionId, liveSessionId} object is still rejected as malformed", () => {
+      const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: { [KEY_A]: [{ durableSessionId: "d1" }] }, launches: [] }));
+      expect(result.ok).toBe(false);
+    });
+
+    test("serializeSessionSlotsState always writes the CURRENT shape, never the legacy one, even for a slot originally read from a legacy entry", () => {
+      const result = parseSessionSlotsState(JSON.stringify({ version: 1, onByKey: { [KEY_A]: ["legacy-id"] }, launches: [] }));
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        const serialized = JSON.parse(serializeSessionSlotsState(result.state));
+        expect(serialized.onByKey[KEY_A]).toEqual([{ durableSessionId: "legacy-id", liveSessionId: "legacy-id" }]);
+      }
     });
   });
 });
