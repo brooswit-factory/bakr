@@ -44,10 +44,35 @@ fi
 
 mkdir -p "$UNIT_DEST_DIR"
 
+# In a `sed` REPLACEMENT (never its pattern), an unescaped `&` means "the
+# entire matched text" and an unescaped `\` starts an escape sequence — so a
+# clone path or bun path containing either would silently corrupt the
+# rendered ExecStart instead of substituting literally (review of this PR,
+# BAKR-13: a clone at a path containing `&` substituted the placeholder back
+# into itself, and the installer went on to report success). Escaping both
+# in the VALUES before they go anywhere near `sed`'s replacement side is
+# what makes the substitution literal regardless of what the resolved paths
+# contain.
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[\&]/\\&/g'
+}
+BUN_PATH_ESCAPED="$(escape_sed_replacement "$BUN_PATH")"
+REPO_ROOT_ESCAPED="$(escape_sed_replacement "$REPO_ROOT")"
+
 RENDERED_UNIT="$(sed \
-  -e "s|@@BUN_PATH@@|$BUN_PATH|g" \
-  -e "s|@@REPO_ROOT@@|$REPO_ROOT|g" \
+  -e "s|@@BUN_PATH@@|$BUN_PATH_ESCAPED|g" \
+  -e "s|@@REPO_ROOT@@|$REPO_ROOT_ESCAPED|g" \
   "$UNIT_SRC")"
+
+# Belt-and-suspenders (review's own suggestion): whatever the cause, a
+# rendered unit that still contains a `@@..@@` placeholder is never safe to
+# install — catches not just this specific `&`/`\` hazard but any future
+# substitution or templating mistake in this same shape, rather than only
+# the one case measured so far.
+if printf '%s' "$RENDERED_UNIT" | grep -q '@@'; then
+  echo "error: unit template still contains an unsubstituted placeholder after rendering — refusing to install a unit that cannot start" >&2
+  exit 1
+fi
 
 if [[ -f "$UNIT_DEST" ]] && [[ "$RENDERED_UNIT" == "$(cat "$UNIT_DEST")" ]]; then
   echo "unit already installed and up to date: $UNIT_DEST"

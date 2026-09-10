@@ -66,6 +66,16 @@ unit that can only ever fail at boot (found in BAKR-1's review of PR #10:
 the previous installer copied the unit verbatim and reported success
 regardless).
 
+The substituted values are escaped before they reach `sed`'s replacement
+side — an unescaped `&` or `\` there has special meaning (`&` means "the
+whole match"), which previously let a clone path *containing* `&` silently
+substitute the placeholder back into itself while the installer still
+reported success (also found in review; tested by cloning to a path with a
+literal `&` in it). As a second, independent line of defence, the installer
+also refuses — again, nothing written or enabled — if the rendered unit
+still contains an unsubstituted `@@..@@` placeholder for any reason, rather
+than ever installing silently-corrupted content.
+
 **One sharp edge, confirmed the hard way (BAKR-7/BAKR-8):** for a systemd
 *user* unit, the system-level `journalctl -u bakr.service` (no `--user`)
 prints `-- No entries --` rather than failing — a silent wrong answer that
