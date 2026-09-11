@@ -68,6 +68,7 @@ import {
   agentsInDirectory,
   beginLaunch,
   clearFailedLaunchRecord,
+  clearFailedForkFromRecordsForCurrentTarget,
   markLaunchStarted,
   markLaunchFailed,
   resolveRespawnAttempt,
@@ -372,11 +373,25 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
       const attemptKey: AttemptKey | undefined = plan.kind === "respawn" ? { kind: "respawn", shortId: plan.shortId } : undefined;
       let next = decision.wasOff ? putAgent(current, decision.agent) : current;
 
+      // BAKR-27 AC4: a FAILED `forkFrom`-keyed record (the escape's OWN
+      // launch failing, not the respawn it was escaping) is never reachable
+      // by the respawn/fresh-keyed wedge check just below — `planRestore`
+      // never returns a `forkFrom` plan, so no `attemptKey` this function
+      // computes can ever match one. Clear any such stray record for this
+      // agent's CURRENT restore target FIRST, unconditionally, so a retried
+      // escape below does not accumulate another one beside an old one no
+      // verb could ever reach (see `clearFailedForkFromRecordsForCurrentTarget`'s
+      // own doc). Independent of, and reported alongside, the primary
+      // wedge-clear below.
+      const forkCleared = clearFailedForkFromRecordsForCurrentTarget(next, agentId, decision.agent.restoreTarget?.sessionId);
+      next = forkCleared.state;
+      const forkWedgeCleared = forkCleared.clearedAttemptIds.length > 0;
+
       if (hasLaunchRecordFor(next, agentId, attemptKey)) {
         const cleared = clearFailedLaunchRecord(next, agentId, attemptKey);
         if (cleared === next) {
           // Genuinely in-flight (not failed) — never duplicate a live launch (AC4).
-          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: false, launch: { kind: "in-flight" } } };
+          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: { kind: "in-flight" } } };
         }
         next = cleared;
         const attemptId = deps.generateAttemptId();
@@ -402,10 +417,10 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
         const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
         const verdict = decideLiveness(plan.shortId, entry, pidVerifiedAlive);
         if (verdict.status === "alive") {
-          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: false, launch: { kind: "alive" } } };
+          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: { kind: "alive" } } };
         }
         if (verdict.status === "not-verifiable") {
-          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: false, launch: { kind: "not-verifiable", reason: verdict.reason } } };
+          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: { kind: "not-verifiable", reason: verdict.reason } } };
         }
       }
 
@@ -418,7 +433,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
         // — should not normally happen, but this is not the place to
         // fabricate a launch for it).
         if (plan.kind !== "respawn") {
-          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: false, launch: { kind: "none" } } };
+          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: { kind: "none" } } };
         }
       }
 
@@ -428,7 +443,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
         plan.kind === "fresh"
           ? { kind: "issue-fresh", attemptId }
           : { kind: "issue-respawn", attemptId, shortId: plan.shortId, restoreSessionId: (decision.agent.restoreTarget as { sessionId: string }).sessionId };
-      return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: false, launch: launchPlan } };
+      return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: launchPlan } };
     },
     lockOpts(deps)
   );

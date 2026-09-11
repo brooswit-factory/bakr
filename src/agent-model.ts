@@ -444,6 +444,53 @@ export function unresolvedLaunches(state: AgentStoreState): readonly LaunchRecor
   return state.launches.filter((l) => l.error !== undefined);
 }
 
+/**
+ * B13a (BAKR-26/BAKR-27): "a recognised stale-cwd refusal is not an
+ * unresolved launch." claude refused `respawn` before starting anything, so
+ * once the escape it triggers (`forkFrom`, or a `fresh` launch on positive
+ * no-transcript evidence — see daemon.ts's `dispatchRespawnForDaemon` and
+ * agent-actions.ts's `forkFromCurrentTarget`, both of which key that escape
+ * as `attemptKey: {kind: "forkFrom", sessionId}` regardless of which of the
+ * two it actually ran) has RESOLVED into a real session, nothing was ever
+ * left orphaned by the refusal — it is not a genuinely unresolved launch to
+ * report every cycle, only a one-time event the daemon already logs loudly
+ * at the point of refusal.
+ *
+ * DETECTED BY INFERENCE, NOT A STORED FLAG — deliberately, so this needs no
+ * new write, no wire-format migration, and treats a record THIS build just
+ * created identically to one a PRE-B13a build already wrote to disk (AC6):
+ * `resolveLaunch` moves an agent's `restoreTarget` ONLY on a successful
+ * `fresh`/`forkFrom` resolution (never on a bare `respawn`, and never on any
+ * failure — see that function's own doc). So a `respawn`-keyed FAILED
+ * record whose own error is the recognised stale-cwd shape, but whose
+ * owning agent's CURRENT `restoreTarget.shortId` no longer equals the
+ * shortId that failed, is proof — from data the store already holds, with
+ * nothing new written to produce it — that some LATER launch for this exact
+ * agent resolved successfully after this respawn was refused. That is
+ * exactly B13a's "the escape succeeded" case.
+ *
+ * Takes the stale-cwd recognizer as a parameter rather than importing one:
+ * this file stays free of any dependency on the spawn substrate (its own
+ * module doc: "no filesystem, clock, env, or daemon coupling"), even though
+ * `isRecognizedStaleCwdRefusal` (spawn/respawn.ts) is itself a pure
+ * string-matching function — the caller (daemon.ts) already has it.
+ *
+ * NEVER used to CLEAR anything — B13 still holds absolutely ("only an
+ * explicit operator action may clear a failed or given-up launch record;
+ * the reconcile loop never does"). This function only tells a REPORTING
+ * call site whether a record is worth surfacing again; the record itself
+ * stays in the store, untouched, forever, exactly as every other
+ * unresolved-but-never-retried record does.
+ */
+export function isSupersededStaleCwdRespawnFailure(state: AgentStoreState, record: LaunchRecord, isRecognizedStaleCwdRefusal: (errorText: string) => boolean): boolean {
+  if (record.error === undefined) return false;
+  if (record.attemptKey === undefined || record.attemptKey.kind !== "respawn") return false;
+  if (!isRecognizedStaleCwdRefusal(record.error)) return false;
+  const agent = state.agents[record.agentId];
+  if (agent?.restoreTarget === undefined) return false;
+  return agent.restoreTarget.shortId !== record.attemptKey.shortId;
+}
+
 /** See session-slots.ts's own doc for why this must be called unconditionally on every load — identical reasoning, ported. */
 export function promoteUnresolvableLaunches(state: AgentStoreState, reason: string): AgentStoreState {
   let next = state;
@@ -497,6 +544,45 @@ export function clearFailedLaunchRecord(state: AgentStoreState, agentId: string,
   const record = state.launches.find((l) => l.agentId === agentId && attemptKeyEquals(l.attemptKey, attemptKey) && l.error !== undefined);
   if (record === undefined) return state;
   return { ...state, launches: state.launches.filter((l) => l.attemptId !== record.attemptId) };
+}
+
+/**
+ * BAKR-27 AC4: `on`'s wedge-clear (see `clearFailedLaunchRecord`, right
+ * above) only ever computes ONE attemptKey — `respawn(shortId)` or
+ * `undefined` (fresh) — from `planRestore(agent)`, because a `forkFrom`
+ * escape's OWN failure (its `launch()` call itself failing, not the
+ * respawn it was escaping) is recorded under a DIFFERENT key entirely:
+ * `forkFrom(sessionId)`, keyed on the pre-escape session it was trying to
+ * fork FROM (see `dispatchRespawnForDaemon`/`forkFromCurrentTarget`'s own
+ * `beginLaunch` call). `planRestore` never returns a `forkFrom` plan — it
+ * only ever answers "respawn this shortId" or "launch fresh" — so no
+ * attemptKey `on` computes can ever equal a stranded `forkFrom` record's
+ * key, and `clearFailedLaunchRecord` alone can never reach it. That
+ * record then sits unresolved and reported forever, with no verb able to
+ * clear it — the exact shape BAKR-26 suspected and this ticket's own AC4
+ * asks to be enumerated and fixed.
+ *
+ * This is that fix's primitive: removes every FAILED `forkFrom`-keyed
+ * record whose `sessionId` matches the agent's CURRENT
+ * `restoreTarget.sessionId` — the one a retried escape would target again,
+ * so leaving an old failed attempt at that same key around serves no
+ * purpose but noise (a fresh retry begins its OWN new attemptId regardless
+ * of whether an old one is cleared here; nothing depends on this beyond
+ * reporting). Every failed record at that key is removed, not just one —
+ * repeated failed retries before this fix shipped could have left more
+ * than one. A no-op (same object, empty list) when `sessionId` is
+ * `undefined` (a never-restored agent has no target to match against) or
+ * nothing matches. MUST be called only from an explicit operator verb
+ * (`on`) — never from `daemon.ts` — for the identical B13 reason
+ * `clearFailedLaunchRecord` already carries.
+ */
+export function clearFailedForkFromRecordsForCurrentTarget(state: AgentStoreState, agentId: string, sessionId: string | undefined): { readonly state: AgentStoreState; readonly clearedAttemptIds: readonly string[] } {
+  if (sessionId === undefined) return { state, clearedAttemptIds: [] };
+  const matches = state.launches.filter((l) => l.agentId === agentId && l.error !== undefined && l.attemptKey?.kind === "forkFrom" && l.attemptKey.sessionId === sessionId);
+  if (matches.length === 0) return { state, clearedAttemptIds: [] };
+  const clearedAttemptIds = matches.map((m) => m.attemptId);
+  const ids = new Set(clearedAttemptIds);
+  return { state: { ...state, launches: state.launches.filter((l) => !ids.has(l.attemptId)) }, clearedAttemptIds };
 }
 
 export function beginLaunch(state: AgentStoreState, agentId: string, key: ClaimKey, attemptKey: AttemptKey | undefined, attemptId: string, now: number): AgentStoreState {
