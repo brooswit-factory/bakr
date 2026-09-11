@@ -211,14 +211,22 @@ describe("B13a negative controls (AC3): the failure paths this fix must NOT touc
 
     const { capturedLines } = await runCycles(deps, 4);
 
-    // The ORIGINAL respawn(oldShortId) record IS suppressed (its own
-    // escape attempt was at least ISSUED — beginLaunch happens
-    // unconditionally before the launch() call's own outcome is known —
-    // no: here the escape's launch() call itself FAILED, so restoreTarget
-    // never advances, so the inference in isSupersededStaleCwdRespawnFailure
-    // correctly does NOT suppress it either. Both records stay reported.
+    // Neither record is suppressed here: the escape's own launch() call
+    // FAILED, so restoreTarget never advances, so
+    // isSupersededStaleCwdRespawnFailure's divergence check never fires for
+    // the ORIGINAL respawn(oldShortId) record either — it stays reported
+    // right alongside the escape's own new forkFrom(sessionId) failure.
+    // Both stay reported, every cycle.
     const unresolvedLines = capturedLines.filter((l) => l.includes("unresolved launch for agent") && l.includes(AGENT_ID));
-    expect(unresolvedLines.length).toBeGreaterThanOrEqual(4); // at least one per cycle, for at least one of the two stranded records
+    // The respawn-keyed record's own error text is STALE_CWD_ERROR
+    // ("Couldn't start a background session ..."), distinct from the
+    // forkFrom-keyed record's ("launch exited ...: systemd-run: simulated
+    // launch failure") — filtering on it names the ORIGINAL
+    // respawn(oldShortId) record directly, rather than relying on a raw
+    // line count to stand in for "this specific record is still reported".
+    const respawnKeyedLines = unresolvedLines.filter((l) => l.includes("Couldn't start a background session"));
+    expect(respawnKeyedLines.length).toBeGreaterThanOrEqual(3); // never suppressed — restoreTarget never advanced, since the escape's own launch failed
+    expect(unresolvedLines.length).toBeGreaterThanOrEqual(4); // both stranded records combined, at least one line per post-dispatch cycle
 
     const finalStore = await loadAgents(join(dir, "agents.json"));
     if (finalStore.status !== "loaded") throw new Error("expected loaded store");
