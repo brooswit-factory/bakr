@@ -279,10 +279,20 @@ async function main(): Promise<void> {
     const costAfter = await cumulativeCostUSD(await findTranscriptPath(scratchDir, infoC.sessionId));
     log(`cumulative totalCostUSD AFTER respawn (interrupting the tool call): ${costAfter}`);
 
-    if (costAfter !== undefined && costBefore !== undefined && costAfter > costBefore) {
+    // BAKR-23's round-2 finding: neither an undefined reading NOR a cycle
+    // that never actually respawned agent C may be reported as PASS —
+    // both mean "the instrument told me nothing", which must stay visibly
+    // distinct from "I measured it and it did not move". A PASS on a
+    // comparison that could not have failed is worse than no result.
+    const agentCRespawned = cycleC.restored.some((r) => r.agentId === agentCId);
+    if (costBefore === undefined || costAfter === undefined) {
+      log(`\n*** UNMEASURED: could not read cumulative totalCostUSD at one or both points (BEFORE=${costBefore}, AFTER=${costAfter}) — no comparison was made, this is not evidence either way ***`);
+    } else if (!agentCRespawned) {
+      log(`\n*** UNMEASURED: agent C never appears in this cycle's "restored" (${JSON.stringify(cycleC.restored)}) — the respawn under test never fired, so the tool-call-in-flight scenario did not occur this run. This is a POSITIVE result for a DIFFERENT claim: killing a session with a tool call in flight leaves it listed without a pid, the liveness gate correctly reports "not-verifiable" rather than "absent", and bakr correctly declines to respawn it — consistent with the epic's reachability argument, but it is not a measurement of what happens to totalCostUSD when a respawn genuinely interrupts a tool call in flight. That specific case remains UNMEASURED per the epic's own ruling (killing the shared claude daemon singleton to force it is forbidden). ***`);
+    } else if (costAfter > costBefore) {
       log(`\n*** STOP: totalCostUSD MOVED (${costBefore} -> ${costAfter}) across a respawn that interrupted a tool call in flight. Per the epic's explicit condition, this is reported rather than proceeded past. ***`);
     } else {
-      log(`PASS: totalCostUSD did not move (${costBefore} -> ${costAfter}) across a respawn interrupting a tool call — B8a holds for the tool-call-in-flight case too`);
+      log(`PASS: totalCostUSD did not move (${costBefore} -> ${costAfter}) across a respawn that genuinely interrupted agent C's tool call (confirmed via "restored") — B8a holds for the tool-call-in-flight case too`);
     }
   } finally {
     log("\n--- cleanup: stopping every session this script started, by its own id ---");
