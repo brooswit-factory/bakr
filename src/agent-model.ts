@@ -257,6 +257,21 @@ export function removeAndRetireAgent(state: AgentStoreState, agentId: string): A
   return { ...state, agents, retiredIds: [...state.retiredIds, agentId] };
 }
 
+/**
+ * Raw, unvalidated rewrite of one agent's `directory` — the primitive
+ * adopt.ts's validated wrapper builds on (this file ships no "adopt" verb
+ * of its own, per the module comment above). Performs no name-collision,
+ * source-membership, or claim check; the caller is responsible for every
+ * refusal in B11's typed set before calling this. A no-op (same object
+ * returned) when `agentId` names no agent, mirroring every other total
+ * mutator in this file.
+ */
+export function setAgentDirectory(state: AgentStoreState, agentId: string, directory: ClaimKey): AgentStoreState {
+  const agent = state.agents[agentId];
+  if (agent === undefined || agent.directory === directory) return state;
+  return { ...state, agents: { ...state.agents, [agentId]: { ...agent, directory } } };
+}
+
 // --- The resolver (B4, R-E) ----------------------------------------------
 
 export type ResolveOutcome =
@@ -294,6 +309,34 @@ export function resolveAgent(state: AgentStoreState, scope: ClaimKey, ref: strin
 
   const agent = Object.values(state.agents).find((a) => a.directory === scope && a.name === ref);
   return agent === undefined ? { outcome: "not-found" } : { outcome: "found", agent };
+}
+
+// --- Which session to resume (BAKR-24 correction) -------------------------
+
+/**
+ * THE SINGLE FUNCTION every restore/adopt caller must go through to answer
+ * "which session id do I pass `--resume`?" — never read `agent.durableSessionId`
+ * inline at a call site. `durableSessionId` is correct and sufficient for now,
+ * but BAKR-23 (a sibling story under the same epic) is going to change this
+ * rule once it has measured which id a silently-failed restore can actually
+ * resume (see this file's own header on the substrate's fork-on-resume
+ * behaviour and the fact that a `--bg --resume` given no prompt writes NO
+ * transcript at all). Funneling every caller through this one function is
+ * what lets that future change land in one place instead of a hunt across
+ * daemon.ts and every adoption/restore call site.
+ *
+ * BAKR-17/BAKR-21 UNIFIED INTO THIS FUNCTION AT MERGE TIME (2026-09-11).
+ * BAKR-21 had shipped an identical `sessionIdToResume` on its own branch
+ * before BAKR-18 landed this one; the two never conflicted textually
+ * because the names differed, which is exactly how a merge can be
+ * silently wrong. BAKR-2 required one name, so `sessionIdToResume` is
+ * retired and `agent-lifecycle.ts`'s `decideOn` now calls THIS function.
+ * Call sites today: `decideOn` (the `on` verb) and `daemon.ts`'s restore.
+ * `daemon.ts` does still mention `.durableSessionId` once more, but only
+ * inside a LOG STRING, never as a resume decision — verified at merge.
+ */
+export function sessionToResume(agent: AgentRecord): string | undefined {
+  return agent.durableSessionId;
 }
 
 // --- Restore-attempt bookkeeping (R-C: rekeyed to agent id) ---------------
@@ -350,31 +393,6 @@ export function hasLaunchRecordFor(state: AgentStoreState, agentId: string, prio
 }
 
 /**
- * BAKR-21: the ONE function that answers "which session id do I resume for
- * this agent" — per the ticket's in-place correction of 2026-09-11 (BAKR-2
- * has since filed BAKR-23 to decide this properly, after BAKR-18 measured
- * WITH REAL SESSIONS that `claude --bg --resume` always forks into a NEW
- * session id, so pinning and reusing `durableSessionId` forever silently
- * rewinds the agent's conversation after the first restore). Today's
- * correct answer is still `agent.durableSessionId` — this function does not
- * change behaviour, it only gives the decision exactly one call site
- * (`agent-lifecycle.ts`'s `decideOn`) so adopting BAKR-23's eventual rule
- * is a one-line change here rather than a hunt through every place that
- * used to read `.durableSessionId` inline.
- *
- * NOT wired into `daemon.ts`'s own restore path — that file is out of this
- * ticket's scope (BAKR-2's own correction: "you are not being asked to fix
- * the rewind... do not redesign session-id bookkeeping under this ticket").
- * `daemon.ts` still reads `agent.durableSessionId` directly today, which is
- * IDENTICAL to what this function currently returns, so the two stay in
- * sync for now; BAKR-23 migrating both to share this function is future
- * work, flagged here rather than done silently by this ticket.
- */
-export function sessionIdToResume(agent: AgentRecord): string | undefined {
-  return agent.durableSessionId;
-}
-
-/**
  * BAKR-21: the operator-driven recovery for the launch-record wedge
  * confirmed on this ticket (BAKR-17 comment, 2026-09-11) — `promoteUnresolvableLaunches`
  * marks a crashed-mid-launch record FAILED (`error` set), but `resolveLaunch`
@@ -423,6 +441,26 @@ export function markLaunchStarted(state: AgentStoreState, attemptId: string, lau
 
 export function markLaunchFailed(state: AgentStoreState, attemptId: string, error: string): AgentStoreState {
   return updateLaunch(state, attemptId, (record) => ({ ...record, error }));
+}
+
+/**
+ * Removes EVERY launch record (pending or already-errored/given-up) belonging
+ * to any of `agentIds` — the primitive adopt.ts's validated wrapper uses to
+ * implement the Q5 decision (BAKR-24): adoption discards ALL of the adopted
+ * agents' launch records, not only the ones the move itself would explain,
+ * because the only available signal for "this record's cause no longer
+ * applies" (its error string) has already been measured to misattribute its
+ * own cause (a missing-cwd launch failure reads as a `systemd-run` problem).
+ * An explicit operator act (adopt) is treated as a deliberate reset of any
+ * prior give-up, consistent with — not a hole in — BAKR-8 Constraint 2's
+ * "never retried automatically" (the daemon never calls this on its own).
+ * A no-op (same object) when none of `agentIds` has any launch record.
+ */
+export function discardLaunchRecordsForAgents(state: AgentStoreState, agentIds: readonly string[]): AgentStoreState {
+  const ids = new Set(agentIds);
+  const launches = state.launches.filter((l) => !ids.has(l.agentId));
+  if (launches.length === state.launches.length) return state;
+  return { ...state, launches };
 }
 
 /**

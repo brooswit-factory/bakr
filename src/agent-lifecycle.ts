@@ -26,7 +26,7 @@
 // directory.
 
 import type { ClaimKey } from "./claim-key-resolve";
-import { type AgentRecord, type AgentStoreState, checkNameAvailability, resolveAgent, sessionIdToResume, validateNameSyntax } from "./agent-model";
+import { type AgentRecord, type AgentStoreState, checkNameAvailability, resolveAgent, sessionToResume, validateNameSyntax } from "./agent-model";
 
 // --- Shared resolution (every verb starts here) ---------------------------
 
@@ -73,7 +73,7 @@ export type OnDecision =
  * `hasLaunchRecordFor`/`clearFailedLaunchRecord` (agent-model.ts) — kept in
  * `agent-actions.ts`'s `on` so this function stays pure. `wasOff` tells the
  * caller whether a real transition happened (for the "no-change" vs
- * "turn-on" diagonal); `priorSessionId` is `sessionIdToResume(agent)` —
+ * "turn-on" diagonal); `priorSessionId` is `sessionToResume(agent)` —
  * the one call site the ticket's in-place correction requires — computed
  * here EITHER WAY, because B13's wedge-clearing applies to an already-"on"
  * agent too (an agent stuck "on" with a wedged fresh-launch record, e.g.
@@ -95,7 +95,7 @@ export function decideOn(state: AgentStoreState, scope: ClaimKey, ref: string): 
   }
 
   const wasOff = agent.state === "off";
-  const priorSessionId = sessionIdToResume(agent);
+  const priorSessionId = sessionToResume(agent);
   const nextAgent: AgentRecord = wasOff ? { ...agent, state: "on" } : agent;
   return { ok: true, agent: nextAgent, wasOff, priorSessionId };
 }

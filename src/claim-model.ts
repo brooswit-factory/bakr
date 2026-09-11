@@ -43,9 +43,26 @@
 
 import type { ClaimKey } from "./claim-key-resolve";
 
+/**
+ * `{ dev, ino }` from a real `stat()` of the directory at claim time
+ * (BAKR-24 Q2) — recorded OUTSIDE the tree, in this store, never written
+ * into the claimed directory itself. Used only to RANK an adoption offer
+ * (a same-filesystem `mv` preserves the inode; a cross-filesystem move or a
+ * copy does not, and inode numbers are reused after deletion) — never to
+ * decide one. See orphan-model.ts for the hint-matching logic this field
+ * feeds. Optional because a claim written before this field existed, or one
+ * whose caller could not `stat` the directory, has none — see Q1's
+ * "reduced confidence" rule for what that absence means downstream.
+ */
+export interface DirIdentity {
+  readonly dev: number;
+  readonly ino: number;
+}
+
 export interface Claim {
   readonly key: ClaimKey;
   readonly claimedAt: number;
+  readonly dirIdentity: DirIdentity | undefined;
 }
 
 export interface ClaimStoreState {
@@ -63,15 +80,19 @@ export interface ClaimOutcome {
 
 /**
  * Total and idempotent. If `key` is already claimed, returns `state`
- * unchanged and the EXISTING claim — same `claimedAt` — never an error,
- * never a re-stamp. Otherwise creates a new claim with `claimedAt: now`.
+ * unchanged and the EXISTING claim — same `claimedAt`, same `dirIdentity` —
+ * never an error, never a re-stamp, and `dirIdentity` is NOT updated on a
+ * second claim (identity is a fact about the moment a directory was FIRST
+ * claimed). Otherwise creates a new claim with `claimedAt: now` and the
+ * given `dirIdentity` (undefined when the caller could not `stat` it, or
+ * chose not to).
  */
-export function claim(state: ClaimStoreState, key: ClaimKey, now: number): ClaimOutcome {
+export function claim(state: ClaimStoreState, key: ClaimKey, now: number, dirIdentity?: DirIdentity): ClaimOutcome {
   const existing = state.claims[key];
   if (existing !== undefined) {
     return { state, claim: existing };
   }
-  const created: Claim = { key, claimedAt: now };
+  const created: Claim = { key, claimedAt: now, dirIdentity };
   return {
     state: { claims: { ...state.claims, [key]: created } },
     claim: created,
@@ -118,10 +139,24 @@ export const CLAIM_STORE_VERSION = 1;
  * a future reader does not mistake it for a second source of truth. See
  * agent-model.ts's `agentsInDirectory` for where membership actually lives
  * now.
+ *
+ * `dev`/`ino` (BAKR-24 Q2) are a NEW optional pair carrying `DirIdentity`.
+ * Forward compat with a binary that predates them is automatic and requires
+ * no frozen placeholder the way `agentIds` needed one: the CURRENT parser
+ * (verified at this ticket's own checkout) IGNORES unknown keys entirely
+ * (see `isValidPersistedClaim` below — it checks only the keys it knows
+ * about), so a binary older than this field simply never sees it. What
+ * needs doing on THIS side, per this ticket's own compatibility note, is
+ * the other direction: add the field to the persisted type AND the
+ * serializer TOGETHER (done below) so a store this version writes is not
+ * silently stripped of the identity it just recorded, and extend the
+ * round-trip test so serialize stays parse's exact inverse.
  */
 interface PersistedClaim {
   readonly claimedAt: number;
   readonly agentIds: readonly string[];
+  readonly dev?: number;
+  readonly ino?: number;
 }
 
 interface PersistedStore {
@@ -133,16 +168,21 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isValidPersistedClaim(value: unknown): value is { claimedAt: number; agentIds?: readonly string[] } {
+function isValidPersistedClaim(value: unknown): value is { claimedAt: number; agentIds?: readonly string[]; dev?: number; ino?: number } {
   if (!isPlainObject(value) || typeof value["claimedAt"] !== "number") return false;
   const agentIds = value["agentIds"];
-  return agentIds === undefined || (Array.isArray(agentIds) && agentIds.every((id) => typeof id === "string"));
+  if (agentIds !== undefined && !(Array.isArray(agentIds) && agentIds.every((id) => typeof id === "string"))) return false;
+  const dev = value["dev"];
+  const ino = value["ino"];
+  // Both present-and-numeric or both absent — a lone dev or ino is a malformed identity, not a partial one.
+  if (dev === undefined && ino === undefined) return true;
+  return typeof dev === "number" && typeof ino === "number";
 }
 
 export function serializeClaimStoreState(state: ClaimStoreState): string {
   const claims: Record<string, PersistedClaim> = {};
   for (const [key, c] of Object.entries(state.claims)) {
-    claims[key] = { claimedAt: c.claimedAt, agentIds: [] };
+    claims[key] = c.dirIdentity === undefined ? { claimedAt: c.claimedAt, agentIds: [] } : { claimedAt: c.claimedAt, agentIds: [], dev: c.dirIdentity.dev, ino: c.dirIdentity.ino };
   }
   const persisted: PersistedStore = { version: CLAIM_STORE_VERSION, claims };
   return JSON.stringify(persisted, null, 2);
@@ -177,7 +217,11 @@ export function parseClaimStoreState(source: string): ParseResult {
         error: `claim entry "${key}" does not have the expected { claimedAt: number, agentIds?: string[] } shape`,
       };
     }
-    claims[key] = { key: key as ClaimKey, claimedAt: value.claimedAt };
+    claims[key] = {
+      key: key as ClaimKey,
+      claimedAt: value.claimedAt,
+      dirIdentity: value.dev !== undefined && value.ino !== undefined ? { dev: value.dev, ino: value.ino } : undefined,
+    };
   }
   return { ok: true, state: { claims } };
 }

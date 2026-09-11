@@ -33,6 +33,7 @@ import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../sr
 import { on, type AgentActionDeps } from "../../src/agent-actions";
 import type { ClaimKey } from "../../src/claim-key-resolve";
 import type { RunCommandOptions, CommandResult } from "../../src/spawn";
+import { realOrphanProbeDeps } from "../../src/paths";
 
 const KEY = "/claimed/dir" as ClaimKey;
 
@@ -69,6 +70,11 @@ function daemonDeps(dir: string, runCommand: DaemonDeps["runCommand"]): DaemonDe
     now: () => 1_700_000_000_000,
     generateAttemptId: () => `daemon-attempt-${counter++}`,
     randomBytes: (n: number) => new Uint8Array(n).fill(7),
+    // Added at the BAKR-18 merge (2026-09-11): `DaemonDeps` gained a required
+    // `probeDeps` (BAKR-24 Q1/Q4's injected `stat` seam for orphan probing).
+    // The real one is correct here — this test's directories genuinely exist,
+    // and nothing in the wedge-recovery path depends on orphan detection.
+    probeDeps: realOrphanProbeDeps,
   };
 }
 

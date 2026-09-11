@@ -237,15 +237,15 @@ describe("on", () => {
     // this codebase's own style, and exactly the class of false positive
     // review finding 2 named: a doc comment MENTIONING the function's name
     // must never count as a call site). A CALL is then the name immediately
-    // followed by "(" that is NOT part of "function sessionIdToResume("
+    // followed by "(" that is NOT part of "function sessionToResume("
     // (the definition itself, in agent-model.ts).
     function stripComments(source: string): string {
       return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     }
     function callSiteCount(source: string): number {
       const code = stripComments(source);
-      const all = code.match(/sessionIdToResume\(/g) ?? [];
-      const definitions = code.match(/function sessionIdToResume\(/g) ?? [];
+      const all = code.match(/sessionToResume\(/g) ?? [];
+      const definitions = code.match(/function sessionToResume\(/g) ?? [];
       return all.length - definitions.length;
     }
 
@@ -253,9 +253,9 @@ describe("on", () => {
     // review: not merely "a string is present somewhere"): the definition
     // line itself must exist in agent-model.ts, AND this scan's own
     // call-vs-definition arithmetic must correctly exclude it — a scan that
-    // could not tell "function sessionIdToResume(" from a call would report
+    // could not tell "function sessionToResume(" from a call would report
     // 1 here instead of 0, silently inflating every other file's count too.
-    expect(modelSrc).toContain("export function sessionIdToResume(agent: AgentRecord)");
+    expect(modelSrc).toContain("export function sessionToResume(agent: AgentRecord)");
     expect(callSiteCount(modelSrc)).toBe(0);
 
     // FALSIFIER: this is 0, not 1, if `decideOn` ever reverts to reading
@@ -268,11 +268,32 @@ describe("on", () => {
     expect(callSiteCount(actionsSrc)).toBe(0);
     expect(actionsSrc).not.toContain(".durableSessionId");
 
-    // daemon.ts is untouched by this ticket and legitimately still reads
-    // `.durableSessionId` inline (flagged for BAKR-23, not fixed here) — but
-    // it must not have silently grown a SECOND call site of the seam
-    // function, which would leave two places to keep in sync instead of one.
-    expect(callSiteCount(daemonSrc)).toBe(0);
+    // POST-MERGE WITH BAKR-18 (2026-09-11): daemon.ts now routes its own
+    // restore decision through this SAME seam — BAKR-18 wired it when it
+    // landed `sessionToResume`. So the expected count here is 1, not 0.
+    // FALSIFIER: 2 would mean a second, unsynchronised decision point; 0
+    // would mean daemon.ts had reverted to reading `.durableSessionId`
+    // inline for its decision. Either breaks BAKR-23's one-line change.
+    expect(callSiteCount(daemonSrc)).toBe(1);
+
+    // daemon.ts does still contain the literal `.durableSessionId` once, but
+    // ONLY inside a log string — never as a resume decision. Asserting its
+    // absence here would be wrong; asserting the call-site count above is
+    // the check that actually constrains behaviour.
+
+    // THE MERGE GUARD, and the reason this test changed at all: BAKR-21 and
+    // BAKR-18 independently shipped IDENTICAL seams under DIFFERENT names
+    // (`sessionIdToResume` and `sessionToResume`). They never conflicted
+    // textually, so git merged both in happily — a merge that is silently
+    // wrong is exactly the failure this epic keeps naming. BAKR-2 required
+    // one name. This pins the retired one as gone from every source file,
+    // so it cannot quietly come back on a future merge.
+    // Checked against STRIPPED source, deliberately: agent-model.ts's own doc
+    // comment narrates this unification and names the retired function, which
+    // is worth keeping. The invariant is that no CODE references it.
+    for (const src of [modelSrc, lifecycleSrc, actionsSrc, daemonSrc]) {
+      expect(stripComments(src)).not.toContain("sessionIdToResume");
+    }
   });
 });
 

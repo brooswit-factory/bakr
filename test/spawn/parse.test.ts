@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { filterExactCwd, parseAgentsJson, parseLaunchId } from "../../src/spawn/parse";
+import { filterExactCwd, parseAgentsJson, parseLaunchId, detectStaleRegisteredCwdRefusal } from "../../src/spawn/parse";
 
 describe("parseAgentsJson", () => {
   test("keeps only kind: background entries, dropping interactive ones", () => {
@@ -101,5 +101,21 @@ describe("parseLaunchId", () => {
 
   test("throws on empty stdout", () => {
     expect(() => parseLaunchId("")).toThrow();
+  });
+});
+
+describe("detectStaleRegisteredCwdRefusal (BAKR-24)", () => {
+  test("extracts the stale path from the observed exact wording", () => {
+    const text = `launch exited 1: Couldn't start a background session (working directory no longer exists or is not accessible: /tmp/bakr-live-e2e/work1)`;
+    expect(detectStaleRegisteredCwdRefusal(text)).toBe("/tmp/bakr-live-e2e/work1");
+  });
+
+  test("returns undefined for an unrelated launch failure — never a false positive", () => {
+    expect(detectStaleRegisteredCwdRefusal("launch exited 1: systemd-run: permission denied")).toBeUndefined();
+    expect(detectStaleRegisteredCwdRefusal("launch failed: ENOENT: no such file or directory, posix_spawn 'systemd-run'")).toBeUndefined();
+  });
+
+  test("returns undefined for empty text", () => {
+    expect(detectStaleRegisteredCwdRefusal("")).toBeUndefined();
   });
 });
