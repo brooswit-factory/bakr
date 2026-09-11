@@ -59,7 +59,6 @@ export interface DaemonDeps {
   readonly now: () => number;
   readonly generateAttemptId: () => string;
   readonly randomBytes: (byteLength: number) => Uint8Array;
-  readonly staleLockMs?: number;
   readonly acquireTimeoutMs?: number;
 }
 
@@ -73,9 +72,8 @@ export function initialDaemonState(): DaemonState {
   return { claimDegraded: false, agentsDegraded: false };
 }
 
-function lockOpts(deps: DaemonDeps): { staleLockMs?: number; acquireTimeoutMs?: number } {
-  const opts: { staleLockMs?: number; acquireTimeoutMs?: number } = {};
-  if (deps.staleLockMs !== undefined) opts.staleLockMs = deps.staleLockMs;
+function lockOpts(deps: DaemonDeps): { acquireTimeoutMs?: number } {
+  const opts: { acquireTimeoutMs?: number } = {};
   if (deps.acquireTimeoutMs !== undefined) opts.acquireTimeoutMs = deps.acquireTimeoutMs;
   return opts;
 }

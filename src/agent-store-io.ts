@@ -15,11 +15,11 @@
 // leaves the decision to the caller (see daemon.ts), exactly as those two
 // modules already do.
 
+import { dlopen, FFIType } from "bun:ffi";
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm } from "node:fs/promises";
+import { type FileHandle, mkdir, open, readFile, rename } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { type AgentStoreState, emptyAgentStore, parseAgentStoreState, serializeAgentStoreState } from "./agent-model";
-import { isPidAlive } from "./spawn/liveness";
 
 export type LoadOutcome =
   | { readonly status: "missing" }
@@ -77,9 +77,83 @@ export async function save(path: string, state: AgentStoreState): Promise<void> 
   }
 }
 
-// --- Cross-process lock (B12, R-F) ---------------------------------------
+// --- Cross-process lock (B12, R-F, AMENDED BAKR-20) -----------------------
+//
+// BAKR-20 replaced the original O_EXCL-plus-parsed-content lock with a
+// kernel lock on an open file description (`flock(2)`, `LOCK_EX|LOCK_NB`).
+// Two findings drove the change, both against the OLD scheme:
+//
+// 1. Mutual exclusion was NOT actually guaranteed. The old `acquireLock`
+//    read a holder's {pid, acquiredAt}, judged it dead/stale, then `rm`'d
+//    the lock PATH unconditionally — three steps not tied to one lock
+//    instance. If the judged-dead holder released and a NEW holder
+//    acquired in the gap between that read and the `rm`, the waiter
+//    deleted the live holder's lock and both proceeded: a lost update,
+//    reported `ok` by both writers. Measured 3/20 trials with a seeded
+//    dead-holder lock file, 6/6 on a positive control with no lock at all.
+// 2. An unreadable lock file (empty, or half-written by a crash between
+//    `open(path, "wx")` and the pid write landing) could never be judged
+//    dead or stale — `readLockInfo` returns `undefined` for it, and both
+//    break conditions require `info !== undefined`. That wedged the
+//    daemon's restore cycle permanently: every acquire attempt threw a
+//    timeout, forever, until a human deleted the file by hand.
+//
+// A kernel lock on an fd kills both at once, structurally rather than by
+// being more careful with the same shape:
+//
+// - There is no steal path, so there is nothing for a TOCTOU race to land
+//   in — the kernel grants `LOCK_EX` to at most one open file description
+//   at a time, full stop. Finding 1 cannot occur.
+// - The lock lives on the file description, never on parsed content, so
+//   Finding 2's question ("is this content readable enough to judge
+//   dead/stale?") does not arise — an empty or half-written lock file
+//   locks and unlocks exactly like a well-formed one. Demonstrated in
+//   agent-store-io.test.ts under "Finding 2 fixtures are now moot".
+// - A crashed holder's lock is released by the KERNEL the instant the
+//   process's last fd closes (on a clean exit, an uncaught throw, or a
+//   `kill -9` alike — see agent-store-lock-crash-recovery.test.ts) — never
+//   inferred from a pid or a timestamp.
+//
+// `staleLockMs` is gone from the public API. It existed to answer "is this
+// holder dead or just slow?" from OUTSIDE the OS — a question a kernel
+// lock answers FOR you: a genuinely dead holder's lock is already gone by
+// the time anyone would ask, and a genuinely alive holder's lock (however
+// slow) is correctly still held. There is no remaining case for a
+// time-based guess to resolve, so the knob is removed rather than kept
+// dead in the API. `acquireTimeoutMs` is unchanged — it still bounds how
+// long a caller waits for a genuinely busy, live holder before giving up.
+//
+// Two invariants the ticket calls out explicitly, both load-bearing:
+// - NEVER unlink the lock file on release. Unlinking a flocked file lets a
+//   later opener lock a DIFFERENT inode at the same path while an older
+//   holder still holds the deleted one under the old inode — silently
+//   defeating mutual exclusion. The file is created once (if absent) and
+//   left in place forever after; only the fd's flock is released, by
+//   closing it.
+// - Non-blocking acquisition (`LOCK_EX|LOCK_NB`) in a retry loop, so the
+//   pre-existing `acquireTimeoutMs` behaviour and its timeout error are
+//   preserved rather than blocking on the kernel indefinitely.
 
-const DEFAULT_STALE_LOCK_MS = 30_000;
+const LOCK_EX = 2;
+const LOCK_NB = 4;
+
+// Verified empirically against THIS runtime (bun 1.3.14, Linux) before
+// committing to this mechanism, per the ticket's own instruction not to
+// assume `node:fs` exposes `flock` (it does not) — `bun:ffi` against libc
+// does. Only the Linux path has been exercised; the darwin path is
+// included for dev-machine convenience and relies on `flock(2)`'s
+// LOCK_EX/LOCK_NB values being the same 4.2BSD-derived constants on both
+// platforms, unverified on an actual Mac.
+const LIBC_PATH = process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6";
+
+const libc = dlopen(LIBC_PATH, {
+  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+});
+
+function tryLockExclusive(fd: number): boolean {
+  return libc.symbols.flock(fd, LOCK_EX | LOCK_NB) === 0;
+}
+
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 10_000;
 const RETRY_DELAY_MS = 20;
 
@@ -92,6 +166,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Diagnostic only — never consulted to decide whether to acquire or steal (see module comment). Lets a human `cat` a wedged lock file and see who (as of the last successful acquire) is holding it. Tolerates any unreadable content, exactly like before. */
 async function readLockInfo(lockPath: string): Promise<LockInfo | undefined> {
   try {
     const raw = await readFile(lockPath, "utf8");
@@ -111,67 +186,85 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | undefined> {
 }
 
 /**
- * `O_EXCL` lock file beside the store — `open(path, "wx")` fails with
- * `EEXIST` when another holder already has it (R-F). Records a pid and a
- * timestamp in the lock file itself (diagnostic — "record something
- * diagnostic in the lock file ... so a human can tell what held it") so a
- * human inspecting a wedged lock can tell what (or who) is holding it and
- * since when.
- *
- * AMENDED (R-F.4): the lock must survive its holder crashing, in BOTH
- * directions — a naive elapsed-time-only steal satisfies neither on its
- * own (it either breaks a live-but-slow holder once its lock looks old
- * enough, or leaves a `kill -9`'d holder wedging every future writer until
- * that same timeout finally elapses). This tree already ships and tests
- * `isPidAlive` (`src/spawn/liveness.ts`) for exactly this kind of positive
- * liveness check, never an inference from absence — reused here rather
- * than reinvented. A lock is breakable when EITHER:
- * - the recorded pid is confirmed NOT alive (`isPidAlive` false) — a
- *   POSITIVE fact (ESRCH), not a guess, so this fires immediately,
- *   regardless of `staleLockMs`, the instant a crashed holder is detected; or
- * - the lock is older than `staleLockMs` — the backstop for the one case
- *   pid-liveness alone cannot cover: the OS reusing the dead holder's pid
- *   for an unrelated live process, which would otherwise make a crashed
- *   holder's lock look falsely alive forever.
- * A holder that is both alive AND within `staleLockMs` is NEVER broken —
- * the other, equally load-bearing half of R-F.4. `acquireTimeoutMs` is a
- * second, independent bound: the total time this call waits for such a
- * healthy holder to release on its own before giving up and throwing, so a
- * genuinely slow-but-legitimate holder does not wedge a caller forever.
+ * Opens the lock file, creating it if absent, WITHOUT truncating existing
+ * content and without O_EXCL (unlike the old scheme, many processes are
+ * meant to share this path concurrently — the kernel lock, not file
+ * creation, is what provides exclusivity). Two processes racing to create
+ * it for the first time both converge on the same inode: whichever loses
+ * the `wx` race simply reopens the file the winner just created.
  */
-async function acquireLock(lockPath: string, staleLockMs: number, acquireTimeoutMs: number): Promise<void> {
-  const deadline = Date.now() + acquireTimeoutMs;
+async function openLockFile(lockPath: string): Promise<FileHandle> {
   for (;;) {
     try {
-      const handle = await open(lockPath, "wx");
-      try {
-        await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() } satisfies LockInfo), "utf8");
-      } finally {
-        await handle.close();
-      }
-      return;
+      return await open(lockPath, "r+");
+    } catch (err) {
+      if (!isEnoent(err)) throw err;
+    }
+    try {
+      return await open(lockPath, "wx");
     } catch (err) {
       if (!isEexist(err)) throw err;
-
-      const info = await readLockInfo(lockPath);
-      const holderConfirmedDead = info !== undefined && !isPidAlive(info.pid);
-      const holderStale = info !== undefined && Date.now() - info.acquiredAt > staleLockMs;
-      if (holderConfirmedDead || holderStale) {
-        await rm(lockPath, { force: true }).catch(() => {});
-        continue; // retry immediately after stealing
-      }
-
-      if (Date.now() > deadline) {
-        const holder = info !== undefined ? `pid ${info.pid} since ${new Date(info.acquiredAt).toISOString()}` : "an unreadable lock file";
-        throw new Error(`timed out after ${acquireTimeoutMs}ms waiting for the agent store lock at "${lockPath}" (held by ${holder})`);
-      }
-      await sleep(RETRY_DELAY_MS);
+      // Another process created it between our "r+" and this "wx" — loop and reopen with "r+".
     }
   }
 }
 
-async function releaseLock(lockPath: string): Promise<void> {
-  await rm(lockPath, { force: true });
+interface AgentStoreLock {
+  readonly handle: FileHandle;
+}
+
+/**
+ * Non-blocking acquisition in a retry loop (ticket's own steer), so
+ * `acquireTimeoutMs` and its timeout error behave exactly as before. Once
+ * acquired, overwrites the file's content with fresh diagnostic
+ * {pid, acquiredAt} JSON — a positioned write, not an append, so the file
+ * never grows across repeated acquire/release cycles over a long-running
+ * daemon's lifetime.
+ */
+async function acquireLock(lockPath: string, acquireTimeoutMs: number): Promise<AgentStoreLock> {
+  const handle = await openLockFile(lockPath);
+  const deadline = Date.now() + acquireTimeoutMs;
+  for (;;) {
+    if (tryLockExclusive(handle.fd)) {
+      try {
+        const diagnostic = Buffer.from(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() } satisfies LockInfo), "utf8");
+        await handle.truncate(0);
+        await handle.write(diagnostic, 0, diagnostic.byteLength, 0);
+      } catch {
+        // Diagnostic content only — never load-bearing for correctness. A failure here must not fail the acquire itself.
+      }
+      return { handle };
+    }
+
+    if (Date.now() > deadline) {
+      const info = await readLockInfo(lockPath);
+      const holder = info !== undefined ? `pid ${info.pid} as of its last recorded acquire at ${new Date(info.acquiredAt).toISOString()} (diagnostic only, may be stale)` : "another process (its diagnostic info was unreadable)";
+      await handle.close();
+      throw new Error(`timed out after ${acquireTimeoutMs}ms waiting for the agent store lock at "${lockPath}" (held by ${holder})`);
+    }
+    await sleep(RETRY_DELAY_MS);
+  }
+}
+
+/** Releases by CLOSING the fd — never unlinking the path (see module comment: unlinking would let a future opener lock a different inode at the same path while this fd's flock is still notionally "held" by the closed-but-undeleted description). The kernel drops the flock the instant this fd (the last one referencing this open file description) closes. */
+async function releaseLock(lock: AgentStoreLock): Promise<void> {
+  await lock.handle.close();
+}
+
+/**
+ * Exposed ONLY for test fixtures that must hold the real lock across an
+ * async boundary (a `sleep`, most often) that `withAgentStoreLock`'s
+ * synchronous `mutate` callback cannot express — production code must
+ * always go through `withAgentStoreLock`. A fixture using this holds the
+ * IDENTICAL kernel lock a real caller would, not a hand-rolled stand-in —
+ * necessary now that "the lock" is an flock on an fd rather than a file a
+ * fixture could plausibly reimplement by hand in a few lines.
+ */
+export async function acquireAgentStoreLockForFixture(agentsPath: string, acquireTimeoutMs = DEFAULT_ACQUIRE_TIMEOUT_MS): Promise<{ readonly release: () => Promise<void> }> {
+  const lockPath = `${agentsPath}.lock`;
+  await mkdir(dirname(agentsPath), { recursive: true });
+  const lock = await acquireLock(lockPath, acquireTimeoutMs);
+  return { release: () => releaseLock(lock) };
 }
 
 export type MutateOutcome<T> = { readonly status: "ok"; readonly result: T } | { readonly status: "malformed"; readonly error: string };
@@ -208,15 +301,23 @@ export type MutateOutcome<T> = { readonly status: "ok"; readonly result: T } | {
  * the outcome (see daemon.ts). `launch()` spawns a process with its own
  * multi-second timeout; holding this lock across it would block every
  * other writer (including an operator's own action) for that whole window.
+ *
+ * Re-entrancy: taking this lock twice from the SAME process (two `open()`s
+ * on the same path create distinct file descriptions, which conflict with
+ * each other under `flock` exactly like two different processes would —
+ * verified empirically) deadlocks against itself. Nothing in this tree
+ * nests one call inside another's `mutate` — `promoteWedgedLaunches`,
+ * `resolvePendingLaunches`, `decideAndBeginForAgent` and
+ * `recordLaunchOutcome` (daemon.ts) each take and release independently.
  */
 export async function withAgentStoreLock<T>(
   path: string,
   mutate: (current: AgentStoreState) => { readonly state: AgentStoreState; readonly result: T },
-  opts?: { readonly staleLockMs?: number; readonly acquireTimeoutMs?: number }
+  opts?: { readonly acquireTimeoutMs?: number }
 ): Promise<MutateOutcome<T>> {
   const lockPath = `${path}.lock`;
   await mkdir(dirname(path), { recursive: true });
-  await acquireLock(lockPath, opts?.staleLockMs ?? DEFAULT_STALE_LOCK_MS, opts?.acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS);
+  const lock = await acquireLock(lockPath, opts?.acquireTimeoutMs ?? DEFAULT_ACQUIRE_TIMEOUT_MS);
   try {
     const loaded = await load(path);
     if (loaded.status === "malformed") {
@@ -224,9 +325,19 @@ export async function withAgentStoreLock<T>(
     }
     const current = loaded.status === "loaded" ? loaded.state : emptyAgentStore();
     const { state, result } = mutate(current);
-    await save(path, state);
+    // BAKR-20 Finding 3: a no-op mutation (mutate returns the SAME state
+    // object it was handed, by reference) is genuinely skipped — this is
+    // what makes daemon.ts's "a no-op save is skipped" comment true, for
+    // every caller of this helper, not merely the one it was written
+    // about. A mutate that builds a new object with equal contents (rather
+    // than returning `current` itself) still saves — this is a reference
+    // check, not a deep-equality one, by design: it costs nothing extra
+    // and every existing no-op caller already returns `current` unchanged.
+    if (state !== current) {
+      await save(path, state);
+    }
     return { status: "ok", result };
   } finally {
-    await releaseLock(lockPath);
+    await releaseLock(lock);
   }
 }

@@ -3,15 +3,19 @@
 // else — used both as a "kill -9 me mid-hold" target and as a genuinely
 // live, healthy holder for the negative-control direction. Prints "READY"
 // as soon as the lock is held (so the parent test knows it is safe to
-// either `kill -9` it or attempt a competing acquisition), then sleeps.
+// either `kill -9` it or attempt a competing acquisition), then sleeps and
+// releases cleanly on a normal exit (a `kill -9` skips the `finally` below
+// entirely — the kernel releases the flock anyway the instant this
+// process's fd closes, which is exactly the behaviour AC15(a) verifies).
 //
-// Reaches directly into agent-store-io.ts's lock file convention
-// (`<path>.lock`, JSON `{pid, acquiredAt}`) rather than going through
-// `withAgentStoreLock` — deliberately, since that helper's own mutate
+// BAKR-20: goes through `acquireAgentStoreLockForFixture` — the SAME
+// kernel lock production code takes — rather than reimplementing the lock
+// convention by hand, since "the lock" is now an flock on an open fd, not
+// a file whose CONTENT a fixture could plausibly stand in for.
+// `withAgentStoreLock` itself is still not used here because its `mutate`
 // callback is synchronous and cannot hold the lock open across an
-// arbitrary sleep. This fixture is standing in for "a real process holding
-// the lock for a while", not for any lifecycle verb.
-import { open } from "node:fs/promises";
+// arbitrary sleep.
+import { acquireAgentStoreLockForFixture } from "../../../src/agent-store-io";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -24,17 +28,15 @@ if (!agentsPathRaw || !holdMsRaw) {
 }
 const agentsPath: string = agentsPathRaw;
 const holdMs = Number(holdMsRaw);
-const lockPath = `${agentsPath}.lock`;
 
 async function main(): Promise<void> {
-  const handle = await open(lockPath, "wx");
-  try {
-    await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }), "utf8");
-  } finally {
-    await handle.close();
-  }
+  const held = await acquireAgentStoreLockForFixture(agentsPath);
   console.log("READY");
-  await sleep(holdMs);
+  try {
+    await sleep(holdMs);
+  } finally {
+    await held.release();
+  }
 }
 
 main().catch((err) => {
