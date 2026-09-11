@@ -32,13 +32,20 @@
 // own commit) — a versioned envelope, a pure `parse` that never throws
 // and reports a shaped error instead, and a `serialize` that is `parse`'s
 // exact inverse.
+//
+// BAKR-16 R-D: `agentIds` is RETIRED from this in-memory model. Membership
+// is now a derived query over the agent store (`agentsInDirectory` in
+// agent-model.ts — "the agents whose `directory` equals this key"), never a
+// second stored copy that could silently disagree with the agent store's
+// own `directory` field (B9). The WIRE format below still round-trips an
+// `agentIds` field for exactly one reason — see the wire format section —
+// but the in-memory `Claim` type here no longer carries it at all.
 
 import type { ClaimKey } from "./claim-key-resolve";
 
 export interface Claim {
   readonly key: ClaimKey;
   readonly claimedAt: number;
-  readonly agentIds: readonly string[];
 }
 
 export interface ClaimStoreState {
@@ -56,16 +63,15 @@ export interface ClaimOutcome {
 
 /**
  * Total and idempotent. If `key` is already claimed, returns `state`
- * unchanged and the EXISTING claim — same `claimedAt`, same `agentIds` —
- * never an error, never a re-stamp. Otherwise creates a new claim with an
- * empty `agentIds` list and `claimedAt: now`.
+ * unchanged and the EXISTING claim — same `claimedAt` — never an error,
+ * never a re-stamp. Otherwise creates a new claim with `claimedAt: now`.
  */
 export function claim(state: ClaimStoreState, key: ClaimKey, now: number): ClaimOutcome {
   const existing = state.claims[key];
   if (existing !== undefined) {
     return { state, claim: existing };
   }
-  const created: Claim = { key, claimedAt: now, agentIds: [] };
+  const created: Claim = { key, claimedAt: now };
   return {
     state: { claims: { ...state.claims, [key]: created } },
     claim: created,
@@ -94,6 +100,25 @@ export function release(state: ClaimStoreState, key: ClaimKey): ClaimStoreState 
 
 export const CLAIM_STORE_VERSION = 1;
 
+/**
+ * `agentIds` stays in the WIRE format even though `Claim` above no longer
+ * carries it (BAKR-16 R-D) — for compatibility in BOTH directions with a
+ * binary that predates this change:
+ * - `parseClaimStoreState` keeps ACCEPTING the field on read (and now also
+ *   accepts a claim entry that lacks it entirely, defaulting to "absent" —
+ *   the same "a field whose absence has an obvious correct reading must not
+ *   trip the malformed path" lesson session-slots.ts's own parser already
+ *   applies to `restoreAttemptCounts`).
+ * - `serializeClaimStoreState` keeps WRITING `agentIds: []` on every claim,
+ *   a frozen compatibility field, so an OLDER binary reading a file this
+ *   version wrote still parses it (that older parser requires the field
+ *   and rejects an entry without it as malformed).
+ * This is deliberately the one field in this codebase that reads as
+ * meaningful but is never populated by anything — labelled as such here so
+ * a future reader does not mistake it for a second source of truth. See
+ * agent-model.ts's `agentsInDirectory` for where membership actually lives
+ * now.
+ */
 interface PersistedClaim {
   readonly claimedAt: number;
   readonly agentIds: readonly string[];
@@ -108,19 +133,16 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isValidPersistedClaim(value: unknown): value is PersistedClaim {
-  return (
-    isPlainObject(value) &&
-    typeof value["claimedAt"] === "number" &&
-    Array.isArray(value["agentIds"]) &&
-    value["agentIds"].every((id) => typeof id === "string")
-  );
+function isValidPersistedClaim(value: unknown): value is { claimedAt: number; agentIds?: readonly string[] } {
+  if (!isPlainObject(value) || typeof value["claimedAt"] !== "number") return false;
+  const agentIds = value["agentIds"];
+  return agentIds === undefined || (Array.isArray(agentIds) && agentIds.every((id) => typeof id === "string"));
 }
 
 export function serializeClaimStoreState(state: ClaimStoreState): string {
   const claims: Record<string, PersistedClaim> = {};
   for (const [key, c] of Object.entries(state.claims)) {
-    claims[key] = { claimedAt: c.claimedAt, agentIds: [...c.agentIds] };
+    claims[key] = { claimedAt: c.claimedAt, agentIds: [] };
   }
   const persisted: PersistedStore = { version: CLAIM_STORE_VERSION, claims };
   return JSON.stringify(persisted, null, 2);
@@ -152,10 +174,10 @@ export function parseClaimStoreState(source: string): ParseResult {
     if (!isValidPersistedClaim(value)) {
       return {
         ok: false,
-        error: `claim entry "${key}" does not have the expected { claimedAt: number, agentIds: string[] } shape`,
+        error: `claim entry "${key}" does not have the expected { claimedAt: number, agentIds?: string[] } shape`,
       };
     }
-    claims[key] = { key: key as ClaimKey, claimedAt: value.claimedAt, agentIds: value.agentIds };
+    claims[key] = { key: key as ClaimKey, claimedAt: value.claimedAt };
   }
   return { ok: true, state: { claims } };
 }
