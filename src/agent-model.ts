@@ -475,7 +475,7 @@ export function hasLaunchRecordFor(state: AgentStoreState, agentId: string, atte
  * marks a crashed-mid-launch record FAILED (`error` set), but `resolveLaunch`
  * only ever removes a record whose `error` is still `undefined`, and
  * `hasLaunchRecordFor` does not look at `error` at all. So a failed record
- * for `(agentId, priorSessionId)` is otherwise PERMANENT: it blocks
+ * for `(agentId, attemptKey)` is otherwise PERMANENT: it blocks
  * `decideAndBeginForAgent` on both the fresh-launch and the restore arm,
  * forever, with no code path that ever removes it.
  *

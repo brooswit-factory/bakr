@@ -73,8 +73,9 @@ export type OnDecision =
  * `hasLaunchRecordFor`/`clearFailedLaunchRecord` (agent-model.ts) — kept in
  * `agent-actions.ts`'s `on` so this function stays pure. `wasOff` tells the
  * caller whether a real transition happened (for the "no-change" vs
- * "turn-on" diagonal); `priorSessionId` is `sessionToResume(agent)` —
- * the one call site the ticket's in-place correction requires — computed
+ * "turn-on" diagonal); the launch record is keyed by `attemptKey(agent)`,
+ * derived from `planRestore(agent)` (agent-model.ts) — the one call site
+ * the ticket's in-place correction requires — computed
  * here EITHER WAY, because B13's wedge-clearing applies to an already-"on"
  * agent too (an agent stuck "on" with a wedged fresh-launch record, e.g.
  * from `create` crashing, needs the identical check `on` performs for the

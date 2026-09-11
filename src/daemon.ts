@@ -311,9 +311,13 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
       // `respawn` kills and restarts a live process (measured) — this gate
       // is what keeps the daemon from calling it on `alive` or
       // `not-verifiable`. THERE IS NO "dead" VERDICT (`decideLiveness`
-      // produces exactly `alive | not-verifiable | unknown` — see
-      // liveness.ts). Respawn/forkFrom are reachable ONLY on `unknown`,
-      // which its own doc comment is explicit is "not proof of death" —
+      // produces exactly `alive | not-verifiable | absent`, and
+      // `checkLiveness` can additionally produce `listing-failed` — see
+      // liveness.ts). Respawn/forkFrom are reachable ONLY on `absent`;
+      // `listing-failed` NEVER proceeds, which is the whole point of
+      // splitting it out of the old `unknown`. `absent` means the listing
+      // SUCCEEDED and this session was not in it — its own doc comment is
+      // explicit that this is "not proof of death" —
       // merely absence from this cycle's listing. That is the SAME weak
       // link the old `--bg --resume` path already restored on; BAKR-22
       // does not strengthen it, only renames the mechanism that acts on

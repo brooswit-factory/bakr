@@ -267,9 +267,11 @@ export type OnResult =
  * `respawn` kills and restarts a live process (measured), so `on` must
  * never call it while `decideLiveness` reports `alive` or `not-verifiable`.
  * THERE IS NO "dead" VERDICT — `decideLiveness` produces exactly
- * `alive | not-verifiable | unknown` (liveness.ts), and `unknown`'s own doc
- * comment is explicit that it is "not proof of death", only absence from
- * this listing. `issue-respawn` is reachable ONLY on `unknown` — the same
+ * `alive | not-verifiable | absent` (liveness.ts), and the impure
+ * `checkLiveness` can additionally return `listing-failed`. `absent`'s own
+ * doc comment is explicit that it is "not proof of death", only absence
+ * from a listing that SUCCEEDED. `issue-respawn` is reachable ONLY on
+ * `absent`, never on `listing-failed` — the same
  * weak link the old `--bg --resume` restore path already acted on, not a
  * stronger guarantee BAKR-22 introduces.
  */
@@ -294,7 +296,7 @@ type OnLockResult =
  * explicit operator action, never something `daemon.ts` does, and ALWAYS
  * reported in the typed result (`wedgeCleared`), never silently. B13 point 2
  * (the epic's own sharp question): the predicate this clears on is "a
- * record exists for `(agentId, priorSessionId)` AND it is FAILED
+ * record exists for `(agentId, attemptKey(agent))` AND it is FAILED
  * (`clearFailedLaunchRecord` only ever removes one whose `error` is
  * already set)" — a genuinely in-flight (not-yet-failed) record is left
  * completely untouched and no duplicate launch is issued (this is what
@@ -311,18 +313,21 @@ type OnLockResult =
  *
  * B8 still binds absolutely: no prompt, ever. The id a restore resumes is
  * NOT hard-coded here — it comes from `decideOn`'s own call to
- * `agent-model.ts`'s `sessionToResume`, which is THE single function that
- * answers "which id do I resume" for the whole tree: `decideOn` (this
- * file's `on`) and `daemon.ts`'s restore path are its only call sites, so
- * BAKR-23's eventual rule lands inside that one function rather than in a
- * hunt across call sites. A never-launched agent's fresh launch passes
- * nothing (that function returns `undefined` for it).
+ * `agent-model.ts`'s `planRestore`, which is THE single function that
+ * answers "what do I restore, and how" for the whole tree: `decideOn`
+ * (this file's `on`) and `daemon.ts`'s restore path are its only call
+ * sites, so BAKR-23's rule landed inside that one function rather than in
+ * a hunt across call sites. It returns a `RestorePlan`, not a bare id:
+ * `{kind:"respawn", shortId}` when `agent.restoreTarget` is set, and
+ * `{kind:"fresh"}` for a never-launched agent.
  *
  * (This comment named `sessionIdToResume` until the BAKR-18 merge. BAKR-21
  * and BAKR-18 had independently shipped identical seams under different
  * names, which git merged cleanly because nothing conflicted textually;
  * BAKR-2 required one name and `sessionToResume` won, being already on
- * `main` and already wired into the daemon. Worth recording because the
+ * `main` and already wired into the daemon. BAKR-23 then REPLACED that
+ * seam outright with `planRestore`, which returns a plan rather than an
+ * id — so the name settled above no longer exists. Worth recording because the
  * seam test scans COMMENT-STRIPPED source — by design, so the history can
  * be told — which means a stale comment like the old one is exactly the
  * thing that test structurally cannot catch, and it would have sent
@@ -386,8 +391,9 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
       // BAKR-22: the liveness gate applies here too, not only in daemon.ts
       // — `respawn` kills and restarts a live process (measured), so `on`
       // must never call it while `decideLiveness` reports `alive` or
-      // `not-verifiable`. Reachable ONLY on `unknown` — not a "dead"
-      // verdict (none exists), just absence from this listing; see
+      // `not-verifiable`. Reachable ONLY on `absent`, never on
+      // `listing-failed` — not a "dead" verdict (none exists), just
+      // absence from a listing that succeeded; see
       // spawn/respawn.ts's own doc for why that is not a new weakness. A
       // `fresh` plan has no session to check liveness against at all
       // (there is nothing to be alive yet).

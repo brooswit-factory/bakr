@@ -26,10 +26,10 @@
 // singleton to test the genuine case. So the reachability argument: a
 // session with a tool call genuinely in flight was, in every trial run,
 // still LISTED (merely without a verifiable pid) — never absent from the
-// listing. Enumerate `decideLiveness`'s three verdicts against that: pid
+// listing. Enumerate `decideLiveness`'s verdicts against that: pid
 // alive -> `alive`, never respawned; listed with no verifiable pid ->
-// `not-verifiable`, never respawned; ONLY absence from the listing ->
-// `unknown` reaches respawn/forkFrom. If "a session executing work is
+// `not-verifiable`, never respawned; ONLY absence from a listing that
+// SUCCEEDED -> `absent` reaches respawn/forkFrom. If "a session executing work is
 // always listed" holds, the cost question cannot arise through bakr's own
 // restore path AT ALL — only a manual, out-of-band `respawn` could reach
 // it. That assumption is supported by every trial this ticket ran, not
@@ -39,9 +39,11 @@
 // restarts its process (measured: the pid changes) — an unannounced stop
 // hidden inside "restore", exactly what B7 forbids. THERE IS NO "dead"
 // VERDICT `decideLiveness` can produce (liveness.ts has exactly
-// `alive | not-verifiable | unknown`, and `unknown`'s own doc comment says
+// `alive | not-verifiable | absent`, plus `listing-failed` which only the
+// impure `checkLiveness` can return, and `absent`'s own doc comment says
 // plainly it is "not proof of death") — so the gate every caller of this
-// file must apply is "reachable only on `unknown`", the same weak link the
+// file must apply is "reachable only on `absent`", NEVER on
+// `listing-failed`, the same weak link the
 // old `--bg --resume` restore path already acted on, not a stronger
 // guarantee this file introduces. Nothing in this file re-checks it, by
 // design (this file, like stop.ts, is a thin, pure argv wrapper — the
