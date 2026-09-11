@@ -1,0 +1,61 @@
+[Unit]
+Description=bakr — daemon that keeps long-lived agents alive inside claimed directories
+# No `After=` line: `WantedBy=default.target` below already gives the
+# ordering needed. Ported from brooswit-factory/candlestix's own
+# systemd/candlestix.service (verified at candlestix's commit
+# 3801992aae149271e273a3ee48247978b1df6e8c) — its own comment gives the same
+# reasoning: default.target has no well-defined "before" set to depend on,
+# so an `After=default.target` alongside `WantedBy=default.target` is
+# redundant boilerplate, not a missing ordering guarantee.
+
+[Service]
+Type=simple
+# %h expands to the invoking user's home directory. bun and claude are
+# commonly installed outside the systemd user manager's default PATH — this
+# ticket's own measured fact, re-stated from candlestix's identical unit:
+# on the investigated host, bun lived at ~/.bun/bin/bun and was NOT on the
+# unit's inherited PATH. Spelled out explicitly rather than assumed
+# inherited from a login shell, which a systemd user unit does not have.
+Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# ExecStart is a TEMPLATE: scripts/install.sh substitutes both placeholders
+# with the real, resolved paths for the machine and clone it is installing
+# onto (BAKR-13, review of PR #10 defect 3) before ever copying this file to
+# $HOME/.config/systemd/user/ — a clone at any path, not only
+# ~/code/brooswit-factory/bakr, and whatever `bun` install.sh itself
+# resolved. The %h Environment=PATH line above is untouched by that
+# substitution and stays systemd-native: it is for subprocesses THIS
+# process spawns (e.g. `claude`), not for finding bun itself, so the
+# reasoning above for why it exists keeps holding regardless.
+#
+# Both substituted arguments are double-quoted (BAKR-14, review of PR #10
+# round 3): ExecStart is not a shell line — systemd splits it on whitespace
+# and expands `%` specifiers on its own, unquoted grammar — so a clone or
+# `bun` path containing a space is split into two argv entries and one
+# containing `%` (e.g. a literal `%d`) is silently expanded into a
+# specifier value, in either case yielding a unit that can never start
+# while install.sh still reported success. Quoting keeps embedded
+# whitespace as one token; install.sh additionally escapes `%` -> `%%` and
+# any literal `"` / `\` in the resolved values before they land inside
+# these quotes, per systemd's own unit-file quoting rules (see
+# scripts/install.sh's `escape_systemd_arg`), so the quotes themselves can
+# never be broken out of by a hostile-looking-but-real path.
+ExecStart="@@BUN_PATH@@" run "@@REPO_ROOT@@/src/index.ts"
+Restart=on-failure
+RestartSec=5
+
+# Deliberately the default (control-group), not overridden — same as
+# candlestix's own unit, and for the identical reason, re-verified for
+# bakr's own spawn substrate rather than assumed to transfer: every session
+# bakr launches goes through its own `systemd-run --user --scope`
+# (src/spawn/launch.ts), a SIBLING cgroup to this unit's own, never a
+# descendant — so `systemctl --user restart bakr` only ever tears down
+# bakr's own process, never a session it launched. See this ticket's PR
+# description for the before/after cgroup inspection that verifies this
+# for bakr specifically, not merely inherited from candlestix's own
+# measurement. KillMode=process was considered and rejected as unnecessary
+# once that sibling-cgroup property was confirmed to already hold
+# structurally, exactly as candlestix's own unit comment reasons.
+KillMode=control-group
+
+[Install]
+WantedBy=default.target
