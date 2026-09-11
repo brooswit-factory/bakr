@@ -63,9 +63,23 @@ export function resolveOrRefuse(state: AgentStoreState, scope: ClaimKey, ref: st
 export type OnDecision =
   | ResolutionRefusal
   | { readonly ok: false; readonly reason: "archived"; readonly message: string; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "no-change"; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "turn-on"; readonly agent: AgentRecord; readonly priorSessionId: string | undefined };
+  | { readonly ok: true; readonly agent: AgentRecord; readonly wasOff: boolean; readonly priorSessionId: string | undefined };
 
+/**
+ * Resolution and the LIFECYCLE half of `on` only — refuse archived,
+ * transition off -> on, no-op the state field when already on. Deliberately
+ * does NOT decide whether a launch is issued: that is inseparable from the
+ * launch-record wedge check (B13, epic ruling 2026-09-11), which needs
+ * `hasLaunchRecordFor`/`clearFailedLaunchRecord` (agent-model.ts) — kept in
+ * `agent-actions.ts`'s `on` so this function stays pure. `wasOff` tells the
+ * caller whether a real transition happened (for the "no-change" vs
+ * "turn-on" diagonal); `priorSessionId` is `sessionIdToResume(agent)` —
+ * the one call site the ticket's in-place correction requires — computed
+ * here EITHER WAY, because B13's wedge-clearing applies to an already-"on"
+ * agent too (an agent stuck "on" with a wedged fresh-launch record, e.g.
+ * from `create` crashing, needs the identical check `on` performs for the
+ * off -> on case — see the module comment in agent-actions.ts).
+ */
 export function decideOn(state: AgentStoreState, scope: ClaimKey, ref: string): OnDecision {
   const resolved = resolveOrRefuse(state, scope, ref);
   if (!resolved.ok) return resolved;
@@ -79,19 +93,11 @@ export function decideOn(state: AgentStoreState, scope: ClaimKey, ref: string): 
       agent,
     };
   }
-  if (agent.state === "on") {
-    return { ok: true, kind: "no-change", agent };
-  }
-  // off -> on. `priorSessionId` is resolved through `sessionIdToResume` —
-  // the ONE function/call site the ticket's in-place correction requires
-  // (2026-09-11: `--resume <durableSessionId>` must not be hard-coded
-  // inline, since BAKR-23 may change which id is correct to resume; today
-  // it still returns `agent.durableSessionId`). `undefined` covers an agent
-  // that has never held a session (e.g. `off` was called before `create`'s
-  // own fresh launch ever resolved one), in which case this is a fresh
-  // launch rather than a resume. See agent-actions.ts's `on` for the
-  // launch-record wedge handling this decision alone does not cover.
-  return { ok: true, kind: "turn-on", agent: { ...agent, state: "on" }, priorSessionId: sessionIdToResume(agent) };
+
+  const wasOff = agent.state === "off";
+  const priorSessionId = sessionIdToResume(agent);
+  const nextAgent: AgentRecord = wasOff ? { ...agent, state: "on" } : agent;
+  return { ok: true, agent: nextAgent, wasOff, priorSessionId };
 }
 
 // --- off: on -> off (B6), and the caller stops `liveSessionId` -------------

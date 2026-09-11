@@ -40,26 +40,26 @@
 // already decided to stop.
 //
 // THE LAUNCH-RECORD WEDGE (BAKR-17 comment, 2026-09-11, CONFIRMED at this
-// checkout): a launch record left by a verb process that records
-// `beginLaunch` and then dies before recording the outcome becomes
-// PERMANENTLY unrecoverable once a daemon cycle's `promoteWedgedLaunches`
-// marks it failed — `hasLaunchRecordFor` does not look at `error`, and
-// `resolveLaunch` never removes a failed record. `on`'s off -> on
-// transition is where this ticket closes that window: see `on` below and
-// `agent-model.ts`'s `clearFailedLaunchRecord` for the exact mechanism and
-// why it cannot become an automated retry (B7 must stay intact). The
-// documented recovery for an ALREADY-on agent stuck on a wedged record
-// (e.g. one left by `create`, which also performs a fresh launch) is
-// `off` then `on`: `off`'s transition is state-only and never touches a
-// launch record, and `on`'s own off -> on transition is exactly where
-// wedge-clearing lives — so the two-step sequence reaches the identical
-// recovery path without `on` needing a special case for an already-on
-// agent. This is a deliberate scope line, not an oversight: `on` does NOT
-// attempt to detect or recover a wedge on an agent that is already "on" by
-// itself — that remains the daemon's own reconcile responsibility, and if
-// ITS restore path is wedged for such an agent, that is a pre-existing
-// BAKR-16 daemon limitation this story does not extend "on"/"off" to patch
-// around, beyond the two-step workaround above being available today.
+// checkout, and now epic ruling B13): a launch record left by a verb
+// process that records `beginLaunch` and then dies before recording the
+// outcome becomes PERMANENTLY unrecoverable once a daemon cycle's
+// `promoteWedgedLaunches` marks it failed — `hasLaunchRecordFor` does not
+// look at `error`, and `resolveLaunch` never removes a failed record. B13:
+// "only an explicit operator action may clear a failed or given-up launch
+// record; the reconcile loop never does... today those actions are `on`
+// and `adopt`... the clearing must be reported in the action's typed
+// result, never done silently." `on` below is that operator action here —
+// see its own doc for the exact predicate it clears on (B13 point 2: a
+// FAILED record only, never a genuinely in-flight one) and how it reports
+// the clear (`wedgeCleared` in its typed result). It checks for a wedge
+// REGARDLESS of whether the agent was off or already "on" — an already-on
+// agent stuck on a wedged record (e.g. one left by `create`, which performs
+// the identical kind of fresh launch) is exactly the second case B13 and
+// the ticket's criterion 11 ask `on` to recover, not only the off -> on
+// transition. `daemon.ts` never calls `clearFailedLaunchRecord` — B7 (the
+// spawn-only reconcile loop) and B13 (the loop's give-up stays final) both
+// stay intact; see `test/unit/daemon-no-stop-path.test.ts`'s sibling
+// assertion in this story's own test suite.
 
 import { emptyAgentStore, hasLaunchRecordFor, mintUniqueAgentId, agentsInDirectory, beginLaunch, clearFailedLaunchRecord, markLaunchStarted, markLaunchFailed, putAgent, removeAndRetireAgent, type AgentRecord, type AgentStoreState } from "./agent-model";
 import { load, withAgentStoreLock } from "./agent-store-io";
@@ -211,27 +211,40 @@ export type OnResult =
   | StoreMalformed
   | ResolutionRefusal
   | { readonly ok: false; readonly reason: "archived"; readonly message: string; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "no-change"; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "turn-on"; readonly agent: AgentRecord; readonly wedgeCleared: boolean; readonly launchIssued: boolean };
+  | { readonly ok: true; readonly kind: "no-change" | "turn-on"; readonly agent: AgentRecord; readonly wedgeCleared: boolean; readonly launchIssued: boolean };
 
-type OnLaunchPlan = { readonly pending: true } | { readonly pending: false; readonly attemptId: string; readonly priorSessionId: string | undefined };
+type OnLaunchPlan = { readonly kind: "in-flight" } | { readonly kind: "none" } | { readonly kind: "issue"; readonly attemptId: string; readonly priorSessionId: string | undefined };
 
 type OnLockResult =
   | ResolutionRefusal
   | { readonly ok: false; readonly reason: "archived"; readonly message: string; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "no-change"; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "turn-on"; readonly agent: AgentRecord; readonly wedgeCleared: boolean; readonly launch: OnLaunchPlan };
+  | { readonly ok: true; readonly kind: "no-change" | "turn-on"; readonly agent: AgentRecord; readonly wedgeCleared: boolean; readonly launch: OnLaunchPlan };
 
 /**
- * off -> on (B6, refused while archived). See the module comment for the
- * launch-record wedge this function's off -> on transition recovers from:
- * a FAILED record for `(agentId, priorSessionId)` is cleared — deliberately
- * and only here, an explicit operator action, never something `daemon.ts`
- * does — before a fresh launch is issued; a genuinely in-flight record
- * (not yet failed) is left untouched and no duplicate launch is issued
- * (AC4: this is what keeps this path safe under a concurrent daemon
- * cycle). B8 still binds absolutely: no prompt, ever. The id a restore
- * resumes is NOT hard-coded here — it comes from `decideOn`'s own call to
+ * B6: off -> on, refused while archived. B13 (epic ruling, 2026-09-11) — the
+ * launch-record wedge (a crashed verb's intent record, PERMANENTLY
+ * unremovable once a daemon cycle marks it failed — see the module comment)
+ * is checked and, if failed, cleared HERE — deliberately and only here, an
+ * explicit operator action, never something `daemon.ts` does, and ALWAYS
+ * reported in the typed result (`wedgeCleared`), never silently. B13 point 2
+ * (the epic's own sharp question): the predicate this clears on is "a
+ * record exists for `(agentId, priorSessionId)` AND it is FAILED
+ * (`clearFailedLaunchRecord` only ever removes one whose `error` is
+ * already set)" — a genuinely in-flight (not-yet-failed) record is left
+ * completely untouched and no duplicate launch is issued (this is what
+ * keeps AC4 safe under concurrent callers).
+ *
+ * This check runs REGARDLESS of whether the agent was off or already on —
+ * an already-"on" agent stuck on a wedged record (e.g. left by `create`,
+ * which performs the identical kind of fresh launch) is exactly the second
+ * case B13/criterion 11 asks `on` to recover, not only the off -> on
+ * transition. `kind` still reports the LIFECYCLE diagonal honestly
+ * ("no-change" when the agent was already on, "turn-on" when it
+ * transitioned) — `wedgeCleared`/`launchIssued` are orthogonal facts about
+ * the launch side effect, reported either way.
+ *
+ * B8 still binds absolutely: no prompt, ever. The id a restore resumes is
+ * NOT hard-coded here — it comes from `decideOn`'s own call to
  * `agent-model.ts`'s `sessionIdToResume`, the one function/call site the
  * ticket's in-place correction (2026-09-11) requires, so adopting BAKR-23's
  * eventual rule for "which id do I resume" is a one-line change there, not
@@ -246,28 +259,34 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
       if (!decision.ok) {
         return { state: current, result: decision };
       }
-      if (decision.kind === "no-change") {
-        return { state: current, result: decision };
-      }
 
+      const kind = decision.wasOff ? ("turn-on" as const) : ("no-change" as const);
+      const agentId = decision.agent.id;
       const priorSessionId = decision.priorSessionId;
-      let next = putAgent(current, decision.agent);
+      let next = decision.wasOff ? putAgent(current, decision.agent) : current;
 
-      if (hasLaunchRecordFor(next, decision.agent.id, priorSessionId)) {
-        const cleared = clearFailedLaunchRecord(next, decision.agent.id, priorSessionId);
+      if (hasLaunchRecordFor(next, agentId, priorSessionId)) {
+        const cleared = clearFailedLaunchRecord(next, agentId, priorSessionId);
         if (cleared === next) {
-          // Genuinely in-flight (not failed) — never duplicate a live launch.
-          return { state: next, result: { ok: true, kind: "turn-on", agent: decision.agent, wedgeCleared: false, launch: { pending: true } } };
+          // Genuinely in-flight (not failed) — never duplicate a live launch (AC4).
+          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: false, launch: { kind: "in-flight" } } };
         }
         next = cleared;
         const attemptId = deps.generateAttemptId();
-        next = beginLaunch(next, decision.agent.id, directory, priorSessionId, attemptId, deps.now());
-        return { state: next, result: { ok: true, kind: "turn-on", agent: decision.agent, wedgeCleared: true, launch: { pending: false, attemptId, priorSessionId } } };
+        next = beginLaunch(next, agentId, directory, priorSessionId, attemptId, deps.now());
+        return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: true, launch: { kind: "issue", attemptId, priorSessionId } } };
+      }
+
+      if (!decision.wasOff) {
+        // Already on, no record at all — healthy or genuinely nothing to
+        // do; ongoing liveness of an already-"on" agent stays the daemon's
+        // own reconcile responsibility.
+        return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: false, launch: { kind: "none" } } };
       }
 
       const attemptId = deps.generateAttemptId();
-      next = beginLaunch(next, decision.agent.id, directory, priorSessionId, attemptId, deps.now());
-      return { state: next, result: { ok: true, kind: "turn-on", agent: decision.agent, wedgeCleared: false, launch: { pending: false, attemptId, priorSessionId } } };
+      next = beginLaunch(next, agentId, directory, priorSessionId, attemptId, deps.now());
+      return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: false, launch: { kind: "issue", attemptId, priorSessionId } } };
     },
     lockOpts(deps)
   );
@@ -275,9 +294,8 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
   if (decided.status === "malformed") return { ok: false, reason: "store-malformed", message: decided.error };
   const result = decided.result;
   if (!result.ok) return result;
-  if (result.kind === "no-change") return result;
-  if (result.launch.pending) {
-    return { ok: true, kind: "turn-on", agent: result.agent, wedgeCleared: result.wedgeCleared, launchIssued: false };
+  if (result.launch.kind !== "issue") {
+    return { ok: true, kind: result.kind, agent: result.agent, wedgeCleared: result.wedgeCleared, launchIssued: false };
   }
 
   const { attemptId, priorSessionId } = result.launch;
@@ -292,7 +310,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
     lockOpts(deps)
   );
 
-  return { ok: true, kind: "turn-on", agent: result.agent, wedgeCleared: result.wedgeCleared, launchIssued: true };
+  return { ok: true, kind: result.kind, agent: result.agent, wedgeCleared: result.wedgeCleared, launchIssued: true };
 }
 
 // --- off -------------------------------------------------------------------
