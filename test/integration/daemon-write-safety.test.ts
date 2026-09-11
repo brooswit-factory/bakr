@@ -83,6 +83,13 @@ function fakeRunCommand(): (argv: string[], opts: RunCommandOptions) => Promise<
     if (argv[0] === "claude" && argv[1] === "agents") {
       return { exitCode: 0, stdout: "[]", stderr: "" }; // nothing currently running -> forces a restore attempt
     }
+    // BAKR-22: an agent that already has a `restoreTarget` (as this file's
+    // migrated seed does) restores via `claude respawn <shortId>`, not
+    // `systemd-run ... --bg`. Only a genuinely FRESH launch (no restoreTarget
+    // yet) still goes through systemd-run.
+    if (argv[0] === "claude" && argv[1] === "respawn") {
+      return { exitCode: 0, stdout: `respawned ${argv[2]}\n`, stderr: "" };
+    }
     if (argv[0] === "systemd-run") {
       const shortId = `short-${n++}`;
       return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };

@@ -27,7 +27,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claim, emptyStore } from "../../src/claim-model";
 import { save as saveClaims } from "../../src/claim-store-io";
-import { emptyAgentStore, hasLaunchRecordFor, putAgent, type AgentRecord } from "../../src/agent-model";
+import { emptyAgentStore, hasLaunchRecordFor, putAgent, type AgentRecord, type AttemptKey } from "../../src/agent-model";
 import { save as saveAgents, load as loadAgents, withAgentStoreLock } from "../../src/agent-store-io";
 import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
 import { on, type AgentActionDeps } from "../../src/agent-actions";
@@ -94,19 +94,19 @@ async function seedClaim(dir: string): Promise<void> {
 }
 
 /** Simulates "a verb recorded `beginLaunch` and then the process died before recording the outcome" — the EXACT shape this story's `on`/`create` leave behind mid-flight, never calling `markLaunchStarted`/`markLaunchFailed`. */
-async function wedgeAgent(agentsPath: string, agent: AgentRecord, priorSessionId: string | undefined): Promise<void> {
+async function wedgeAgent(agentsPath: string, agent: AgentRecord, attemptKey: AttemptKey | undefined): Promise<void> {
   await saveAgents(agentsPath, putAgent(emptyAgentStore(), agent));
   await withAgentStoreLock(agentsPath, (current) => {
-    const next = { ...current, launches: [...current.launches, { attemptId: "wedge-attempt", agentId: agent.id, key: agent.directory, priorSessionId, attemptedAt: 1, launchShortId: undefined, error: undefined }] };
+    const next = { ...current, launches: [...current.launches, { attemptId: "wedge-attempt", agentId: agent.id, key: agent.directory, attemptKey, attemptedAt: 1, launchShortId: undefined, error: undefined }] };
     return { state: next, result: undefined };
   });
 }
 
 /** NEGATIVE CONTROL (a): the UNHANDLED shape — checks `hasLaunchRecordFor` (exactly as the daemon's own guard does) but has no `clearFailedLaunchRecord` step at all. Reproduces the permanent-block bug this story's `on` fixes. */
-async function unhandledOnAttempt(agentsPath: string, agentId: string, priorSessionId: string | undefined): Promise<"blocked" | "would-launch"> {
+async function unhandledOnAttempt(agentsPath: string, agentId: string, attemptKey: AttemptKey | undefined): Promise<"blocked" | "would-launch"> {
   const loaded = await loadAgents(agentsPath);
   if (loaded.status !== "loaded") throw new Error("expected a loaded store");
-  return hasLaunchRecordFor(loaded.state, agentId, priorSessionId) ? "blocked" : "would-launch";
+  return hasLaunchRecordFor(loaded.state, agentId, attemptKey) ? "blocked" : "would-launch";
 }
 
 describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, reported, and never cleared by the reconcile loop", () => {
@@ -115,7 +115,7 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
     try {
       const agentsPath = join(dir, "agents.json");
       await seedClaim(dir);
-      const agent: AgentRecord = { id: "@wedge-fresh0000000", name: undefined, directory: KEY, state: "on", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined };
+      const agent: AgentRecord = { id: "@wedge-fresh0000000", name: undefined, directory: KEY, state: "on", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined };
       await wedgeAgent(agentsPath, agent, undefined);
 
       // STEP: run a REAL reconcile cycle so the record is promoted to failed — the CONFIRMED hazard, reproduced against real code.
@@ -141,7 +141,11 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       expect(await unhandledOnAttempt(agentsPath, agent.id, undefined)).toBe("blocked"); // still blocked on a repeat — no automatic healing
 
       // THE REAL RECOVERY: calling the shipped `on()` clears the wedge, reports it, and launches again.
+      // BAKR-22: `on()` always fetches a listing first, even for a `fresh`
+      // plan that has nothing to check liveness against — see this file's
+      // own note on the concurrency fixture for the same behavior.
       const launchRunCommand = async (argv: string[], opts: RunCommandOptions): Promise<CommandResult> => {
+        if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
         if (argv[0] === "systemd-run") return { exitCode: 0, stdout: "backgrounded · recovered-short-0 (idle — send a prompt to start)\n", stderr: "" };
         throw new Error(`unexpected argv ${JSON.stringify(argv)}`);
       };
@@ -172,8 +176,9 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       const agentsPath = join(dir, "agents.json");
       await seedClaim(dir);
       // Mid-flight shape: `on`'s lock-1 already committed state:"on" before the crash — see agent-actions.ts's `on`, lock-1 transitions before launch() runs.
-      const agent: AgentRecord = { id: "@wedge-restore000000", name: undefined, directory: KEY, state: "on", createdAt: 1, durableSessionId: "durable-1", liveSessionId: undefined };
-      await wedgeAgent(agentsPath, agent, "durable-1");
+      // BAKR-22: a real restore target is a `{sessionId, shortId}` pair now, and the restore attempt it wedged on keys on the SHORT id (what `respawn` takes).
+      const agent: AgentRecord = { id: "@wedge-restore000000", name: undefined, directory: KEY, state: "on", createdAt: 1, birthSessionId: "durable-1", restoreTarget: { sessionId: "durable-1", shortId: "durable-1" } };
+      await wedgeAgent(agentsPath, agent, { kind: "respawn", shortId: "durable-1" });
 
       const daemonStub = makeDaemonStub();
       await runReconcileCycle(initialDaemonState(), daemonDeps(dir, daemonStub.runCommand));
@@ -182,15 +187,14 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       if (promoted.status !== "loaded") throw new Error("expected loaded");
       expect(promoted.state.launches.find((l) => l.agentId === agent.id)?.error).toBeDefined();
 
-      expect(await unhandledOnAttempt(agentsPath, agent.id, "durable-1")).toBe("blocked");
+      expect(await unhandledOnAttempt(agentsPath, agent.id, { kind: "respawn", shortId: "durable-1" })).toBe("blocked");
 
+      // BAKR-22: the recovery restore now goes through `claude respawn <shortId>`, not `--bg --resume`.
       const launchRunCommand = async (argv: string[], opts: RunCommandOptions): Promise<CommandResult> => {
-        if (argv[0] === "systemd-run") {
-          // B8/resume check: the restore must pass exactly --resume durable-1, nothing else, as argv elements AFTER "claude --bg".
-          const dashIdx = argv.indexOf("--");
-          const claudeArgs = argv.slice(dashIdx + 3);
-          expect(claudeArgs).toEqual(["--resume", "durable-1"]);
-          return { exitCode: 0, stdout: "backgrounded · recovered-short-1 (idle — send a prompt to start)\n", stderr: "" };
+        if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
+        if (argv[0] === "claude" && argv[1] === "respawn") {
+          expect(argv).toEqual(["claude", "respawn", "durable-1"]); // EXACTLY this and nothing else (B8/argv-exactness)
+          return { exitCode: 0, stdout: "respawned durable-1\n", stderr: "" };
         }
         throw new Error(`unexpected argv ${JSON.stringify(argv)}`);
       };
@@ -212,10 +216,11 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
     try {
       const agentsPath = join(dir, "agents.json");
       await seedClaim(dir);
-      const agent: AgentRecord = { id: "@in-flight00000000", name: undefined, directory: KEY, state: "off", durableSessionId: undefined, liveSessionId: undefined, createdAt: 1 };
+      const agent: AgentRecord = { id: "@in-flight00000000", name: undefined, directory: KEY, state: "off", birthSessionId: undefined, restoreTarget: undefined, createdAt: 1 };
       await wedgeAgent(agentsPath, agent, undefined); // NOTE: no reconcile cycle run — the record is still pending, never promoted to failed.
 
       const runCommand = async (argv: string[]): Promise<CommandResult> => {
+        if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" }; // BAKR-22: on() always lists first
         throw new Error(`FALSIFIER TRIPPED: must never call launch for an in-flight record — got ${JSON.stringify(argv)}`);
       };
       const result = await on(actionDeps(dir, runCommand), KEY, agent.id);

@@ -74,7 +74,7 @@ async function waitForReady(proc: { stdout: ReadableStream<Uint8Array> }): Promi
 }
 
 async function seedOnAgent(agentsPath: string): Promise<void> {
-  const agent: AgentRecord = { id: AGENT_ID, name: undefined, directory: KEY, state: "on", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined };
+  const agent: AgentRecord = { id: AGENT_ID, name: undefined, directory: KEY, state: "on", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined };
   await save(agentsPath, putAgent(emptyAgentStore(), agent));
 }
 

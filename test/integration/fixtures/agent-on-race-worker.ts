@@ -21,11 +21,19 @@ async function fakeLaunchOk(): Promise<{ ok: true; id: string }> {
 function baseDeps(agentsPath: string): AgentActionDeps {
   return {
     agentsPath,
-    // `on`'s "safe" path only ever calls `launch()`, never `listBackgroundSessions` —
-    // this fake only needs to handle a `systemd-run` invocation.
+    // BAKR-22: `on`'s "safe" path now ALWAYS fetches a listing first (before
+    // deciding anything, including for a `fresh` plan that has no session
+    // to check liveness against yet) — a behavior change from the pre-BAKR-22
+    // code this fixture originally modeled (which only ever called
+    // `launch()`). This fixture's agent is seeded fresh (no restoreTarget),
+    // so the listing's actual content is irrelevant to the race being
+    // tested; `[]` is enough to let `on()` proceed to its `fresh` branch.
     runCommand: async (argv) => {
       if (argv[0] === "systemd-run") {
         return { exitCode: 0, stdout: `backgrounded · short-${process.pid} (idle — send a prompt to start)\n`, stderr: "" };
+      }
+      if (argv[0] === "claude" && argv[1] === "agents") {
+        return { exitCode: 0, stdout: "[]", stderr: "" };
       }
       throw new Error(`fixture fake runCommand: unexpected argv ${JSON.stringify(argv)}`);
     },

@@ -36,7 +36,7 @@ async function makeTempDir(prefix = "bakr-adopt-test-"): Promise<string> {
 }
 
 function makeAgent(overrides: Partial<AgentRecord> & { id: string; directory: ClaimKey }): AgentRecord {
-  return { name: undefined, state: "on", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined, ...overrides };
+  return { name: undefined, state: "on", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined, ...overrides };
 }
 
 function makeDeps(storeDir: string): AdoptDeps {
@@ -69,9 +69,9 @@ describe("adopt: the successful path (Q3/Q6/Q7)", () => {
     const source = await makeOrphan(storeDir);
     const destination = await makeTempDir("bakr-adopt-dest-");
 
-    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: source, name: "worker-one", durableSessionId: "durable-x", liveSessionId: "durable-x" }));
+    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: source, name: "worker-one", birthSessionId: "durable-x", restoreTarget: { sessionId: "durable-x", shortId: "durable-x" } }));
     agentState = recordRestoreAttempt(agentState, "@a1");
-    agentState = beginLaunch(agentState, "@a1", source, "durable-x", "given-up-attempt", 100);
+    agentState = beginLaunch(agentState, "@a1", source, { kind: "respawn", shortId: "durable-x" }, "given-up-attempt", 100);
     agentState = markLaunchFailed(agentState, "given-up-attempt", "gave up after 3 consecutive restore attempts — unrelated to the move");
     await saveAgents(join(storeDir, "agents.json"), agentState);
 
@@ -98,7 +98,7 @@ describe("adopt: the successful path (Q3/Q6/Q7)", () => {
       const moved = agentsAfter.state.agents["@a1"];
       expect(moved?.directory).toBe(outcome.destination);
       expect(restoreAttemptCount(agentsAfter.state, "@a1")).toBe(0);
-      expect(hasLaunchRecordFor(agentsAfter.state, "@a1", "durable-x")).toBe(false);
+      expect(hasLaunchRecordFor(agentsAfter.state, "@a1", { kind: "respawn", shortId: "durable-x" })).toBe(false);
     }
 
     // Q7: the OLD claim is NOT auto-released, even though its last agent just left.

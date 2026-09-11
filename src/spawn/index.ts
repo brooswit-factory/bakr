@@ -50,3 +50,6 @@ export { listBackgroundSessions } from "./list";
 
 export type { StopDeps, StopResult } from "./stop";
 export { stopSession } from "./stop";
+
+export type { RespawnDeps, RespawnResult } from "./respawn";
+export { respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal } from "./respawn";

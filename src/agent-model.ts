@@ -34,14 +34,50 @@ export type AgentLifecycleState = "on" | "off" | "archived";
  * `resolveAgent` below is the one function that accepts a directory-scoped
  * or global reference from a caller and translates it to one of these.
  */
+/**
+ * BAKR-22: the one field bakr actually restores from, and (per that
+ * ticket's own measurement) the one field it also checks liveness against
+ * — a single pair rather than the old two-field split, because the
+ * rationale for two fields no longer holds. Under `claude --bg --resume`
+ * the session id ROTATED on every restore, so "the id to check liveness
+ * for" and "the durable identity" had to be kept apart (conflating them is
+ * exactly what caused the original restore-spawn loop — see
+ * `session-slots.ts`'s own incident comment). Under `claude respawn`, the
+ * id no longer rotates on an ordinary restore at all — the only thing that
+ * ever changes this field is a successful `forkFrom` (the moved-directory
+ * escape), a rare, explicit, single event, not routine rotation. The one
+ * place `sessionId` and `shortId` could diverge — mid-`forkFrom`, between
+ * minting the new session and the store write landing — is closed by B12:
+ * this field is only ever read and written inside the same lock hold as
+ * the decision that produced it.
+ */
+export interface RestoreTarget {
+  readonly sessionId: string;
+  readonly shortId: string;
+}
+
 export interface AgentRecord {
   readonly id: string;
   readonly name: string | undefined;
   readonly directory: ClaimKey;
   readonly state: AgentLifecycleState;
   readonly createdAt: number;
-  readonly durableSessionId: string | undefined;
-  readonly liveSessionId: string | undefined;
+  /**
+   * BAKR-22: pure birth provenance. Set once, at this agent's first-ever
+   * launch, from the session id that launch resolved to — and NEVER
+   * written again after that. No restore decision anywhere in this tree
+   * reads this field; it exists only so a human (or a future incident
+   * report) can answer "what session was this agent born from". Renamed
+   * from `durableSessionId`, which BAKR-22 measured to be a lie in
+   * practice: `claude --bg --resume` forks on every restore on at least
+   * one still-supported claude build (2.1.251), so a field claiming to be
+   * the thing bakr restores from, while never changing, was asserting a
+   * story the substrate did not honor. This field makes no restore claim
+   * at all — see `restoreTarget` for the field that does.
+   */
+  readonly birthSessionId: string | undefined;
+  /** See `RestoreTarget`'s own doc. `undefined` only before this agent's first launch has resolved a session at all. */
+  readonly restoreTarget: RestoreTarget | undefined;
 }
 
 /**
@@ -54,12 +90,45 @@ export interface AgentRecord {
  * remains, as an ATTRIBUTE naming which directory to launch into (AC9's own
  * sweep item), never again what a resolution is keyed by.
  */
+/**
+ * BAKR-22: the identity actually attempted, tagged by which mechanism
+ * produced the attempt — never a "durable" id, never implicitly one id
+ * space. `respawn`'s target is a SHORT id (`claude respawn` rejects a full
+ * session uuid outright — measured); `forkFrom`'s target is the FULL
+ * session id being forked FROM (never the new id a successful fork would
+ * produce — see `planRestore`'s own doc for why forking from anything
+ * other than the agent's current `restoreTarget` would reintroduce this
+ * ticket's own rewind bug, gated on "moved twice" instead of "restored
+ * twice"). `undefined` means a fresh launch (no prior session at all).
+ *
+ * THE KEYING RULE THAT MAKES B13 WORK WITH NO FORK-SPECIFIC BRANCH:
+ * a launch record keys on the exact identity value that was actually
+ * attempted, not on what it might resolve to. Neither a `respawn` target
+ * (a short id) nor a `forkFrom` source (a pre-fork session id) ever
+ * changes on FAILURE — only a successful resolution changes either. So a
+ * run of failures against the same key accumulates against the same key
+ * every time, and `hasLaunchRecordFor`'s existing "a matching record with
+ * `error` set blocks forever" mechanism needs no special case for either
+ * kind: a give-up on a `respawn` target stays a give-up on that exact
+ * short id; a give-up on a `forkFrom` source stays a give-up on that exact
+ * session id. It stops matching only once a *different* attempt is made
+ * against a *different* key, which only happens after an actual
+ * successful resolution.
+ */
+export type AttemptKey = { readonly kind: "respawn"; readonly shortId: string } | { readonly kind: "forkFrom"; readonly sessionId: string };
+
+function attemptKeyEquals(a: AttemptKey | undefined, b: AttemptKey | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  if (a.kind !== b.kind) return false;
+  return a.kind === "respawn" ? a.shortId === (b as { shortId: string }).shortId : a.sessionId === (b as { sessionId: string }).sessionId;
+}
+
 export interface LaunchRecord {
   readonly attemptId: string;
   readonly agentId: string;
   readonly key: ClaimKey;
-  /** The DURABLE session id this launch was resuming, or `undefined` for a fresh launch. Never the live/rotated id. */
-  readonly priorSessionId: string | undefined;
+  /** See `AttemptKey`'s own doc. `undefined` for a fresh launch (no prior session at all). */
+  readonly attemptKey: AttemptKey | undefined;
   readonly attemptedAt: number;
   readonly launchShortId: string | undefined;
   readonly error: string | undefined;
@@ -311,32 +380,37 @@ export function resolveAgent(state: AgentStoreState, scope: ClaimKey, ref: strin
   return agent === undefined ? { outcome: "not-found" } : { outcome: "found", agent };
 }
 
-// --- Which session to resume (BAKR-24 correction) -------------------------
+// --- Which session to resume (BAKR-22: respawn, with a fork-only escape) --
 
 /**
  * THE SINGLE FUNCTION every restore/adopt caller must go through to answer
- * "which session id do I pass `--resume`?" — never read `agent.durableSessionId`
- * inline at a call site. `durableSessionId` is correct and sufficient for now,
- * but BAKR-23 (a sibling story under the same epic) is going to change this
- * rule once it has measured which id a silently-failed restore can actually
- * resume (see this file's own header on the substrate's fork-on-resume
- * behaviour and the fact that a `--bg --resume` given no prompt writes NO
- * transcript at all). Funneling every caller through this one function is
- * what lets that future change land in one place instead of a hunt across
- * daemon.ts and every adoption/restore call site.
+ * "what do I do to restore this agent?" — never read `agent.restoreTarget`
+ * or `agent.birthSessionId` inline at a call site. Call sites: `decideOn`
+ * (the `on` verb) and `daemon.ts`'s reconcile restore.
  *
- * BAKR-17/BAKR-21 UNIFIED INTO THIS FUNCTION AT MERGE TIME (2026-09-11).
- * BAKR-21 had shipped an identical `sessionIdToResume` on its own branch
- * before BAKR-18 landed this one; the two never conflicted textually
- * because the names differed, which is exactly how a merge can be
- * silently wrong. BAKR-2 required one name, so `sessionIdToResume` is
- * retired and `agent-lifecycle.ts`'s `decideOn` now calls THIS function.
- * Call sites today: `decideOn` (the `on` verb) and `daemon.ts`'s restore.
- * `daemon.ts` does still mention `.durableSessionId` once more, but only
- * inside a LOG STRING, never as a resume decision — verified at merge.
+ * BAKR-22 measured (raw results on the ticket) that `claude --bg --resume`
+ * forks on at least one still-supported build (2.1.251) even under bakr's
+ * own exact invocation shape, while `claude respawn <shortId>` does not
+ * fork on any build measured (2.1.251, 2.1.268, and across a build change)
+ * — same session id every time, full content retention, no model-turn
+ * cost on a cleanly-completed prior turn. So the ordinary path is
+ * `respawn`, keyed on the short id `respawn` requires (it rejects a full
+ * session uuid outright — measured). This function NEVER returns a
+ * `forkFrom` plan itself — `forkFrom` is reached only reactively, by the
+ * caller, after `respawn` has returned the one recognised stale-cwd
+ * refusal (see `RESPAWN_STALE_CWD_MARKER` in spawn/respawn.ts) — never
+ * chosen up front, and never from any other non-zero result (an
+ * unrecognised failure must refuse loudly, never fall through to a fork:
+ * forking when the failure meant something else would abandon a live
+ * conversation and mint a new one).
  */
-export function sessionToResume(agent: AgentRecord): string | undefined {
-  return agent.durableSessionId;
+export type RestorePlan = { readonly kind: "fresh" } | { readonly kind: "respawn"; readonly shortId: string };
+
+export function planRestore(agent: AgentRecord): RestorePlan {
+  if (agent.restoreTarget === undefined) {
+    return { kind: "fresh" };
+  }
+  return { kind: "respawn", shortId: agent.restoreTarget.shortId };
 }
 
 // --- Restore-attempt bookkeeping (R-C: rekeyed to agent id) ---------------
@@ -382,14 +456,17 @@ export function promoteUnresolvableLaunches(state: AgentStoreState, reason: stri
 }
 
 /**
- * True when a launch attempt for exactly this `(agentId, priorSessionId)`
- * pair already exists. Keyed by AGENT id now, not by directory — this is
- * what makes two agents launched fresh into the SAME directory in the SAME
+ * True when a launch attempt for exactly this `(agentId, attemptKey)` pair
+ * already exists. Keyed by AGENT id now, not by directory — this is what
+ * makes two agents launched fresh into the SAME directory in the SAME
  * cycle independent of one another (AC4): each has its own agent id, so
- * each gets its own guard entry, regardless of arrival order.
+ * each gets its own guard entry, regardless of arrival order. `attemptKey`
+ * is compared as a whole tagged value (see `AttemptKey`'s own doc for why
+ * this is what makes B13 work unmodified for both `respawn` and
+ * `forkFrom`).
  */
-export function hasLaunchRecordFor(state: AgentStoreState, agentId: string, priorSessionId: string | undefined): boolean {
-  return state.launches.some((l) => l.agentId === agentId && l.priorSessionId === priorSessionId);
+export function hasLaunchRecordFor(state: AgentStoreState, agentId: string, attemptKey: AttemptKey | undefined): boolean {
+  return state.launches.some((l) => l.agentId === agentId && attemptKeyEquals(l.attemptKey, attemptKey));
 }
 
 /**
@@ -416,14 +493,14 @@ export function hasLaunchRecordFor(state: AgentStoreState, agentId: string, prio
  * was written for an unattended loop; an operator who calls `on` again
  * after a launch demonstrably failed is not that.
  */
-export function clearFailedLaunchRecord(state: AgentStoreState, agentId: string, priorSessionId: string | undefined): AgentStoreState {
-  const record = state.launches.find((l) => l.agentId === agentId && l.priorSessionId === priorSessionId && l.error !== undefined);
+export function clearFailedLaunchRecord(state: AgentStoreState, agentId: string, attemptKey: AttemptKey | undefined): AgentStoreState {
+  const record = state.launches.find((l) => l.agentId === agentId && attemptKeyEquals(l.attemptKey, attemptKey) && l.error !== undefined);
   if (record === undefined) return state;
   return { ...state, launches: state.launches.filter((l) => l.attemptId !== record.attemptId) };
 }
 
-export function beginLaunch(state: AgentStoreState, agentId: string, key: ClaimKey, priorSessionId: string | undefined, attemptId: string, now: number): AgentStoreState {
-  const record: LaunchRecord = { attemptId, agentId, key, priorSessionId, attemptedAt: now, launchShortId: undefined, error: undefined };
+export function beginLaunch(state: AgentStoreState, agentId: string, key: ClaimKey, attemptKey: AttemptKey | undefined, attemptId: string, now: number): AgentStoreState {
+  const record: LaunchRecord = { attemptId, agentId, key, attemptKey, attemptedAt: now, launchShortId: undefined, error: undefined };
   return { ...state, launches: [...state.launches, record] };
 }
 
@@ -468,18 +545,24 @@ export function discardLaunchRecordsForAgents(state: AgentStoreState, agentIds: 
  * — finalizes the matching pending record, attaching the outcome to the
  * AGENT that requested it (`record.agentId`), never to a directory-keyed
  * list (the fix for defect 1 in BAKR-16 §4). Removes the launch record
- * either way.
+ * either way. Applies to `fresh` and `forkFrom` launches ONLY — a
+ * `respawn` attempt never needs this (its result is synchronous and its
+ * identity never changes; see `resolveRespawnAttempt`).
  *
- * - Fresh launch (`priorSessionId === undefined`): sets the agent's
- *   `durableSessionId`/`liveSessionId` to `resolvedSessionId`, but only if
- *   the agent does not already have a durable session id — idempotent
- *   against a duplicate resolution, and never overwrites an existing
- *   session the way BAKR-13's own regression forbids.
- * - Restore (`priorSessionId` defined — always a durable id): updates ONLY
- *   `liveSessionId`, and only when `priorSessionId` still matches the
- *   agent's own `durableSessionId` — `durableSessionId` itself is NEVER
- *   overwritten here (session-slots.ts's own hard-won fix, ported: this is
- *   what stopped the live restore-spawn loop).
+ * - Fresh launch (`attemptKey === undefined`): sets the agent's
+ *   `birthSessionId`/`restoreTarget` to `resolvedSessionId`/`launchShortId`,
+ *   but only if the agent does not already have a birth session id —
+ *   idempotent against a duplicate resolution, and never overwrites an
+ *   existing session the way BAKR-13's own regression forbids.
+ * - `forkFrom` (attemptKey.kind === "forkFrom"): updates ONLY
+ *   `restoreTarget`, and only when the attempt's own pre-fork session id
+ *   still matches the agent's CURRENT `restoreTarget.sessionId` —
+ *   `birthSessionId` itself is NEVER touched here. Matching against
+ *   `restoreTarget` rather than `birthSessionId` is BAKR-22's own
+ *   correction: forking from anything other than the agent's current
+ *   target would discard whatever happened since the last fork,
+ *   reintroducing this ticket's own rewind bug gated on "moved twice"
+ *   instead of "restored twice".
  * - If the agent named by `record.agentId` no longer exists (defensive —
  *   should not happen while no delete verb ships), the launch record is
  *   still removed rather than left to wedge future cycles, but no agent is
@@ -499,15 +582,30 @@ export function resolveLaunch(state: AgentStoreState, launchShortId: string, res
   }
 
   let nextAgent: AgentRecord = agent;
-  if (record.priorSessionId !== undefined) {
-    if (agent.durableSessionId === record.priorSessionId) {
-      nextAgent = { ...agent, liveSessionId: resolvedSessionId };
+  if (record.attemptKey !== undefined && record.attemptKey.kind === "forkFrom") {
+    if (agent.restoreTarget?.sessionId === record.attemptKey.sessionId) {
+      nextAgent = { ...agent, restoreTarget: { sessionId: resolvedSessionId, shortId: launchShortId } };
     }
-  } else if (agent.durableSessionId === undefined) {
-    nextAgent = { ...agent, durableSessionId: resolvedSessionId, liveSessionId: resolvedSessionId };
+  } else if (record.attemptKey === undefined && agent.birthSessionId === undefined) {
+    nextAgent = { ...agent, birthSessionId: resolvedSessionId, restoreTarget: { sessionId: resolvedSessionId, shortId: launchShortId } };
   }
 
   return { ...state, agents: { ...state.agents, [agent.id]: nextAgent }, launches };
+}
+
+/**
+ * `claude respawn <shortId>` resolves SYNCHRONOUSLY — no later listing is
+ * needed to learn a session id, because `respawn` never changes it (BAKR-22
+ * measurement). This is the `respawn`-kind counterpart to `resolveLaunch`:
+ * on success, the pending record is simply removed (the agent's
+ * `restoreTarget` needs no update — it was already correct, and BAKR-22
+ * measured that `respawn` does not rotate it). Total, like every other
+ * mutator here: a no-op if no pending record matches.
+ */
+export function resolveRespawnAttempt(state: AgentStoreState, attemptId: string): AgentStoreState {
+  const record = state.launches.find((l) => l.attemptId === attemptId && l.error === undefined);
+  if (record === undefined) return state;
+  return { ...state, launches: state.launches.filter((l) => l.attemptId !== record.attemptId) };
 }
 
 /**
@@ -537,15 +635,26 @@ export function resolvePendingCreation(state: AgentStoreState, launchShortId: st
     directory: record.key,
     state: "on",
     createdAt: now,
-    durableSessionId: resolvedSessionId,
-    liveSessionId: resolvedSessionId,
+    birthSessionId: resolvedSessionId,
+    restoreTarget: { sessionId: resolvedSessionId, shortId: launchShortId },
   };
   return { ...state, agents: { ...state.agents, [id]: agent }, pendingCreations };
 }
 
 // --- Wire format -----------------------------------------------------
 
-export const AGENT_STORE_VERSION = 1;
+export const AGENT_STORE_VERSION = 2;
+
+interface PersistedRestoreTarget {
+  readonly sessionId: string;
+  readonly shortId: string;
+}
+
+interface PersistedAttemptKey {
+  readonly kind: "respawn" | "forkFrom";
+  readonly shortId: string | null;
+  readonly sessionId: string | null;
+}
 
 interface PersistedAgentRecord {
   readonly id: string;
@@ -553,15 +662,15 @@ interface PersistedAgentRecord {
   readonly directory: string;
   readonly state: AgentLifecycleState;
   readonly createdAt: number;
-  readonly durableSessionId: string | null;
-  readonly liveSessionId: string | null;
+  readonly birthSessionId: string | null;
+  readonly restoreTarget: PersistedRestoreTarget | null;
 }
 
 interface PersistedLaunchRecord {
   readonly attemptId: string;
   readonly agentId: string;
   readonly key: string;
-  readonly priorSessionId: string | null;
+  readonly attemptKey: PersistedAttemptKey | null;
   readonly attemptedAt: number;
   readonly launchShortId: string | null;
   readonly error: string | null;
@@ -589,6 +698,19 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 const LIFECYCLE_STATES: readonly AgentLifecycleState[] = ["on", "off", "archived"];
 
+function isValidPersistedRestoreTarget(value: unknown): value is PersistedRestoreTarget {
+  return isPlainObject(value) && typeof value["sessionId"] === "string" && typeof value["shortId"] === "string";
+}
+
+function isValidPersistedAttemptKey(value: unknown): value is PersistedAttemptKey {
+  return (
+    isPlainObject(value) &&
+    (value["kind"] === "respawn" || value["kind"] === "forkFrom") &&
+    (value["shortId"] === null || typeof value["shortId"] === "string") &&
+    (value["sessionId"] === null || typeof value["sessionId"] === "string")
+  );
+}
+
 function isValidPersistedAgentRecord(value: unknown): value is PersistedAgentRecord {
   return (
     isPlainObject(value) &&
@@ -598,8 +720,8 @@ function isValidPersistedAgentRecord(value: unknown): value is PersistedAgentRec
     typeof value["state"] === "string" &&
     LIFECYCLE_STATES.includes(value["state"] as AgentLifecycleState) &&
     typeof value["createdAt"] === "number" &&
-    (value["durableSessionId"] === null || typeof value["durableSessionId"] === "string") &&
-    (value["liveSessionId"] === null || typeof value["liveSessionId"] === "string")
+    (value["birthSessionId"] === null || typeof value["birthSessionId"] === "string") &&
+    (value["restoreTarget"] === null || isValidPersistedRestoreTarget(value["restoreTarget"]))
   );
 }
 
@@ -609,7 +731,7 @@ function isValidPersistedLaunchRecord(value: unknown): value is PersistedLaunchR
     typeof value["attemptId"] === "string" &&
     typeof value["agentId"] === "string" &&
     typeof value["key"] === "string" &&
-    (value["priorSessionId"] === null || typeof value["priorSessionId"] === "string") &&
+    (value["attemptKey"] === null || isValidPersistedAttemptKey(value["attemptKey"])) &&
     typeof value["attemptedAt"] === "number" &&
     (value["launchShortId"] === null || typeof value["launchShortId"] === "string") &&
     (value["error"] === null || typeof value["error"] === "string")
@@ -635,6 +757,21 @@ function isValidPersistedPendingCreationRecord(value: unknown): value is Persist
   );
 }
 
+function persistAttemptKey(key: AttemptKey | undefined): PersistedAttemptKey | null {
+  if (key === undefined) return null;
+  return key.kind === "respawn" ? { kind: "respawn", shortId: key.shortId, sessionId: null } : { kind: "forkFrom", shortId: null, sessionId: key.sessionId };
+}
+
+function reviveAttemptKey(value: PersistedAttemptKey | null): AttemptKey | undefined {
+  if (value === null) return undefined;
+  if (value.kind === "respawn") {
+    if (value.shortId === null) throw new Error("attemptKey kind 'respawn' with no shortId");
+    return { kind: "respawn", shortId: value.shortId };
+  }
+  if (value.sessionId === null) throw new Error("attemptKey kind 'forkFrom' with no sessionId");
+  return { kind: "forkFrom", sessionId: value.sessionId };
+}
+
 export function serializeAgentStoreState(state: AgentStoreState): string {
   const agents: Record<string, PersistedAgentRecord> = {};
   for (const [id, a] of Object.entries(state.agents)) {
@@ -644,15 +781,15 @@ export function serializeAgentStoreState(state: AgentStoreState): string {
       directory: a.directory,
       state: a.state,
       createdAt: a.createdAt,
-      durableSessionId: a.durableSessionId ?? null,
-      liveSessionId: a.liveSessionId ?? null,
+      birthSessionId: a.birthSessionId ?? null,
+      restoreTarget: a.restoreTarget ?? null,
     };
   }
   const launches: PersistedLaunchRecord[] = state.launches.map((l) => ({
     attemptId: l.attemptId,
     agentId: l.agentId,
     key: l.key,
-    priorSessionId: l.priorSessionId ?? null,
+    attemptKey: persistAttemptKey(l.attemptKey),
     attemptedAt: l.attemptedAt,
     launchShortId: l.launchShortId ?? null,
     error: l.error ?? null,
@@ -677,12 +814,140 @@ export function serializeAgentStoreState(state: AgentStoreState): string {
 export type ParseResult = { readonly ok: true; readonly state: AgentStoreState } | { readonly ok: false; readonly error: string };
 
 /**
+ * BAKR-22 MIGRATION, pure (no I/O — the store-shape half only; see this
+ * function's own doc for what it deliberately does NOT attempt to verify).
+ * `sessionId.slice(0, 8)` matches the short id `claude` itself uses for a
+ * job's own directory name — measured 58/58 on one host and 56/56
+ * independently on another (both recorded on BAKR-22's ticket) — but it is
+ * an OBSERVED, UNDOCUMENTED pattern, not a guarantee, so it is used ONLY
+ * here, as a migration fallback, never for a normal write (every ordinary
+ * `restoreTarget`/`attemptKey` write gets its short id from an actual
+ * `launch()`/`respawn` result). If the derived id is wrong, the first
+ * `respawn` attempt against it fails with claude's own "No job matching"
+ * message — an UNRECOGNISED failure under this ticket's own rule, so it
+ * refuses loudly rather than silently forking; see `planRestore`'s doc and
+ * daemon.ts's dispatch. That is the "verification" this migration relies
+ * on: not performed here, but guaranteed to surface loudly at the next
+ * real restore attempt rather than being silently trusted.
+ */
+function deriveShortIdFromSessionId(sessionId: string): string {
+  return sessionId.slice(0, 8);
+}
+
+interface PersistedAgentRecordV1 {
+  readonly id: string;
+  readonly name: string | null;
+  readonly directory: string;
+  readonly state: AgentLifecycleState;
+  readonly createdAt: number;
+  readonly durableSessionId: string | null;
+  readonly liveSessionId: string | null;
+}
+
+interface PersistedLaunchRecordV1 {
+  readonly attemptId: string;
+  readonly agentId: string;
+  readonly key: string;
+  readonly priorSessionId: string | null;
+  readonly attemptedAt: number;
+  readonly launchShortId: string | null;
+  readonly error: string | null;
+}
+
+function isValidPersistedAgentRecordV1(value: unknown): value is PersistedAgentRecordV1 {
+  return (
+    isPlainObject(value) &&
+    typeof value["id"] === "string" &&
+    (value["name"] === null || typeof value["name"] === "string") &&
+    typeof value["directory"] === "string" &&
+    typeof value["state"] === "string" &&
+    LIFECYCLE_STATES.includes(value["state"] as AgentLifecycleState) &&
+    typeof value["createdAt"] === "number" &&
+    (value["durableSessionId"] === null || typeof value["durableSessionId"] === "string") &&
+    (value["liveSessionId"] === null || typeof value["liveSessionId"] === "string")
+  );
+}
+
+function isValidPersistedLaunchRecordV1(value: unknown): value is PersistedLaunchRecordV1 {
+  return (
+    isPlainObject(value) &&
+    typeof value["attemptId"] === "string" &&
+    typeof value["agentId"] === "string" &&
+    typeof value["key"] === "string" &&
+    (value["priorSessionId"] === null || typeof value["priorSessionId"] === "string") &&
+    typeof value["attemptedAt"] === "number" &&
+    (value["launchShortId"] === null || typeof value["launchShortId"] === "string") &&
+    (value["error"] === null || typeof value["error"] === "string")
+  );
+}
+
+/**
+ * ONE agent record, V1 (`durableSessionId`/`liveSessionId`) in, V2
+ * (`birthSessionId`/`restoreTarget`) out. `birthSessionId` is a direct
+ * carry of `durableSessionId` — birth provenance never needed a rule
+ * change. `restoreTarget` prefers `liveSessionId` over `durableSessionId`
+ * when both are present and differ — THE SUBTLE CASE the epic asked this
+ * migration to argue: a v1 record whose `liveSessionId` is a 2.1.251-era
+ * FORK of its `durableSessionId` (the exact defect this ticket measured:
+ * `resolveLaunch`'s old restore branch updated only `liveSessionId`,
+ * leaving `durableSessionId` pinned at birth). `liveSessionId` is the MORE
+ * RECENT of the two in every such case — it is what the agent's last
+ * successful restore actually resolved to — so it is the correct choice
+ * for "what do I restore next", exactly mirroring `forkFrom`'s own rule of
+ * always advancing from the current target, never back to birth. A record
+ * with no session at all yet (`durableSessionId` and `liveSessionId` both
+ * absent — e.g. a fresh launch that never resolved) gets no
+ * `restoreTarget` either; `planRestore` already treats that as `fresh`.
+ */
+function migrateV1AgentRecord(v1: PersistedAgentRecordV1): PersistedAgentRecord {
+  const restoreSessionId = v1.liveSessionId ?? v1.durableSessionId;
+  return {
+    id: v1.id,
+    name: v1.name,
+    directory: v1.directory,
+    state: v1.state,
+    createdAt: v1.createdAt,
+    birthSessionId: v1.durableSessionId,
+    restoreTarget: restoreSessionId === null ? null : { sessionId: restoreSessionId, shortId: deriveShortIdFromSessionId(restoreSessionId) },
+  };
+}
+
+/**
+ * ONE launch record, V1 (`priorSessionId`, always a durable/full session
+ * id or absent) in, V2 (`attemptKey`, tagged by kind) out. Every v1
+ * restore attempt becomes a `respawn`-kind key on the SAME derived short
+ * id `migrateV1AgentRecord` would derive for that same session id — so a
+ * migrated give-up record and the agent's own migrated `restoreTarget`
+ * agree on the short id they key against, and B13's "give-up stays a
+ * give-up until an operator clears it" property survives the migration
+ * unchanged. A v1 fresh-launch attempt (`priorSessionId` absent) stays a
+ * fresh (`undefined`) attempt key.
+ */
+function migrateV1LaunchRecord(v1: PersistedLaunchRecordV1): PersistedLaunchRecord {
+  return {
+    attemptId: v1.attemptId,
+    agentId: v1.agentId,
+    key: v1.key,
+    attemptKey: v1.priorSessionId === null ? null : { kind: "respawn", shortId: deriveShortIdFromSessionId(v1.priorSessionId), sessionId: null },
+    attemptedAt: v1.attemptedAt,
+    launchShortId: v1.launchShortId,
+    error: v1.error,
+  };
+}
+
+/**
  * Pure parse: text in, typed result out, never throws. Mirrors
  * claim-model.ts / session-slots.ts exactly in discipline — a malformed or
  * foreign-shaped store is reported as an error, never silently coerced to
  * empty (this file is in the identical unreconstructable-from-nothing
  * position both of those are in; see agent-store-io.ts for where that
- * decision is enforced).
+ * decision is enforced). Accepts BOTH `version: 2` (current) and
+ * `version: 1` (BAKR-16/BAKR-19-era, pre-BAKR-22) — a v1 store is migrated
+ * in place, in memory, via `migrateV1AgentRecord`/`migrateV1LaunchRecord`
+ * above, and the NEXT save writes it back out as v2 (agent-store-io.ts's
+ * `save` always serializes the current version). Any other version, or a
+ * store that fails validation even after recognizing its version, is
+ * malformed — never silently coerced.
  */
 export function parseAgentStoreState(source: string): ParseResult {
   let parsed: unknown;
@@ -692,12 +957,13 @@ export function parseAgentStoreState(source: string): ParseResult {
     return { ok: false, error: `agent store is not valid JSON: ${err instanceof Error ? err.message : String(err)}` };
   }
 
-  if (!isPlainObject(parsed) || parsed["version"] !== AGENT_STORE_VERSION || !isPlainObject(parsed["agents"]) || !Array.isArray(parsed["launches"])) {
+  if (!isPlainObject(parsed) || (parsed["version"] !== AGENT_STORE_VERSION && parsed["version"] !== 1) || !isPlainObject(parsed["agents"]) || !Array.isArray(parsed["launches"])) {
     return {
       ok: false,
-      error: "agent store does not have the expected { version: 1, agents: {...}, retiredIds: [...], launches: [...], restoreAttemptCounts: {...} } shape",
+      error: "agent store does not have the expected { version: 1 | 2, agents: {...}, retiredIds: [...], launches: [...], restoreAttemptCounts: {...} } shape",
     };
   }
+  const isV1 = parsed["version"] === 1;
 
   const retiredIdsField = parsed["retiredIds"];
   if (retiredIdsField !== undefined && !isValidRetiredIds(retiredIdsField)) {
@@ -715,34 +981,66 @@ export function parseAgentStoreState(source: string): ParseResult {
   }
 
   const agents: Record<string, AgentRecord> = {};
-  for (const [id, value] of Object.entries(parsed["agents"])) {
-    if (!isValidPersistedAgentRecord(value)) {
-      return { ok: false, error: `agent entry "${id}" does not have the expected AgentRecord shape: ${JSON.stringify(value)}` };
+  for (const [id, rawValue] of Object.entries(parsed["agents"])) {
+    if (isV1) {
+      if (!isValidPersistedAgentRecordV1(rawValue)) {
+        return { ok: false, error: `agent entry "${id}" does not have the expected v1 AgentRecord shape: ${JSON.stringify(rawValue)}` };
+      }
+      const value = migrateV1AgentRecord(rawValue);
+      agents[id] = {
+        id: value.id,
+        name: value.name ?? undefined,
+        directory: value.directory as ClaimKey,
+        state: value.state,
+        createdAt: value.createdAt,
+        birthSessionId: value.birthSessionId ?? undefined,
+        restoreTarget: value.restoreTarget ?? undefined,
+      };
+      continue;
+    }
+    if (!isValidPersistedAgentRecord(rawValue)) {
+      return { ok: false, error: `agent entry "${id}" does not have the expected AgentRecord shape: ${JSON.stringify(rawValue)}` };
     }
     agents[id] = {
-      id: value.id,
-      name: value.name ?? undefined,
-      directory: value.directory as ClaimKey,
-      state: value.state,
-      createdAt: value.createdAt,
-      durableSessionId: value.durableSessionId ?? undefined,
-      liveSessionId: value.liveSessionId ?? undefined,
+      id: rawValue.id,
+      name: rawValue.name ?? undefined,
+      directory: rawValue.directory as ClaimKey,
+      state: rawValue.state,
+      createdAt: rawValue.createdAt,
+      birthSessionId: rawValue.birthSessionId ?? undefined,
+      restoreTarget: rawValue.restoreTarget ?? undefined,
     };
   }
 
   const launches: LaunchRecord[] = [];
-  for (const value of parsed["launches"]) {
-    if (!isValidPersistedLaunchRecord(value)) {
-      return { ok: false, error: `a launch record in the agent store does not have the expected shape: ${JSON.stringify(value)}` };
+  for (const rawValue of parsed["launches"]) {
+    if (isV1) {
+      if (!isValidPersistedLaunchRecordV1(rawValue)) {
+        return { ok: false, error: `a launch record in the agent store does not have the expected v1 shape: ${JSON.stringify(rawValue)}` };
+      }
+      const value = migrateV1LaunchRecord(rawValue);
+      launches.push({
+        attemptId: value.attemptId,
+        agentId: value.agentId,
+        key: value.key as ClaimKey,
+        attemptKey: reviveAttemptKey(value.attemptKey),
+        attemptedAt: value.attemptedAt,
+        launchShortId: value.launchShortId ?? undefined,
+        error: value.error ?? undefined,
+      });
+      continue;
+    }
+    if (!isValidPersistedLaunchRecord(rawValue)) {
+      return { ok: false, error: `a launch record in the agent store does not have the expected shape: ${JSON.stringify(rawValue)}` };
     }
     launches.push({
-      attemptId: value.attemptId,
-      agentId: value.agentId,
-      key: value.key as ClaimKey,
-      priorSessionId: value.priorSessionId ?? undefined,
-      attemptedAt: value.attemptedAt,
-      launchShortId: value.launchShortId ?? undefined,
-      error: value.error ?? undefined,
+      attemptId: rawValue.attemptId,
+      agentId: rawValue.agentId,
+      key: rawValue.key as ClaimKey,
+      attemptKey: reviveAttemptKey(rawValue.attemptKey),
+      attemptedAt: rawValue.attemptedAt,
+      launchShortId: rawValue.launchShortId ?? undefined,
+      error: rawValue.error ?? undefined,
     });
   }
 

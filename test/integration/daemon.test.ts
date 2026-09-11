@@ -50,13 +50,22 @@ function baseDeps(dir: string, runCommand: DaemonDeps["runCommand"]): DaemonDeps
 }
 
 function makeAgent(overrides: Partial<AgentRecord> & { id: string; directory: ClaimKey }): AgentRecord {
-  return { name: undefined, state: "on", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined, ...overrides };
+  return { name: undefined, state: "on", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined, ...overrides };
 }
 
-/** A fake `runCommand` that understands the two invocation shapes this substrate makes, and simulates claude's session-id-rotates-on-resume behaviour. THROWS on any `claude stop` invocation — arming the AC3 falsifier ("fail loudly if the loop ever issues a stop") across every test that uses it. */
+/**
+ * A fake `runCommand` that understands the THREE invocation shapes this
+ * substrate makes — `systemd-run` (fresh launch / forkFrom, mints a NEW
+ * session every time), `claude respawn <shortId>` (BAKR-22: never mints a
+ * new session — same short id, same session, every time, exactly what was
+ * measured on the real binary) and `claude agents --json` (the listing).
+ * THROWS on any `claude stop` invocation — arming the AC3 falsifier ("fail
+ * loudly if the loop ever issues a stop") across every test that uses it.
+ */
 function makeFakeClaude() {
   const listing: Array<{ id: string; sessionId: string; cwd: string; startedAt: number; kind: string; pid?: number }> = [];
   let nextShortId = 0;
+  const respawnCalls: string[] = [];
 
   async function runCommand(argv: string[], opts: RunCommandOptions): Promise<CommandResult> {
     if (argv[0] === "claude" && argv[1] === "agents") {
@@ -64,6 +73,19 @@ function makeFakeClaude() {
     }
     if (argv[0] === "claude" && argv[1] === "stop") {
       throw new Error(`FALSIFIER TRIPPED: this loop must never issue a stop (B7) — got: ${JSON.stringify(argv)}`);
+    }
+    if (argv[0] === "claude" && argv[1] === "respawn") {
+      const shortId = argv[2] as string;
+      respawnCalls.push(shortId);
+      // BAKR-22 measurement: respawn never mints a new session — the SAME
+      // short id becomes (or stays) listed, verifiably alive, afterward.
+      const existing = listing.find((s) => s.id === shortId);
+      if (existing === undefined) {
+        listing.push({ id: shortId, sessionId: `respawned-session-${shortId}`, cwd: "", startedAt: 1, kind: "background", pid: process.pid });
+      } else {
+        existing.pid = process.pid; // this test process's own pid — genuinely verifiable alive via isPidAlive
+      }
+      return { exitCode: 0, stdout: `respawned ${shortId}\n`, stderr: "" };
     }
     if (argv[0] === "systemd-run") {
       const shortId = `short-${nextShortId++}`;
@@ -74,7 +96,7 @@ function makeFakeClaude() {
     throw new Error(`fake runCommand: unexpected argv ${JSON.stringify(argv)}`);
   }
 
-  return { runCommand, listing };
+  return { runCommand, listing, respawnCalls };
 }
 
 describe("Constraint 3: a malformed claim store degrades the daemon", () => {
@@ -171,11 +193,11 @@ describe("Constraint 1: a listing failure makes the whole cycle a no-op", () => 
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
     await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
-    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, durableSessionId: "session-on-record", liveSessionId: "session-on-record" })));
+    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, birthSessionId: "session-on-record", restoreTarget: { sessionId: "session-on-record", shortId: "session-" } })));
 
     let launchCalls = 0;
     const deps = baseDeps(dir, async (argv) => {
-      if (argv[0] === "systemd-run") launchCalls += 1;
+      if (argv[0] === "systemd-run" || (argv[0] === "claude" && argv[1] === "respawn")) launchCalls += 1;
       return { exitCode: 1, stdout: "", stderr: "not logged in" };
     });
 
@@ -186,11 +208,11 @@ describe("Constraint 1: a listing failure makes the whole cycle a no-op", () => 
 
     const reloaded = await loadAgents(join(dir, "agents.json"));
     expect(reloaded.status).toBe("loaded");
-    if (reloaded.status === "loaded") expect(reloaded.state.agents["@a1"]?.durableSessionId).toBe("session-on-record");
+    if (reloaded.status === "loaded") expect(reloaded.state.agents["@a1"]?.birthSessionId).toBe("session-on-record");
   });
 });
 
-describe("AC2: restore is silent and exact — the recorded launch argv carries EXACTLY --resume <durableSessionId>", () => {
+describe("AC2 (BAKR-22 REWRITE): restore is silent and exact — the recorded restore argv carries EXACTLY `claude respawn <shortId>`, never a permissions or model flag", () => {
   test("through the real reconcile cycle against a migrated store (stubbed claude — proves what bakr constructs and passes, nothing about the real binary)", async () => {
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
@@ -201,25 +223,24 @@ describe("AC2: restore is silent and exact — the recorded launch argv carries 
     slots = resolveLaunch(slots, "seed-short", "old-session-id");
     await writeFile(join(dir, "session-slots.json"), serializeSessionSlotsState(slots), "utf8");
 
-    const launchArgvs: string[][] = [];
-    const deps = baseDeps(dir, async (argv, opts) => {
+    const respawnArgvs: string[][] = [];
+    const deps = baseDeps(dir, async (argv) => {
       if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
-      if (argv[0] === "systemd-run") {
-        launchArgvs.push(argv);
-        const bgIndex = argv.indexOf("--");
-        void opts;
-        return { exitCode: 0, stdout: "backgrounded · short-1 (idle — send a prompt to start)\n", stderr: "" };
+      if (argv[0] === "claude" && argv[1] === "respawn") {
+        respawnArgvs.push(argv);
+        return { exitCode: 0, stdout: `respawned ${argv[2]}\n`, stderr: "" };
       }
       throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
     });
 
     const result = await runReconcileCycle(initialDaemonState(), deps);
     expect(result.restored).toHaveLength(1);
-    expect(launchArgvs).toHaveLength(1);
-    const argv = launchArgvs[0] as string[];
-    const bgIndex = argv.indexOf("--");
-    const claudeArgs = argv.slice(bgIndex + 1);
-    expect(claudeArgs).toEqual(["claude", "--bg", "--resume", "old-session-id"]); // EXACTLY this and nothing else
+    expect(respawnArgvs).toHaveLength(1);
+    // FALSIFIER: this is the regression test pinning the actual cause BAKR-22
+    // isolated — bakr's restore argv must NEVER carry a permissions or model
+    // flag (that is what was shown to cause `--bg --resume` to fork even on
+    // builds where an unflagged restore correctly reattaches).
+    expect(respawnArgvs[0]).toEqual(["claude", "respawn", "old-sess"]); // EXACTLY this and nothing else — the short id migration derives from the durable session id (see agent-model.ts's migration doc)
   });
 });
 
@@ -246,10 +267,10 @@ describe("AC3: only 'on' is restored — off and archived are NEVER launched, wi
     const final = await loadAgents(join(dir, "agents.json"));
     expect(final.status).toBe("loaded");
     if (final.status === "loaded") {
-      expect(final.state.agents["@off-agent"]?.durableSessionId).toBeUndefined();
-      expect(final.state.agents["@archived-agent"]?.durableSessionId).toBeUndefined();
+      expect(final.state.agents["@off-agent"]?.birthSessionId).toBeUndefined();
+      expect(final.state.agents["@archived-agent"]?.birthSessionId).toBeUndefined();
       // NEGATIVE CONTROL: the on-agent DID get launched — proves the run can observe a launch at all.
-      expect(final.state.agents["@on-agent"]?.durableSessionId).toBeDefined();
+      expect(final.state.agents["@on-agent"]?.birthSessionId).toBeDefined();
     }
   });
 });
@@ -260,8 +281,8 @@ describe("AC4 (HEADLINE): fresh-launch resolution by agent, not directory", () =
     const key = "/claimed/dir" as ClaimKey;
     await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
     let store = emptyAgentStore();
-    store = putAgent(store, makeAgent({ id: "@agent-1", directory: key, state: "on", durableSessionId: undefined }));
-    store = putAgent(store, makeAgent({ id: "@agent-2", directory: key, state: "on", durableSessionId: undefined }));
+    store = putAgent(store, makeAgent({ id: "@agent-1", directory: key, state: "on", restoreTarget: undefined }));
+    store = putAgent(store, makeAgent({ id: "@agent-2", directory: key, state: "on", restoreTarget: undefined }));
     await saveAgents(join(dir, "agents.json"), store);
 
     const fake = makeFakeClaude();
@@ -281,90 +302,81 @@ describe("AC4 (HEADLINE): fresh-launch resolution by agent, not directory", () =
     if (final.status === "loaded") {
       const a1 = final.state.agents["@agent-1"];
       const a2 = final.state.agents["@agent-2"];
-      expect(a1?.durableSessionId).toBeDefined();
-      expect(a2?.durableSessionId).toBeDefined();
-      expect(a1?.durableSessionId).not.toBe(a2?.durableSessionId); // distinct sessions, correctly attributed
+      expect(a1?.birthSessionId).toBeDefined();
+      expect(a2?.birthSessionId).toBeDefined();
+      expect(a1?.birthSessionId).not.toBe(a2?.birthSessionId); // distinct sessions, correctly attributed
     }
   });
 });
 
-describe("the full silent-restore lifecycle (durable id never overwritten)", () => {
-  test("an on-record session absent from a successful listing is restored via --resume of its DURABLE id; only the live id updates once a listing reveals it", async () => {
+describe("BAKR-22 REWRITE: the full silent-respawn lifecycle (birth id AND restoreTarget never rotate on an ordinary respawn)", () => {
+  test("an on-record session absent from a successful listing is restored via `claude respawn <shortId>`; restoreTarget does NOT change (respawn never mints a new id — the ticket's own measurement)", async () => {
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
     await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
-    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, durableSessionId: "old-session-id", liveSessionId: "old-session-id" })));
+    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, birthSessionId: "old-session-id", restoreTarget: { sessionId: "old-session-id", shortId: "old-sessi" } })));
 
     const fake = makeFakeClaude();
     const deps = baseDeps(dir, fake.runCommand);
 
     const result1 = await runReconcileCycle(initialDaemonState(), deps);
     expect(result1.restored).toEqual([{ agentId: "@a1", key, sessionId: "old-session-id" }]);
+    expect(fake.respawnCalls).toEqual(["old-sessi"]);
 
     const afterCycle1 = await loadAgents(join(dir, "agents.json"));
-    if (afterCycle1.status === "loaded") expect(afterCycle1.state.agents["@a1"]?.durableSessionId).toBe("old-session-id");
+    if (afterCycle1.status === "loaded") expect(afterCycle1.state.agents["@a1"]?.birthSessionId).toBe("old-session-id");
 
     const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, agentsDegraded: result1.agentsDegraded, orphanReportSignatures: result1.orphanReportSignatures }, deps);
-    expect(result2.restored).toEqual([]); // resolved, not restored again
+    expect(result2.restored).toEqual([]); // now verifiably alive (the fake's respawn handler listed it with this process's own pid) — not restored again
 
     const afterCycle2 = await loadAgents(join(dir, "agents.json"));
     expect(afterCycle2.status).toBe("loaded");
     if (afterCycle2.status === "loaded") {
       const agent = afterCycle2.state.agents["@a1"];
-      expect(agent?.durableSessionId).toBe("old-session-id"); // UNCHANGED
-      expect(agent?.liveSessionId).toBe(fake.listing[0]?.sessionId); // updated to the rotated id
+      expect(agent?.birthSessionId).toBe("old-session-id"); // UNCHANGED
+      expect(agent?.restoreTarget).toEqual({ sessionId: "old-session-id", shortId: "old-sessi" }); // UNCHANGED — no rotation at all under respawn
     }
   });
 
-  test("a session already alive (listed with a verifiably-alive pid) is never restored", async () => {
+  test("a session already alive (listed with a verifiably-alive pid) is never respawned", async () => {
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
     await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
-    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, durableSessionId: "live-session-id", liveSessionId: "live-session-id" })));
+    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, birthSessionId: "live-session-id", restoreTarget: { sessionId: "live-session-id", shortId: "short-live" } })));
 
-    let launchCalls = 0;
+    let respawnCalls = 0;
     const deps = baseDeps(dir, async (argv) => {
-      if (argv[0] === "systemd-run") {
-        launchCalls += 1;
-        return { exitCode: 0, stdout: "backgrounded · short-x (idle)\n", stderr: "" };
+      if (argv[0] === "claude" && argv[1] === "respawn") {
+        respawnCalls += 1;
+        return { exitCode: 0, stdout: `respawned ${argv[2]}\n`, stderr: "" };
       }
       return { exitCode: 0, stdout: JSON.stringify([{ id: "short-live", sessionId: "live-session-id", cwd: key, startedAt: 1, kind: "background", pid: process.pid }]), stderr: "" };
     });
 
     const result = await runReconcileCycle(initialDaemonState(), deps);
     expect(result.restored).toEqual([]);
-    expect(launchCalls).toBe(0);
+    expect(respawnCalls).toBe(0);
   });
 });
 
-describe("regression: the daemon must always resume the DURABLE id, never a rotated live id that may itself be unresumable", () => {
-  test("resuming the ROTATED id fails, resuming the ORIGINAL durable id keeps succeeding — every restore attempt across many cycles uses the durable id", async () => {
+describe("BAKR-22 REWRITE: the daemon always respawns the SAME short id — there is no rotation left to guard against, but a give-up must still stay keyed on that one stable id", () => {
+  test("every restore attempt across many cycles respawns the identical short id, never drifting, and gives up after MAX_CONSECUTIVE_UNVERIFIED_RESTORES if it never becomes verifiably alive", async () => {
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
     await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
-    const DURABLE_ID = "03df9926-durable-conversation";
-    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, durableSessionId: DURABLE_ID, liveSessionId: DURABLE_ID })));
+    const SHORT_ID = "durabl-1";
+    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, birthSessionId: "03df9926-durable-conversation", restoreTarget: { sessionId: "03df9926-durable-conversation", shortId: SHORT_ID } })));
 
-    const launchArgvs: string[][] = [];
-    let rotationCounter = 0;
-    let pendingEntry: { id: string; sessionId: string } | undefined;
+    const respawnArgvs: string[][] = [];
+    // This session NEVER becomes visible in a listing (unknown/not-alive
+    // forever) — the daemon must still respawn only ever this one short id,
+    // never invent or drift to another, and must eventually give up rather
+    // than retry unboundedly.
     const runCommand = async (argv: string[]) => {
-      if (argv[0] === "claude" && argv[1] === "agents") {
-        const listing = pendingEntry ? [{ id: pendingEntry.id, sessionId: pendingEntry.sessionId, cwd: key, startedAt: 1, kind: "background" }] : [];
-        pendingEntry = undefined;
-        return { exitCode: 0, stdout: JSON.stringify(listing), stderr: "" };
-      }
-      if (argv[0] === "systemd-run") {
-        launchArgvs.push(argv);
-        const resumeIdx = argv.indexOf("--resume");
-        const resumedId = resumeIdx === -1 ? undefined : argv[resumeIdx + 1];
-        if (resumedId !== DURABLE_ID) {
-          return { exitCode: 1, stdout: "", stderr: `exit 1 before init — No conversation found with session ID: ${resumedId}` };
-        }
-        rotationCounter += 1;
-        const shortId = `short-${rotationCounter}`;
-        pendingEntry = { id: shortId, sessionId: `rotated-${rotationCounter}` };
-        return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
+      if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
+      if (argv[0] === "claude" && argv[1] === "respawn") {
+        respawnArgvs.push(argv);
+        return { exitCode: 0, stdout: `respawned ${argv[2]}\n`, stderr: "" };
       }
       throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
     };
@@ -376,38 +388,32 @@ describe("regression: the daemon must always resume the DURABLE id, never a rota
       state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
     }
 
-    expect(launchArgvs.length).toBeGreaterThan(0);
-    for (const argv of launchArgvs) {
-      const resumeIdx = argv.indexOf("--resume");
-      expect(argv[resumeIdx + 1]).toBe(DURABLE_ID);
+    expect(respawnArgvs.length).toBeGreaterThan(0);
+    for (const argv of respawnArgvs) {
+      expect(argv).toEqual(["claude", "respawn", SHORT_ID]); // never drifts to any other id
     }
+    // Converges: MAX_CONSECUTIVE_UNVERIFIED_RESTORES bounds the attempts, then the give-up record blocks further ones.
+    expect(respawnArgvs.length).toBeLessThanOrEqual(3);
 
     const finalState = await loadAgents(join(dir, "agents.json"));
     expect(finalState.status).toBe("loaded");
-    if (finalState.status === "loaded") expect(finalState.state.agents["@a1"]?.durableSessionId).toBe(DURABLE_ID);
+    if (finalState.status === "loaded") expect(finalState.state.agents["@a1"]?.birthSessionId).toBe("03df9926-durable-conversation");
   });
 });
 
-describe("regression: a resume that 'succeeds' but is actually a silent empty session must not loop forever (convergence)", () => {
-  test("every resume exits 0 but is a phantom session with no pid that vanishes by the next listing — the daemon must converge", async () => {
+describe("regression: a respawn that 'succeeds' but never becomes independently verifiable must not loop forever (convergence)", () => {
+  test("every respawn exits 0 but the shortId never shows a verifiable pid in the next listing — the daemon must converge", async () => {
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
     await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
-    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, durableSessionId: "seed-session-id", liveSessionId: "seed-session-id" })));
+    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, birthSessionId: "seed-session-id", restoreTarget: { sessionId: "seed-session-id", shortId: "seed-sess" } })));
 
-    let launchCalls = 0;
-    let pendingEntry: { id: string; sessionId: string } | undefined;
+    let respawnCalls = 0;
     const runCommand = async (argv: string[]) => {
-      if (argv[0] === "claude" && argv[1] === "agents") {
-        const listing = pendingEntry ? [{ id: pendingEntry.id, sessionId: pendingEntry.sessionId, cwd: key, startedAt: 1, kind: "background" }] : [];
-        pendingEntry = undefined;
-        return { exitCode: 0, stdout: JSON.stringify(listing), stderr: "" };
-      }
-      if (argv[0] === "systemd-run") {
-        launchCalls += 1;
-        const shortId = `short-${launchCalls}`;
-        pendingEntry = { id: shortId, sessionId: `phantom-session-${shortId}` };
-        return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
+      if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" }; // never lists it — always "unknown", never "alive"
+      if (argv[0] === "claude" && argv[1] === "respawn") {
+        respawnCalls += 1;
+        return { exitCode: 0, stdout: `respawned ${argv[2]}\n`, stderr: "" };
       }
       throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
     };
@@ -419,19 +425,19 @@ describe("regression: a resume that 'succeeds' but is actually a silent empty se
       state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
     }
 
-    expect(launchCalls).toBeLessThanOrEqual(3);
-    expect(launchCalls).toBeGreaterThan(0);
+    expect(respawnCalls).toBeLessThanOrEqual(3);
+    expect(respawnCalls).toBeGreaterThan(0);
 
     const finalState = await loadAgents(join(dir, "agents.json"));
     expect(finalState.status).toBe("loaded");
     if (finalState.status === "loaded") expect(unresolvedLaunches(finalState.state).length).toBeGreaterThan(0);
 
-    const launchCallsAtConvergence = launchCalls;
+    const respawnCallsAtConvergence = respawnCalls;
     for (let i = 0; i < 5; i++) {
       const result = await runReconcileCycle(state, deps);
       state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
     }
-    expect(launchCalls).toBe(launchCallsAtConvergence);
+    expect(respawnCalls).toBe(respawnCallsAtConvergence); // still converged — no further attempts once given up
   });
 });
 
@@ -440,8 +446,8 @@ describe("regression (PR #7 review, ported): a crash mid-launch must not silentl
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
     await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
-    let store = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, durableSessionId: "stale-prior-session", liveSessionId: "stale-prior-session" }));
-    store = { ...store, launches: [{ attemptId: "wedged-attempt", agentId: "@a1", key, priorSessionId: "stale-prior-session", attemptedAt: 1000, launchShortId: undefined, error: undefined }] };
+    let store = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, birthSessionId: "stale-prior-session", restoreTarget: { sessionId: "stale-prior-session", shortId: "stale-pri" } }));
+    store = { ...store, launches: [{ attemptId: "wedged-attempt", agentId: "@a1", key, attemptKey: { kind: "respawn", shortId: "stale-pri" }, attemptedAt: 1000, launchShortId: undefined, error: undefined }] };
     await saveAgents(join(dir, "agents.json"), store);
 
     let launchCalls = 0;
@@ -468,13 +474,13 @@ describe("Constraint 2: a failed launch is recorded, never retried automatically
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
     await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
-    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, durableSessionId: "old-session-id", liveSessionId: "old-session-id" })));
+    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: key, birthSessionId: "old-session-id", restoreTarget: { sessionId: "old-session-id", shortId: "old-sessi" } })));
 
     let launchCalls = 0;
     const deps = baseDeps(dir, async (argv) => {
-      if (argv[0] === "systemd-run") {
+      if (argv[0] === "claude" && argv[1] === "respawn") {
         launchCalls += 1;
-        return { exitCode: 1, stdout: "", stderr: "systemd-run: permission denied" };
+        return { exitCode: 1, stdout: "", stderr: "No job matching 'old-sessi'" };
       }
       return { exitCode: 0, stdout: "[]", stderr: "" };
     });
@@ -523,8 +529,8 @@ describe("AC14: a given-up (errored) v1 launch record must keep blocking its mig
     expect(finalState.status).toBe("loaded");
     if (finalState.status !== "loaded") return;
 
-    const healthyAgent = Object.values(finalState.state.agents).find((a) => a.durableSessionId === "healthy-durable-id");
-    const givenUpAgent = Object.values(finalState.state.agents).find((a) => a.durableSessionId === "given-up-durable-id");
+    const healthyAgent = Object.values(finalState.state.agents).find((a) => a.birthSessionId === "healthy-durable-id");
+    const givenUpAgent = Object.values(finalState.state.agents).find((a) => a.birthSessionId === "given-up-durable-id");
     expect(healthyAgent).toBeDefined();
     expect(givenUpAgent).toBeDefined();
 
@@ -624,9 +630,9 @@ describe("BAKR-24 Q4: report, don't launch — an orphaned claim's on-agents are
 
     await saveClaims(join(storeDir, "claims.json"), claim(emptyStore(), goneDir, 1).state);
 
-    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@stale-agent", directory: goneDir, durableSessionId: "durable-x", liveSessionId: "durable-x" }));
+    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@stale-agent", directory: goneDir, birthSessionId: "durable-x", restoreTarget: { sessionId: "durable-x", shortId: "durable-x" } }));
     // Simulate a PRE-EXISTING failed launch record from before this daemon version shipped — exactly what a daemon upgrade finds already sitting in the store for an agent that was orphaned under the OLD code.
-    agentState = { ...agentState, launches: [{ attemptId: "pre-existing-attempt", agentId: "@stale-agent", key: goneDir, priorSessionId: "durable-x", attemptedAt: 1, launchShortId: undefined, error: "gave up after 3 consecutive restore attempts — left by a pre-Q4 daemon" }] };
+    agentState = { ...agentState, launches: [{ attemptId: "pre-existing-attempt", agentId: "@stale-agent", key: goneDir, attemptKey: { kind: "respawn", shortId: "durable-x" }, attemptedAt: 1, launchShortId: undefined, error: "gave up after 3 consecutive restore attempts — left by a pre-Q4 daemon" }] };
     await saveAgents(join(storeDir, "agents.json"), agentState);
 
     const deps: DaemonDeps = { ...baseDeps(storeDir, async () => ({ exitCode: 0, stdout: "[]", stderr: "" })), probeDeps: realOrphanProbeDeps };
@@ -657,8 +663,8 @@ describe("BAKR-24 Q4: report, don't launch — an orphaned claim's on-agents are
     cleanupDirs.push(presentDir);
     const storeDir2 = await makeTempDir();
     await saveClaims(join(storeDir2, "claims.json"), claim(emptyStore(), presentDir as ClaimKey, 1).state);
-    let agentState2 = putAgent(emptyAgentStore(), makeAgent({ id: "@healthy-agent", directory: presentDir as ClaimKey, durableSessionId: "durable-y", liveSessionId: "durable-y" }));
-    agentState2 = { ...agentState2, launches: [{ attemptId: "pre-existing-attempt-2", agentId: "@healthy-agent", key: presentDir as ClaimKey, priorSessionId: "durable-y", attemptedAt: 1, launchShortId: undefined, error: "gave up after 3 consecutive restore attempts — unrelated to any directory move" }] };
+    let agentState2 = putAgent(emptyAgentStore(), makeAgent({ id: "@healthy-agent", directory: presentDir as ClaimKey, birthSessionId: "durable-y", restoreTarget: { sessionId: "durable-y", shortId: "durable-y" } }));
+    agentState2 = { ...agentState2, launches: [{ attemptId: "pre-existing-attempt-2", agentId: "@healthy-agent", key: presentDir as ClaimKey, attemptKey: { kind: "respawn", shortId: "durable-y" }, attemptedAt: 1, launchShortId: undefined, error: "gave up after 3 consecutive restore attempts — unrelated to any directory move" }] };
     await saveAgents(join(storeDir2, "agents.json"), agentState2);
     const deps2: DaemonDeps = { ...baseDeps(storeDir2, async () => ({ exitCode: 0, stdout: "[]", stderr: "" })), probeDeps: realOrphanProbeDeps };
     const capturedLines2: string[] = [];

@@ -55,7 +55,7 @@ async function main(): Promise<void> {
     const current = loaded.status === "loaded" ? loaded.state : emptyAgentStore();
     await sleep(15); // deliberately widen the unprotected load-to-save window
     const id = mintUniqueAgentId(current, randomBytes);
-    const next = putAgent(current, { id, name: undefined, directory: PROBE_DIR, state: "off", createdAt: Date.now(), durableSessionId: undefined, liveSessionId: undefined });
+    const next = putAgent(current, { id, name: undefined, directory: PROBE_DIR, state: "off", createdAt: Date.now(), birthSessionId: undefined, restoreTarget: undefined });
     await save(store, next);
     if (lingerMs > 0) await sleep(lingerMs);
     process.exit(0);
@@ -65,7 +65,7 @@ async function main(): Promise<void> {
   const r = await lockFn(store, (current) => {
     const id = mintUniqueAgentId(current, randomBytes);
     return {
-      state: putAgent(current, { id, name: undefined, directory: PROBE_DIR, state: "off", createdAt: Date.now(), durableSessionId: undefined, liveSessionId: undefined }),
+      state: putAgent(current, { id, name: undefined, directory: PROBE_DIR, state: "off", createdAt: Date.now(), birthSessionId: undefined, restoreTarget: undefined }),
       result: id,
     };
   });

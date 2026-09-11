@@ -29,8 +29,8 @@ function makeAgent(overrides: Partial<AgentRecord> & { id: string }): AgentRecor
     directory: DIR_A,
     state: "on",
     createdAt: 1000,
-    durableSessionId: undefined,
-    liveSessionId: undefined,
+    birthSessionId: undefined,
+    restoreTarget: undefined,
     ...overrides,
   };
 }
@@ -104,34 +104,34 @@ describe("decideOn", () => {
   });
 
   test("already on: wasOff is false, agent unchanged (the launch-record wedge check is agent-actions.ts's job, not this pure function's)", () => {
-    const state = storeWith(makeAgent({ id: "@a1", state: "on", durableSessionId: "sess-1" }));
+    const state = storeWith(makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "sess-1", shortId: "sess-1s" } }));
     const decision = decideOn(state, DIR_A, "@a1");
     expect(decision.ok).toBe(true);
     if (decision.ok) {
       expect(decision.wasOff).toBe(false);
       expect(decision.agent.state).toBe("on");
-      expect(decision.priorSessionId).toBe("sess-1"); // still computed — agent-actions.ts's `on` needs it for the wedge check even when not transitioning
+      expect(decision.plan).toEqual({ kind: "respawn", shortId: "sess-1s" }); // still computed — agent-actions.ts's `on` needs it for the wedge check even when not transitioning
     }
   });
 
-  test("CONTROL: off -> on with a durable session resumes that session id", () => {
-    const state = storeWith(makeAgent({ id: "@a1", state: "off", durableSessionId: "sess-1" }));
+  test("CONTROL: off -> on with a restoreTarget respawns that short id", () => {
+    const state = storeWith(makeAgent({ id: "@a1", state: "off", restoreTarget: { sessionId: "sess-1", shortId: "sess-1s" } }));
     const decision = decideOn(state, DIR_A, "@a1");
     expect(decision.ok).toBe(true);
     if (decision.ok) {
       expect(decision.wasOff).toBe(true);
       expect(decision.agent.state).toBe("on");
-      expect(decision.priorSessionId).toBe("sess-1");
+      expect(decision.plan).toEqual({ kind: "respawn", shortId: "sess-1s" });
     }
   });
 
-  test("off -> on with NO durable session yet is a fresh launch (priorSessionId undefined)", () => {
-    const state = storeWith(makeAgent({ id: "@a1", state: "off", durableSessionId: undefined }));
+  test("off -> on with NO restoreTarget yet is a fresh launch (plan.kind === 'fresh')", () => {
+    const state = storeWith(makeAgent({ id: "@a1", state: "off", restoreTarget: undefined }));
     const decision = decideOn(state, DIR_A, "@a1");
     expect(decision.ok).toBe(true);
     if (decision.ok) {
       expect(decision.wasOff).toBe(true);
-      expect(decision.priorSessionId).toBeUndefined();
+      expect(decision.plan).toEqual({ kind: "fresh" });
     }
   });
 });
@@ -154,23 +154,23 @@ describe("decideOff", () => {
   });
 
   test("CONTROL: on -> off captures the live session id to stop", () => {
-    const state = storeWith(makeAgent({ id: "@a1", state: "on", liveSessionId: "live-1" }));
+    const state = storeWith(makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-1", shortId: "live-1s" } }));
     const decision = decideOff(state, DIR_A, "@a1");
     expect(decision.ok).toBe(true);
     if (decision.ok && decision.kind === "turn-off") {
       expect(decision.agent.state).toBe("off");
-      expect(decision.liveSessionId).toBe("live-1");
+      expect(decision.restoreSessionId).toBe("live-1");
     } else {
       throw new Error("expected turn-off");
     }
   });
 
-  test("on -> off with no live session yet reports liveSessionId undefined (nothing to stop)", () => {
-    const state = storeWith(makeAgent({ id: "@a1", state: "on", liveSessionId: undefined }));
+  test("on -> off with no live session yet reports restoreSessionId undefined (nothing to stop)", () => {
+    const state = storeWith(makeAgent({ id: "@a1", state: "on", restoreTarget: undefined }));
     const decision = decideOff(state, DIR_A, "@a1");
     expect(decision.ok).toBe(true);
     if (decision.ok && decision.kind === "turn-off") {
-      expect(decision.liveSessionId).toBeUndefined();
+      expect(decision.restoreSessionId).toBeUndefined();
     } else {
       throw new Error("expected turn-off");
     }
@@ -191,13 +191,13 @@ describe("decideArchive", () => {
   });
 
   test("CONTROL: on -> archived, keeping the name, capturing the session to stop", () => {
-    const state = storeWith(makeAgent({ id: "@a1", state: "on", name: "keepme", liveSessionId: "live-1" }));
+    const state = storeWith(makeAgent({ id: "@a1", state: "on", name: "keepme", restoreTarget: { sessionId: "live-1", shortId: "live-1s" } }));
     const decision = decideArchive(state, DIR_A, "@a1");
     expect(decision.ok).toBe(true);
     if (decision.ok && decision.kind === "archive") {
       expect(decision.agent.state).toBe("archived");
       expect(decision.agent.name).toBe("keepme");
-      expect(decision.liveSessionId).toBe("live-1");
+      expect(decision.restoreSessionId).toBe("live-1");
     } else {
       throw new Error("expected archive");
     }
@@ -353,17 +353,17 @@ describe("decideDelete", () => {
   });
 
   test("CONTROL: permitted for on/off/archived alike, carrying the live session id to stop", () => {
-    for (const [lifecycleState, liveSessionId] of [
+    for (const [lifecycleState, restoreSessionId] of [
       ["on", "live-1"],
       ["off", undefined],
       ["archived", undefined],
     ] as const) {
-      const state = storeWith(makeAgent({ id: "@a1", state: lifecycleState, liveSessionId }));
+      const state = storeWith(makeAgent({ id: "@a1", state: lifecycleState, restoreTarget: restoreSessionId === undefined ? undefined : { sessionId: restoreSessionId, shortId: "live-1s" } }));
       const decision = decideDelete(state, DIR_A, "@a1");
       expect(decision.ok).toBe(true);
       if (decision.ok) {
         expect(decision.agent.id).toBe("@a1");
-        expect(decision.liveSessionId).toBe(liveSessionId);
+        expect(decision.restoreSessionId).toBe(restoreSessionId);
       }
     }
   });
@@ -390,19 +390,19 @@ describe("decideAttachTarget", () => {
   });
 
   test("refused: on, but not yet live (launch hasn't resolved a session)", () => {
-    const state = storeWith(makeAgent({ id: "@a1", state: "on", durableSessionId: undefined, liveSessionId: undefined }));
+    const state = storeWith(makeAgent({ id: "@a1", state: "on", birthSessionId: undefined, restoreTarget: undefined }));
     const decision = decideAttachTarget(state, DIR_A, "@a1");
     expect(decision.ok).toBe(false);
     if (!decision.ok && "reason" in decision) expect(decision.reason).toBe("not-yet-live");
   });
 
   test("CONTROL: on and live returns the session identity a caller needs, touching nothing else", () => {
-    const state = storeWith(makeAgent({ id: "@a1", state: "on", durableSessionId: "durable-1", liveSessionId: "live-1" }));
+    const state = storeWith(makeAgent({ id: "@a1", state: "on", birthSessionId: "durable-1", restoreTarget: { sessionId: "live-1", shortId: "live-1s" } }));
     const decision = decideAttachTarget(state, DIR_A, "@a1");
     expect(decision.ok).toBe(true);
     if (decision.ok) {
-      expect(decision.liveSessionId).toBe("live-1");
-      expect(decision.durableSessionId).toBe("durable-1");
+      expect(decision.restoreSessionId).toBe("live-1");
+      expect(decision.birthSessionId).toBe("durable-1");
     }
   });
 });

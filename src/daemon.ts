@@ -28,12 +28,14 @@ import { loadOrMigrateAgentStore } from "./agent-store-migrate";
 import { load as loadAgents, withAgentStoreLock } from "./agent-store-io";
 import {
   type AgentStoreState,
+  type AttemptKey,
   emptyAgentStore,
   agentsInDirectory,
   beginLaunch,
   markLaunchStarted,
   markLaunchFailed,
   resolveLaunch,
+  resolveRespawnAttempt,
   resolvePendingCreation,
   mintUniqueAgentId,
   pendingLaunches,
@@ -43,9 +45,11 @@ import {
   restoreAttemptCount,
   recordRestoreAttempt,
   resetRestoreAttempts,
-  sessionToResume,
+  planRestore,
 } from "./agent-model";
-import { listBackgroundSessions, decideLiveness, isPidAlive, launch, detectStaleRegisteredCwdRefusal, type RunCommand, type BackgroundSessionInfo } from "./spawn";
+import { listBackgroundSessions, decideLiveness, checkLiveness, isPidAlive, launch, respawnSession, isRecognizedStaleCwdRefusal, detectStaleRegisteredCwdRefusal, type RunCommand, type BackgroundSessionInfo } from "./spawn";
+import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
+import { realTranscriptProbeDeps } from "./paths";
 import type { ClaimKey } from "./claim-key-resolve";
 import { classifyDirectory, type OrphanVerdict } from "./orphan-model";
 import { probeDirectory, type OrphanProbeDeps } from "./orphan-probe";
@@ -64,6 +68,8 @@ export interface DaemonDeps {
   readonly randomBytes: (byteLength: number) => Uint8Array;
   /** BAKR-24 Q1/Q4: real `stat`, injected for the same reason every other filesystem seam in this tree is — unit-testable with fakes. See orphan-probe.ts / paths.ts's `realOrphanProbeDeps`. */
   readonly probeDeps: OrphanProbeDeps;
+  /** BAKR-22: read-only access to Claude Code's own `~/.claude/projects/` tree, for the never-spoken-to-then-moved check. Optional — defaults to the real filesystem (`realTranscriptProbeDeps`, paths.ts). */
+  readonly transcriptProbeDeps?: TranscriptProbeDeps;
   readonly acquireTimeoutMs?: number;
 }
 
@@ -203,13 +209,20 @@ async function resolvePendingLaunches(deps: DaemonDeps, sessions: readonly Backg
     deps.agentsPath,
     (current) => {
       let next = current;
-      const resolvedInfo: { attemptId: string; agentId: string; key: ClaimKey; launchShortId: string; sessionId: string; priorSessionId: string | undefined }[] = [];
+      const resolvedInfo: { attemptId: string; agentId: string; key: ClaimKey; launchShortId: string; sessionId: string; attemptKey: AttemptKey | undefined }[] = [];
       for (const pending of pendingLaunches(next)) {
         if (pending.launchShortId === undefined) continue;
+        // `respawn` attempts resolve synchronously (see `dispatchRespawn`'s
+        // daemon-side counterpart below) and never leave a PENDING record
+        // waiting for a listing — only `fresh` and `forkFrom` do, since
+        // both go through `launch()`, which only ever returns a short id
+        // immediately. A `respawn`-kind attemptKey should never reach here;
+        // skip it defensively rather than mis-resolving it.
+        if (pending.attemptKey?.kind === "respawn") continue;
         const found = sessions.find((s) => s.id === pending.launchShortId);
         if (found === undefined) continue;
         next = resolveLaunch(next, pending.launchShortId, found.sessionId);
-        resolvedInfo.push({ attemptId: pending.attemptId, agentId: pending.agentId, key: pending.key, launchShortId: pending.launchShortId, sessionId: found.sessionId, priorSessionId: pending.priorSessionId });
+        resolvedInfo.push({ attemptId: pending.attemptId, agentId: pending.agentId, key: pending.key, launchShortId: pending.launchShortId, sessionId: found.sessionId, attemptKey: pending.attemptKey });
       }
 
       const createdInfo: { attemptId: string; key: ClaimKey; launchShortId: string; sessionId: string; agentId: string }[] = [];
@@ -232,7 +245,7 @@ async function resolvePendingLaunches(deps: DaemonDeps, sessions: readonly Backg
   for (const info of result.result.resolvedInfo) {
     log(
       "info",
-      `resolved launch attempt ${info.attemptId} for agent ${info.agentId} in "${info.key}": short id ${info.launchShortId} -> live session ${info.sessionId}${info.priorSessionId !== undefined ? ` (durable id ${info.priorSessionId} unchanged)` : " (new agent session)"}`
+      `resolved launch attempt ${info.attemptId} for agent ${info.agentId} in "${info.key}": short id ${info.launchShortId} -> session ${info.sessionId}${info.attemptKey?.kind === "forkFrom" ? ` (forkFrom escape from stale-cwd session ${info.attemptKey.sessionId} — restoreTarget advances to this new session; birthSessionId untouched)` : " (fresh launch — birthSessionId/restoreTarget both set for the first time)"}`
     );
   }
   for (const info of result.result.createdInfo) {
@@ -249,9 +262,9 @@ export type AgentDecision =
   | { readonly kind: "reset" }
   | { readonly kind: "alive" }
   | { readonly kind: "not-verifiable"; readonly reason: string }
-  | { readonly kind: "give-up"; readonly attemptsSoFar: number; readonly sessionId: string }
+  | { readonly kind: "give-up"; readonly attemptsSoFar: number; readonly shortId: string }
   | { readonly kind: "begin-fresh-launch"; readonly attemptId: string }
-  | { readonly kind: "begin-restore-launch"; readonly attemptId: string; readonly sessionId: string };
+  | { readonly kind: "begin-respawn"; readonly attemptId: string; readonly shortId: string; readonly restoreSessionId: string };
 
 /**
  * ONE agent's reconcile decision AND its write, made inside a SINGLE lock
@@ -276,8 +289,8 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
         return { state: current, result: { kind: "skip" } };
       }
 
-      const resumeSessionId = sessionToResume(agent);
-      if (resumeSessionId === undefined) {
+      const plan = planRestore(agent);
+      if (plan.kind === "fresh") {
         if (hasLaunchRecordFor(current, agentId, undefined)) {
           return { state: current, result: { kind: "skip" } };
         }
@@ -286,14 +299,30 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
         return { state: next, result: { kind: "begin-fresh-launch", attemptId } };
       }
 
-      const sessionId = resumeSessionId;
-      if (hasLaunchRecordFor(current, agentId, sessionId)) {
+      const shortId = plan.shortId;
+      const attemptKey: AttemptKey = { kind: "respawn", shortId };
+      if (hasLaunchRecordFor(current, agentId, attemptKey)) {
         return { state: current, result: { kind: "skip" } };
       }
 
-      const entry = sessions.find((s) => s.sessionId === agent.liveSessionId);
+      // BAKR-22: liveness is checked against the SHORT id now (what
+      // `respawn` itself keys on — `checkLiveness`'s own convention),
+      // never the full session id `--bg --resume` used to key against.
+      // `respawn` kills and restarts a live process (measured) — this gate
+      // is what keeps the daemon from calling it on `alive` or
+      // `not-verifiable`. THERE IS NO "dead" VERDICT (`decideLiveness`
+      // produces exactly `alive | not-verifiable | unknown` — see
+      // liveness.ts). Respawn/forkFrom are reachable ONLY on `unknown`,
+      // which its own doc comment is explicit is "not proof of death" —
+      // merely absence from this cycle's listing. That is the SAME weak
+      // link the old `--bg --resume` path already restored on; BAKR-22
+      // does not strengthen it, only renames the mechanism that acts on
+      // it. Do not read "the gate" as a death-verification gate — it is a
+      // never-alive, never-uncertain gate, which is the honest strength
+      // this design actually has.
+      const entry = sessions.find((s) => s.id === shortId);
       const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
-      const verdict = decideLiveness(agent.liveSessionId ?? sessionId, entry, pidVerifiedAlive);
+      const verdict = decideLiveness(shortId, entry, pidVerifiedAlive);
 
       if (verdict.status === "alive") {
         if (restoreAttemptCount(current, agentId) > 0) {
@@ -308,19 +337,19 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
       const attemptsSoFar = restoreAttemptCount(current, agentId);
       if (attemptsSoFar >= MAX_CONSECUTIVE_UNVERIFIED_RESTORES) {
         const giveUpAttemptId = deps.generateAttemptId();
-        let next = beginLaunch(current, agentId, key, sessionId, giveUpAttemptId, deps.now());
+        let next = beginLaunch(current, agentId, key, attemptKey, giveUpAttemptId, deps.now());
         next = markLaunchFailed(
           next,
           giveUpAttemptId,
           `gave up after ${attemptsSoFar} consecutive restore attempts for this agent, none independently verified alive — likely a silently-failing resume (ticket measurement 5); never retried automatically (BAKR-8 Constraint 2)`
         );
-        return { state: next, result: { kind: "give-up", attemptsSoFar, sessionId } };
+        return { state: next, result: { kind: "give-up", attemptsSoFar, shortId } };
       }
 
       const attemptId = deps.generateAttemptId();
-      let next = beginLaunch(current, agentId, key, sessionId, attemptId, deps.now());
+      let next = beginLaunch(current, agentId, key, attemptKey, attemptId, deps.now());
       next = recordRestoreAttempt(next, agentId);
-      return { state: next, result: { kind: "begin-restore-launch", attemptId, sessionId } };
+      return { state: next, result: { kind: "begin-respawn", attemptId, shortId, restoreSessionId: agent.restoreTarget?.sessionId ?? shortId } };
     },
     lockOpts(deps)
   );
@@ -339,6 +368,105 @@ async function recordLaunchOutcome(deps: DaemonDeps, attemptId: string, outcome:
     }),
     lockOpts(deps)
   );
+}
+
+/**
+ * `abandonedSessionId`, when present on `"forked"`, means the escape found
+ * NO transcript to carry (positive evidence, per `probeResumableTranscript`)
+ * and chose a bare fresh launch instead of a doomed fork — the reconcile
+ * loop's own log line names this explicitly (see the dispatch site below)
+ * rather than letting it read like an ordinary successful fork.
+ */
+export type RespawnDispatchResult =
+  | { readonly kind: "respawned" }
+  | { readonly kind: "forked"; readonly newShortId: string | undefined; readonly abandonedSessionId?: string }
+  | { readonly kind: "refused"; readonly error: string };
+
+/**
+ * Dispatches ONE `respawn` attempt, unlocked (R-F: never hold the lock
+ * across a spawn), and records the outcome in a second, separate locked
+ * mutation — mirrors `agent-actions.ts`'s own `dispatchRespawn` for the
+ * `on` verb exactly; this is the daemon's reconcile-loop counterpart.
+ *
+ * THE TOCTOU RE-CHECK (epic-flagged risk 2): the liveness verdict that
+ * chose to reach this function was decided INSIDE a lock hold that has
+ * since been released (B12 forbids holding it across the spawn below).
+ * `respawn` silently kills and restarts whatever process currently holds
+ * `shortId` — if an operator attached in the gap between that decision and
+ * this call, their fresh session would be killed by a restore that had
+ * already decided (correctly, at the time) that nothing was there. Re-
+ * verifying liveness here, immediately before the spawn and with nothing
+ * else in between, narrows that window from "up to one reconcile interval"
+ * to "the gap between two back-to-back listing calls" — it does NOT close
+ * the race (an attach in that remaining sub-second gap is still possible),
+ * and this comment says so rather than claiming a fix B12 does not allow.
+ *
+ * THE ONE RECOGNISED FAILURE SHAPE that transitions to `forkFrom`:
+ * `isRecognizedStaleCwdRefusal`. ANY OTHER non-zero result is a typed
+ * refusal that leaves the original `respawn` attempt failed and NEVER
+ * falls through to a fork — forking on an unrecognised failure would
+ * abandon a live conversation and mint a new one on a guess.
+ */
+async function dispatchRespawnForDaemon(deps: DaemonDeps, agentId: string, key: ClaimKey, attemptId: string, shortId: string, restoreSessionId: string): Promise<RespawnDispatchResult> {
+  // BAKR-22 CORRECTION: this re-check now goes through the real
+  // `checkLiveness` (spawn/liveness.ts), whose verdict distinguishes
+  // `absent` (the listing succeeded, genuinely not found) from
+  // `listing-failed` (the listing call itself threw) — a distinction the
+  // epic caught missing here: the ORIGINAL version of this re-check
+  // treated a THROWN listing the same as "not alive" and proceeded to
+  // respawn anyway, which is exactly the unannounced-stop-hidden-in-
+  // restore case B7 forbids, caused by a transient CLI hiccup rather than
+  // any fact about the session. `absent` is the ONLY verdict that proceeds
+  // — `alive`, `not-verifiable`, AND `listing-failed` all refuse.
+  const recheck = await checkLiveness(shortId, { runCommand: deps.runCommand });
+  if (recheck.status !== "absent") {
+    const reason = recheck.status === "alive" ? `verified alive with pid ${recheck.pid}` : recheck.reason;
+    const error = `respawn refused: TOCTOU re-check reported "${recheck.status}" for session ${shortId} (${reason}) — only "absent" (a listing that succeeded and genuinely did not find it) proceeds; an operator likely attached since the decision was made, or the re-check listing itself failed, so this is not killed`;
+    await withAgentStoreLock(deps.agentsPath, (current) => ({ state: markLaunchFailed(current, attemptId, error), result: undefined }), lockOpts(deps));
+    return { kind: "refused", error };
+  }
+
+  const result = await respawnSession(shortId, { runCommand: deps.runCommand });
+  if (result.ok) {
+    await withAgentStoreLock(deps.agentsPath, (current) => ({ state: resolveRespawnAttempt(current, attemptId), result: undefined }), lockOpts(deps));
+    return { kind: "respawned" };
+  }
+
+  if (isRecognizedStaleCwdRefusal(result.error)) {
+    // BAKR-22 EPIC CORRECTION: routes on `probeResumableTranscript`'s
+    // THREE outcomes, never a boolean — a false "no transcript" would make
+    // bakr choose `fresh` and PERMANENTLY, SILENTLY abandon a real
+    // conversation, worse than the phantom-fork failure this mechanism
+    // exists to avoid (the phantom fails LOUDLY on first prompt instead).
+    // `could-not-tell` proceeds with NEITHER escape — no new launch
+    // attempt at all, only the original failure recorded, leaving the
+    // agent wedged for an operator to resolve via `on`/`adopt`.
+    const probe = await probeResumableTranscript(restoreSessionId, deps.transcriptProbeDeps ?? realTranscriptProbeDeps);
+    if (probe.status === "could-not-tell") {
+      const error = `could not determine whether session ${restoreSessionId} has a resumable transcript (${probe.reason}) — refusing rather than guessing in either direction; resolve with on/adopt once the layout question is settled`;
+      await withAgentStoreLock(deps.agentsPath, (current) => ({ state: markLaunchFailed(current, attemptId, result.error), result: undefined }), lockOpts(deps));
+      return { kind: "refused", error };
+    }
+    const canForkFrom = probe.status === "has-transcript";
+    const forkResult = canForkFrom ? await launch(key, ["--resume", restoreSessionId, "--fork-session"], { runCommand: deps.runCommand }) : await launch(key, [], { runCommand: deps.runCommand });
+    await withAgentStoreLock(
+      deps.agentsPath,
+      (current) => {
+        let next = markLaunchFailed(current, attemptId, result.error);
+        const forkAttemptId = deps.generateAttemptId();
+        const forkKey: AttemptKey = { kind: "forkFrom", sessionId: restoreSessionId };
+        next = beginLaunch(next, agentId, key, forkKey, forkAttemptId, deps.now());
+        next = forkResult.ok ? markLaunchStarted(next, forkAttemptId, forkResult.id) : markLaunchFailed(next, forkAttemptId, forkResult.error);
+        return { state: next, result: undefined };
+      },
+      lockOpts(deps)
+    );
+    const newShortId = forkResult.ok ? forkResult.id : undefined;
+    return canForkFrom ? { kind: "forked", newShortId } : { kind: "forked", newShortId, abandonedSessionId: restoreSessionId };
+  }
+
+  await withAgentStoreLock(deps.agentsPath, (current) => ({ state: markLaunchFailed(current, attemptId, result.error), result: undefined }), lockOpts(deps));
+  return { kind: "refused", error: result.error };
 }
 
 /**
@@ -483,30 +611,56 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
         continue;
       }
       if (decision.kind === "not-verifiable") {
-        log("warn", `agent ${agent.id} in "${key}": session ${agent.liveSessionId ?? agent.durableSessionId} ${decision.reason} — not restoring this cycle to avoid a duplicate; re-checked next cycle`);
+        log("warn", `agent ${agent.id} in "${key}": session ${decision.reason} — not restoring this cycle to avoid a duplicate; re-checked next cycle`);
         continue;
       }
       if (decision.kind === "give-up") {
         log(
           "error",
-          `agent ${agent.id} in "${key}": giving up on restoring session ${decision.sessionId} after ${decision.attemptsSoFar} consecutive unverified restore attempts — the daemon must converge, not spawn unboundedly; see the unresolved-launch log for this attempt`
+          `agent ${agent.id} in "${key}": giving up on respawning short id ${decision.shortId} after ${decision.attemptsSoFar} consecutive unverified restore attempts — the daemon must converge, not spawn unboundedly; see the unresolved-launch log for this attempt`
         );
         continue;
       }
 
-      // begin-fresh-launch or begin-restore-launch: the write already
-      // landed inside the same lock hold as the decision (R-F.3). Now
-      // launch() runs UNLOCKED (R-F: never hold the lock across it).
-      const claudeArgs = decision.kind === "begin-restore-launch" ? ["--resume", decision.sessionId] : [];
-      const launchResult = await launch(key, claudeArgs, { runCommand: deps.runCommand });
+      if (decision.kind === "begin-respawn") {
+        // The write already landed inside the same lock hold as the
+        // decision (R-F.3). Now respawn (or its stale-cwd forkFrom escape)
+        // runs UNLOCKED (R-F: never hold the lock across a spawn).
+        const dispatch = await dispatchRespawnForDaemon(deps, agent.id, key, decision.attemptId, decision.shortId, decision.restoreSessionId);
+        if (dispatch.kind === "respawned") {
+          log("info", `agent ${agent.id} in "${key}": respawned short id ${decision.shortId} — same session, no fork, per BAKR-22's own measurement`);
+          restored.push({ agentId: agent.id, key, sessionId: decision.restoreSessionId });
+        } else if (dispatch.kind === "forked") {
+          if (dispatch.abandonedSessionId !== undefined) {
+            // BAKR-22 EPIC REQUIREMENT: `fresh` was chosen for a MOVED agent
+            // (confirmed no-transcript, per `probeResumableTranscript`) —
+            // report it LOUDLY, naming the agent and the abandoned session
+            // id, so this never reads like an ordinary successful escape.
+            log(
+              "error",
+              `agent ${agent.id} in "${key}": respawn REFUSED with the recognised stale-cwd shape — the job's registered directory no longer matches "${key}". Session ${dispatch.abandonedSessionId} was CONFIRMED to have no resumable transcript (probeResumableTranscript), so a FRESH session was started instead of forking — session ${dispatch.abandonedSessionId} is now abandoned${dispatch.newShortId !== undefined ? ` (new short id ${dispatch.newShortId}; awaiting a future listing to confirm its new session id and advance restoreTarget)` : ", but the fresh launch itself also failed — see the unresolved-launch log"}. This is the ONE case restoreTarget still moves; birthSessionId is untouched.`
+            );
+          } else {
+            log(
+              "error",
+              `agent ${agent.id} in "${key}": respawn REFUSED with the recognised stale-cwd shape — the job's registered directory no longer matches "${key}". Escaped via forkFrom (--fork-session) resuming session ${decision.restoreSessionId}${dispatch.newShortId !== undefined ? ` -> new short id ${dispatch.newShortId}; awaiting a future listing to confirm its new session id and advance restoreTarget` : ", but the fork launch itself also failed — see the unresolved-launch log"}. This is the ONE case restoreTarget still moves; birthSessionId is untouched.`
+            );
+          }
+        } else {
+          log(
+            "error",
+            `agent ${agent.id} in "${key}": respawn REFUSED: ${dispatch.error} — an unrecognised failure never falls through to forkFrom (that would risk abandoning a live conversation on a guess); recorded as unresolved, never retried automatically (BAKR-8 Constraint 2)`
+          );
+        }
+        continue;
+      }
+
+      // begin-fresh-launch only from here on.
+      const launchResult = await launch(key, [], { runCommand: deps.runCommand });
       if (launchResult.ok) {
         await recordLaunchOutcome(deps, decision.attemptId, launchResult);
-        const sessionId = decision.kind === "begin-restore-launch" ? decision.sessionId : undefined;
-        log(
-          "info",
-          `agent ${agent.id} in "${key}": ${decision.kind === "begin-restore-launch" ? `restore launched, resuming durable session ${decision.sessionId}` : "fresh launch issued"} -> short id ${launchResult.id}; awaiting a future listing to learn its session id`
-        );
-        restored.push({ agentId: agent.id, key, sessionId });
+        log("info", `agent ${agent.id} in "${key}": fresh launch issued -> short id ${launchResult.id}; awaiting a future listing to learn its session id`);
+        restored.push({ agentId: agent.id, key, sessionId: undefined });
       } else {
         await recordLaunchOutcome(deps, decision.attemptId, launchResult);
         const staleRegisteredCwd = detectStaleRegisteredCwdRefusal(launchResult.error);

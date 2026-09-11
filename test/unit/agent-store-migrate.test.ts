@@ -31,8 +31,8 @@ describe("migrateSessionSlots: AC1 — each of the three shapes the current pars
     expect(agents[0]?.name).toBeUndefined();
     expect(agents[0]?.directory).toBe(KEY_A);
     // Session ids preserved BYTE-FOR-BYTE.
-    expect(agents[0]?.durableSessionId).toBe("durable-and-live-1");
-    expect(agents[0]?.liveSessionId).toBe("durable-and-live-1");
+    expect(agents[0]?.birthSessionId).toBe("durable-and-live-1");
+    expect(agents[0]?.restoreTarget?.sessionId).toBe("durable-and-live-1");
     expect(summary.agentsCreated).toBe(1);
     expect(summary.directories).toEqual([KEY_A]);
   });
@@ -46,8 +46,8 @@ describe("migrateSessionSlots: AC1 — each of the three shapes the current pars
     const agents = Object.values(state.agents);
     expect(agents).toHaveLength(1);
     // A legacy bare string means durableSessionId === liveSessionId === that string — preserved byte-for-byte through both the legacy normalizer AND the migration.
-    expect(agents[0]?.durableSessionId).toBe("legacy-bare-id");
-    expect(agents[0]?.liveSessionId).toBe("legacy-bare-id");
+    expect(agents[0]?.birthSessionId).toBe("legacy-bare-id");
+    expect(agents[0]?.restoreTarget?.sessionId).toBe("legacy-bare-id");
     expect(agents[0]?.state).toBe("on");
   });
 
@@ -75,7 +75,7 @@ describe("migrateSessionSlots: AC1 — each of the three shapes the current pars
     const agents = Object.values(state.agents);
     expect(agents).toHaveLength(2);
     expect(new Set(agents.map((a) => a.id)).size).toBe(2); // distinct ids
-    expect(new Set(agents.map((a) => a.durableSessionId))).toEqual(new Set(["session-1", "session-2"]));
+    expect(new Set(agents.map((a) => a.birthSessionId))).toEqual(new Set(["session-1", "session-2"]));
     expect(summary.agentsCreated).toBe(2);
   });
 
@@ -141,7 +141,7 @@ describe("R-C.2/R-C.3: a v1 launch record is split by its OWN state, not treated
     expect(state.launches).toHaveLength(1);
     const launch = state.launches[0];
     expect(launch?.error).toBe("gave up after 3 consecutive restore attempts — pre-migration");
-    const agent = Object.values(state.agents).find((a) => a.durableSessionId === "durable-1");
+    const agent = Object.values(state.agents).find((a) => a.birthSessionId === "durable-1");
     expect(agent).toBeDefined();
     expect(launch?.agentId).toBe(agent!.id);
   });
@@ -209,7 +209,7 @@ describe("R-C.2/R-C.3: a v1 launch record is split by its OWN state, not treated
     expect(pending?.key).toBe(KEY_A); // the record's OWN launch target
     expect(pending?.launchShortId).toBe("fresh-short");
     // No agent was fabricated for it — that only happens on resolution (see agent-model.test.ts's resolvePendingCreation tests).
-    expect(Object.values(state.agents).some((a) => a.durableSessionId === undefined && a.directory === KEY_A)).toBe(false);
+    expect(Object.values(state.agents).some((a) => a.birthSessionId === undefined && a.directory === KEY_A)).toBe(false);
   });
 
   test("a permanently-unresolved (errored) FRESH launch (no priorSessionId) is dropped and counted — R-C.3 only reverses the PENDING (case 3) sub-case, not case 2", () => {

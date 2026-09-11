@@ -97,3 +97,25 @@ export interface StopInvocation {
 export function buildStopInvocation(id: string): StopInvocation {
   return { argv: ["claude", "stop", id], timeoutMs: STOP_TIMEOUT_MS };
 }
+
+export interface RespawnInvocation {
+  readonly argv: string[];
+  readonly timeoutMs: number;
+}
+
+const RESPAWN_TIMEOUT_MS = 20_000;
+
+/**
+ * BAKR-22: `claude respawn <shortId>` — the argv-exactness this ticket's
+ * own regression test pins. Takes the SHORT id only (`respawn` measured to
+ * REJECT a full session uuid outright: `"No job matching '<uuid>'"`, rc=1
+ * — this is not a stylistic choice, it is the only shape that works).
+ * Never carries a permissions or model flag, and never will: BAKR-22
+ * measured that `--dangerously-skip-permissions` on a restore invocation
+ * is what causes `claude --bg --resume` to fork even on builds where an
+ * unflagged restore correctly reattaches — the whole point of switching to
+ * `respawn` collapses if a future edit ever adds a flag here.
+ */
+export function buildRespawnInvocation(shortId: string): RespawnInvocation {
+  return { argv: ["claude", "respawn", shortId], timeoutMs: RESPAWN_TIMEOUT_MS };
+}
