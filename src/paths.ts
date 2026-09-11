@@ -1,8 +1,9 @@
 import { homedir } from "node:os";
-import { lstat, readlink } from "node:fs/promises";
+import { lstat, readlink, stat } from "node:fs/promises";
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 import * as xdg from "./xdg";
 import type { ResolveInputs } from "./claim-key-resolve";
+import type { OrphanProbeDeps } from "./orphan-probe";
 
 // The impure seams for this ticket's two real-filesystem dependencies:
 // XDG resolution and symlink-aware path resolution. Both read real env/os
@@ -43,3 +44,11 @@ export const realResolveInputs: ResolveInputs = {
 
 /** The real CSPRNG source, for wiring into `mintAgentId`/`mintUniqueAgentId` (see agent-model.ts) — never called directly from anywhere pure. */
 export const realRandomBytes = (byteLength: number): Uint8Array => nodeRandomBytes(byteLength);
+
+/** The real `stat`, for wiring into `probeDirectory` (see orphan-probe.ts) — follows symlinks deliberately (see that module's own comment). */
+export const realOrphanProbeDeps: OrphanProbeDeps = {
+  stat: async (path: string) => {
+    const s = await stat(path);
+    return { dev: s.dev, ino: s.ino, isDirectory: () => s.isDirectory() };
+  },
+};

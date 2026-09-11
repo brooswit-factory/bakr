@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claim, emptyStore } from "../../src/claim-model";
+import { realOrphanProbeDeps } from "../../src/paths";
 import { save as saveClaims } from "../../src/claim-store-io";
 import { emptySessionSlots, beginLaunch, markLaunchStarted, resolveLaunch, markLaunchFailed, serializeSessionSlotsState } from "../../src/session-slots";
 import { save as saveAgents, load as loadAgents } from "../../src/agent-store-io";
@@ -10,6 +11,10 @@ import { emptyAgentStore, putAgent, unresolvedLaunches, type AgentRecord } from 
 import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
 import type { ClaimKey } from "../../src/claim-key-resolve";
 import type { RunCommandOptions, CommandResult } from "../../src/spawn";
+import type { OrphanProbeDeps } from "../../src/orphan-probe";
+
+/** These tests use symbolic paths like "/claimed/dir" that do not exist on the real filesystem — a real `stat` would classify every one of them as orphaned. This fake always reports "exists", preserving the pre-BAKR-24 behaviour (every claimed directory is `present`) for every test that isn't specifically exercising Q4's orphan-reporting behaviour (see the dedicated "BAKR-24" describe block below, which builds its own real-directory fixtures instead). */
+export const alwaysPresentProbeDeps: OrphanProbeDeps = { stat: async () => ({ dev: 1, ino: 1, isDirectory: () => true }) };
 
 const cleanupDirs: string[] = [];
 
@@ -40,6 +45,7 @@ function baseDeps(dir: string, runCommand: DaemonDeps["runCommand"]): DaemonDeps
       randomCounter += 1;
       return new Uint8Array(n).fill(randomCounter & 0xff);
     },
+    probeDeps: alwaysPresentProbeDeps,
   };
 }
 
@@ -86,7 +92,7 @@ describe("Constraint 3: a malformed claim store degrades the daemon", () => {
     expect(result1.restored).toEqual([]);
     expect(calls).toBe(0);
 
-    const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, agentsDegraded: result1.agentsDegraded }, deps);
+    const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, agentsDegraded: result1.agentsDegraded, orphanReportSignatures: result1.orphanReportSignatures }, deps);
     expect(result2.claimDegraded).toBe(true);
     expect(calls).toBe(0);
   });
@@ -234,7 +240,7 @@ describe("AC3: only 'on' is restored — off and archived are NEVER launched, wi
     let state = initialDaemonState();
     for (let i = 0; i < 3; i++) {
       const result = await runReconcileCycle(state, deps);
-      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded };
+      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
     }
 
     const final = await loadAgents(join(dir, "agents.json"));
@@ -267,7 +273,7 @@ describe("AC4 (HEADLINE): fresh-launch resolution by agent, not directory", () =
     expect(new Set(result1.restored.map((r) => r.agentId))).toEqual(new Set(["@agent-1", "@agent-2"]));
 
     // Cycle 2: the listing now includes both launched short ids -> both resolve, EACH to its own agent.
-    const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, agentsDegraded: result1.agentsDegraded }, deps);
+    const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, agentsDegraded: result1.agentsDegraded, orphanReportSignatures: result1.orphanReportSignatures }, deps);
     void result2;
 
     const final = await loadAgents(join(dir, "agents.json"));
@@ -298,7 +304,7 @@ describe("the full silent-restore lifecycle (durable id never overwritten)", () 
     const afterCycle1 = await loadAgents(join(dir, "agents.json"));
     if (afterCycle1.status === "loaded") expect(afterCycle1.state.agents["@a1"]?.durableSessionId).toBe("old-session-id");
 
-    const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, agentsDegraded: result1.agentsDegraded }, deps);
+    const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, agentsDegraded: result1.agentsDegraded, orphanReportSignatures: result1.orphanReportSignatures }, deps);
     expect(result2.restored).toEqual([]); // resolved, not restored again
 
     const afterCycle2 = await loadAgents(join(dir, "agents.json"));
@@ -367,7 +373,7 @@ describe("regression: the daemon must always resume the DURABLE id, never a rota
     let state = initialDaemonState();
     for (let i = 0; i < 8; i++) {
       const result = await runReconcileCycle(state, deps);
-      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded };
+      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
     }
 
     expect(launchArgvs.length).toBeGreaterThan(0);
@@ -410,7 +416,7 @@ describe("regression: a resume that 'succeeds' but is actually a silent empty se
     let state = initialDaemonState();
     for (let i = 0; i < 10; i++) {
       const result = await runReconcileCycle(state, deps);
-      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded };
+      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
     }
 
     expect(launchCalls).toBeLessThanOrEqual(3);
@@ -423,7 +429,7 @@ describe("regression: a resume that 'succeeds' but is actually a silent empty se
     const launchCallsAtConvergence = launchCalls;
     for (let i = 0; i < 5; i++) {
       const result = await runReconcileCycle(state, deps);
-      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded };
+      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
     }
     expect(launchCalls).toBe(launchCallsAtConvergence);
   });
@@ -477,7 +483,7 @@ describe("Constraint 2: a failed launch is recorded, never retried automatically
     expect(result1.restored).toEqual([]);
     expect(launchCalls).toBe(1);
 
-    const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, agentsDegraded: result1.agentsDegraded }, deps);
+    const result2 = await runReconcileCycle({ claimDegraded: result1.claimDegraded, agentsDegraded: result1.agentsDegraded, orphanReportSignatures: result1.orphanReportSignatures }, deps);
     expect(result2.restored).toEqual([]);
     expect(launchCalls).toBe(1);
   });
@@ -510,7 +516,7 @@ describe("AC14: a given-up (errored) v1 launch record must keep blocking its mig
     for (let i = 0; i < 5; i++) {
       const result = await runReconcileCycle(state, deps);
       cycles.push(result);
-      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded };
+      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
     }
 
     const finalState = await loadAgents(join(dir, "agents.json"));
@@ -531,5 +537,80 @@ describe("AC14: a given-up (errored) v1 launch record must keep blocking its mig
     // And the given-up record itself is still on record, unresolved, still attributed to the right agent.
     const stillUnresolved = unresolvedLaunches(finalState.state).find((l) => l.agentId === givenUpAgent!.id);
     expect(stillUnresolved).toBeDefined();
+  });
+});
+
+describe("BAKR-24 Q4: report, don't launch — an orphaned claim's on-agents are never launched, and never create a launch record", () => {
+  test("real directories: a claim whose directory is DELETED gets zero launches over several cycles; the NEGATIVE CONTROL — an ordinary 'on' agent in a directory that still resolves — IS launched in the SAME run; the report names the missing directory, not systemd-run", async () => {
+    const storeDir = await makeTempDir();
+    const presentDir = await mkdtemp(join(tmpdir(), "bakr-q4-present-"));
+    cleanupDirs.push(presentDir);
+    const goneDirParent = await mkdtemp(join(tmpdir(), "bakr-q4-gone-parent-"));
+    cleanupDirs.push(goneDirParent);
+    const goneDir = join(goneDirParent, "moved-away") as ClaimKey;
+    await mkdir(goneDir);
+    // Delete it BEFORE any reconcile cycle runs — a genuine orphan from cycle 1.
+    await rm(goneDir, { recursive: true, force: true });
+
+    const presentKey = presentDir as ClaimKey;
+
+    let claimState = emptyStore();
+    claimState = claim(claimState, presentKey, 1).state;
+    claimState = claim(claimState, goneDir, 1).state;
+    await saveClaims(join(storeDir, "claims.json"), claimState);
+
+    let agentState = emptyAgentStore();
+    agentState = putAgent(agentState, makeAgent({ id: "@present-agent", directory: presentKey }));
+    agentState = putAgent(agentState, makeAgent({ id: "@orphan-agent", directory: goneDir }));
+    await saveAgents(join(storeDir, "agents.json"), agentState);
+
+    const launchedCwds: string[] = [];
+    const runCommand = async (argv: string[], opts: RunCommandOptions) => {
+      if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
+      if (argv[0] === "systemd-run") {
+        launchedCwds.push(opts.cwd ?? "");
+        return { exitCode: 0, stdout: "backgrounded · short-x (idle — send a prompt to start)\n", stderr: "" };
+      }
+      throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
+    };
+
+    const deps: DaemonDeps = { ...baseDeps(storeDir, runCommand), probeDeps: realOrphanProbeDeps };
+
+    const capturedLines: string[] = [];
+    const originalConsoleLog = console.log;
+    console.log = (...args: unknown[]) => {
+      capturedLines.push(args.map(String).join(" "));
+    };
+    let state = initialDaemonState();
+    try {
+      for (let i = 0; i < 3; i++) {
+        const result = await runReconcileCycle(state, deps);
+        state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
+      }
+    } finally {
+      console.log = originalConsoleLog;
+    }
+
+    // The orphan was NEVER launched, across every cycle.
+    expect(launchedCwds).not.toContain(goneDir);
+    // NEGATIVE CONTROL: the present-directory agent WAS launched in this same run — proves the harness can observe a launch at all, so the zero above means "correctly skipped", not "launched nothing anywhere".
+    expect(launchedCwds).toContain(presentDir);
+
+    // No launch record was ever created for the orphaned agent (Q4: "create no launch record at all").
+    const finalAgents = await loadAgents(join(storeDir, "agents.json"));
+    expect(finalAgents.status).toBe("loaded");
+    if (finalAgents.status === "loaded") {
+      expect(finalAgents.state.launches.some((l) => l.agentId === "@orphan-agent")).toBe(false);
+    }
+
+    // The report names the missing directory and the agent, and does NOT echo a systemd-run/ENOENT-shaped explanation.
+    const orphanLogLines = capturedLines.filter((line) => line.includes("@orphan-agent"));
+    expect(orphanLogLines.length).toBeGreaterThan(0);
+    expect(orphanLogLines[0]).toContain(goneDir);
+    expect(orphanLogLines[0]).toMatch(/verdict: gone/);
+    expect(orphanLogLines[0]).not.toMatch(/posix_spawn|systemd-run:/);
+
+    // Reported on STATE CHANGE only, not once per cycle — 3 cycles, but the orphan's status never changed after cycle 1, so exactly one report line for it.
+    expect(orphanLogLines).toHaveLength(1);
   });
 });
