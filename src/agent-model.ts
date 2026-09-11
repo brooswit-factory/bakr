@@ -243,6 +243,21 @@ export function putAgent(state: AgentStoreState, agent: AgentRecord): AgentStore
 }
 
 /**
+ * BAKR-21: `delete`'s primitive — removes the record from `agents` and adds
+ * its id to `retiredIds` (B6: "deleted means removed, with the id retired
+ * and the name freed") — this is `retiredIds`'s first writer, as this
+ * file's own module comment already said it would be. A no-op, like every
+ * other mutator here, if `agentId` is not currently present — total, never
+ * throws.
+ */
+export function removeAndRetireAgent(state: AgentStoreState, agentId: string): AgentStoreState {
+  if (!(agentId in state.agents)) return state;
+  const agents = { ...state.agents };
+  delete agents[agentId];
+  return { ...state, agents, retiredIds: [...state.retiredIds, agentId] };
+}
+
+/**
  * Raw, unvalidated rewrite of one agent's `directory` — the primitive
  * adopt.ts's validated wrapper builds on (this file ships no "adopt" verb
  * of its own, per the module comment above). Performs no name-collision,
@@ -309,6 +324,16 @@ export function resolveAgent(state: AgentStoreState, scope: ClaimKey, ref: strin
  * transcript at all). Funneling every caller through this one function is
  * what lets that future change land in one place instead of a hunt across
  * daemon.ts and every adoption/restore call site.
+ *
+ * BAKR-17/BAKR-21 UNIFIED INTO THIS FUNCTION AT MERGE TIME (2026-09-11).
+ * BAKR-21 had shipped an identical `sessionIdToResume` on its own branch
+ * before BAKR-18 landed this one; the two never conflicted textually
+ * because the names differed, which is exactly how a merge can be
+ * silently wrong. BAKR-2 required one name, so `sessionIdToResume` is
+ * retired and `agent-lifecycle.ts`'s `decideOn` now calls THIS function.
+ * Call sites today: `decideOn` (the `on` verb) and `daemon.ts`'s restore.
+ * `daemon.ts` does still mention `.durableSessionId` once more, but only
+ * inside a LOG STRING, never as a resume decision — verified at merge.
  */
 export function sessionToResume(agent: AgentRecord): string | undefined {
   return agent.durableSessionId;
@@ -365,6 +390,36 @@ export function promoteUnresolvableLaunches(state: AgentStoreState, reason: stri
  */
 export function hasLaunchRecordFor(state: AgentStoreState, agentId: string, priorSessionId: string | undefined): boolean {
   return state.launches.some((l) => l.agentId === agentId && l.priorSessionId === priorSessionId);
+}
+
+/**
+ * BAKR-21: the operator-driven recovery for the launch-record wedge
+ * confirmed on this ticket (BAKR-17 comment, 2026-09-11) — `promoteUnresolvableLaunches`
+ * marks a crashed-mid-launch record FAILED (`error` set), but `resolveLaunch`
+ * only ever removes a record whose `error` is still `undefined`, and
+ * `hasLaunchRecordFor` does not look at `error` at all. So a failed record
+ * for `(agentId, priorSessionId)` is otherwise PERMANENT: it blocks
+ * `decideAndBeginForAgent` on both the fresh-launch and the restore arm,
+ * forever, with no code path that ever removes it.
+ *
+ * This function is that removal — but it removes ONLY a record whose
+ * `error` is already set (i.e. one `promoteUnresolvableLaunches` or a
+ * direct `markLaunchFailed` has already given up on). It is a no-op against
+ * a genuinely in-flight record (`error === undefined`, whether or not
+ * `launchShortId` is set yet) — clearing THAT would risk a duplicate launch
+ * racing a resolution that is still coming, which is exactly the hazard
+ * `hasLaunchRecordFor`'s guard exists to prevent (AC4).
+ *
+ * MUST be called only from an explicit, operator-initiated verb
+ * (`agent-actions.ts`'s `on`) — never from `daemon.ts` or anything reachable
+ * from its reconcile loop. B7 stays intact: "never retried automatically"
+ * was written for an unattended loop; an operator who calls `on` again
+ * after a launch demonstrably failed is not that.
+ */
+export function clearFailedLaunchRecord(state: AgentStoreState, agentId: string, priorSessionId: string | undefined): AgentStoreState {
+  const record = state.launches.find((l) => l.agentId === agentId && l.priorSessionId === priorSessionId && l.error !== undefined);
+  if (record === undefined) return state;
+  return { ...state, launches: state.launches.filter((l) => l.attemptId !== record.attemptId) };
 }
 
 export function beginLaunch(state: AgentStoreState, agentId: string, key: ClaimKey, priorSessionId: string | undefined, attemptId: string, now: number): AgentStoreState {
