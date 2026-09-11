@@ -51,9 +51,6 @@ async function brokenOn(deps: AgentActionDeps, directory: ClaimKey, agentId: str
   const agent = peeked.state.agents[agentId];
   if (agent === undefined || agent.state !== "off") return false;
 
-  // Simulate real-world scheduling variance between the stale peek and the lock attempt.
-  await new Promise((resolve) => setTimeout(resolve, Math.random() * 30));
-
   let launched = false;
   await withAgentStoreLock(deps.agentsPath, (current) => {
     const currentAgent = current.agents[agentId] as AgentRecord;
@@ -68,11 +65,28 @@ async function brokenOn(deps: AgentActionDeps, directory: ClaimKey, agentId: str
   return launched;
 }
 
+/**
+ * Spins/sleeps until `targetEpochMs`, so every contender's first read of
+ * the store happens at approximately the SAME wall-clock instant
+ * regardless of each process's own startup jitter (`Bun.spawn` + the JS
+ * runtime boot itself can easily vary by tens of milliseconds under load,
+ * which a fixed random sleep chosen independently by each process cannot
+ * compensate for). Same technique BAKR-16's own 12-contender lock test
+ * describes as "each spinning to a shared start instant".
+ */
+async function waitUntil(targetEpochMs: number): Promise<void> {
+  const remaining = targetEpochMs - Date.now();
+  if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
+}
+
 async function main(): Promise<void> {
-  const [mode, agentsPath, agentId, directory] = process.argv.slice(2);
+  const [mode, agentsPath, agentId, directory, targetStartEpochMsRaw] = process.argv.slice(2);
   if (mode === undefined || agentsPath === undefined || agentId === undefined || directory === undefined) {
-    console.error("usage: agent-on-race-worker.ts <safe|broken> <agentsPath> <agentId> <directory>");
+    console.error("usage: agent-on-race-worker.ts <safe|broken> <agentsPath> <agentId> <directory> [targetStartEpochMs]");
     process.exit(1);
+  }
+  if (targetStartEpochMsRaw !== undefined) {
+    await waitUntil(Number(targetStartEpochMsRaw));
   }
   const deps = baseDeps(agentsPath);
   const key = directory as ClaimKey;

@@ -28,10 +28,11 @@
 // verbs: `create()`/`off()` themselves are exercised exactly as shipped.
 
 import { randomUUID } from "node:crypto";
-import { lstat, readlink, stat, readdir } from "node:fs/promises";
+import { lstat, readlink, writeFile } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { snapshotDirectory } from "./dir-snapshot";
 import { claim, emptyStore } from "../src/claim-model";
 import { save as saveClaims } from "../src/claim-store-io";
 import { resolveClaimKey } from "../src/claim-key-resolve";
@@ -112,6 +113,15 @@ async function main(): Promise<void> {
   let singletonPidAfter: number | undefined;
 
   try {
+    // Pre-existing content, BEFORE claiming — criterion 7's corrected
+    // instrument needs something already there to prove an IN-PLACE,
+    // same-name rewrite is detected (an empty directory can only reveal
+    // additions, the exact class a bare mtime/ctime check already caught;
+    // see scripts/dir-snapshot.ts's module comment for why that is not
+    // the gap that mattered).
+    await writeFile(join(scratchDir, "README.md"), "# a real repo, for this demonstration\n");
+    await writeFile(join(scratchDir, ".gitignore"), "node_modules\n");
+
     // --- claim the scratch directory ---
     const lexical = lexicallyNormalize(scratchDir, { cwd: process.cwd(), home: homedir() });
     const resolved = await resolveClaimKey(lexical, { lstat, readlink });
@@ -125,8 +135,7 @@ async function main(): Promise<void> {
     log(`\n--- BEFORE: full unscoped listing (${beforeAll.length} background session(s) already on this host, none started by this demo) ---`);
     log(JSON.stringify(beforeAll, null, 2));
 
-    const dirStatBefore = await stat(scratchDir);
-    const dirEntriesBefore = await readdir(scratchDir);
+    const dirSnapshotBefore = await snapshotDirectory(scratchDir);
 
     // --- create TWO real agents in the SAME directory ---
     const { runCommand: loggingRunCommand, log: callLog } = makeLoggingRunCommand();
@@ -164,8 +173,7 @@ async function main(): Promise<void> {
     if (singletonPidBefore === undefined) throw new Error("expected to find the claude daemon run singleton after launching two --bg sessions");
 
     // --- verify nothing written into the claimed directory BEFORE the stop ---
-    const dirStatMid = await stat(scratchDir);
-    const dirEntriesMid = await readdir(scratchDir);
+    const dirSnapshotMid = await snapshotDirectory(scratchDir);
 
     // --- THE STOP: turn agent A off ---
     log(`\n--- calling off() on agent A (${createdA.agent.id}) ---`);
@@ -203,13 +211,14 @@ async function main(): Promise<void> {
     const anySystemctl = callLog.some((c) => c.argv.join(" ").toLowerCase().includes("systemctl"));
     log(`any systemctl invocation during off(): ${anySystemctl} (expect false)`);
 
-    const dirStatAfterStop = await stat(scratchDir);
-    const dirEntriesAfterStop = await readdir(scratchDir);
-    log("\n=== nothing written into the claimed directory (item 7) ===");
-    log(`mtime unchanged (before create -> after stop): ${dirStatBefore.mtimeMs === dirStatAfterStop.mtimeMs}`);
-    log(`ctime unchanged (before create -> after stop): ${dirStatBefore.ctimeMs === dirStatAfterStop.ctimeMs}`);
-    log(`entries unchanged: ${JSON.stringify(dirEntriesBefore) === JSON.stringify(dirEntriesAfterStop)} (both: ${JSON.stringify(dirEntriesBefore)})`);
-    log(`(mid-point, right after both creates, for completeness: mtime ${dirStatBefore.mtimeMs === dirStatMid.mtimeMs}, entries ${JSON.stringify(dirEntriesBefore) === JSON.stringify(dirEntriesMid)})`);
+    const dirSnapshotAfterStop = await snapshotDirectory(scratchDir);
+    log("\n=== nothing written into the claimed directory (item 7, CORRECTED instrument) ===");
+    log("SCOPE, stated honestly: this proves bakr's OWN verbs/spawn-substrate wrote nothing into the claimed directory across this run. It does NOT claim anything about what a real attached agent's own conversation might legitimately write there — both agents here were launched with no prompt at all (B8), so nothing exercised that separate path either.");
+    log(`recursive content-sensitive snapshot, BEFORE create -> AFTER stop, identical: ${dirSnapshotBefore === dirSnapshotAfterStop} (expect true)`);
+    log(`(mid-point, right after both creates, for completeness: identical to BEFORE: ${dirSnapshotBefore === dirSnapshotMid})`);
+    log(`snapshot value (before): ${dirSnapshotBefore}`);
+    log(`snapshot value (after):  ${dirSnapshotAfterStop}`);
+    log("this instrument's own positive controls (new file / dotfile / subdirectory / deletion / in-place rewrite / nested rewrite) and negative control are demonstrated separately in test/unit/dir-snapshot.test.ts — all six mutation shapes are shown DETECTED there, which is what makes the 'identical' result above meaningful rather than a probe that would pass either way.");
 
     // Sanity asserts — fail loudly rather than let a misleading PASS print above.
     const problems: string[] = [];
@@ -222,7 +231,7 @@ async function main(): Promise<void> {
     if (singletonPidAfter === undefined || !isPidAlive(singletonPidAfter)) problems.push("singleton no longer alive");
     if (stopArgvCalls.length !== 1) problems.push(`expected exactly 1 stop call, got ${stopArgvCalls.length}`);
     if (anySystemctl) problems.push("a systemctl invocation was issued");
-    if (dirStatBefore.mtimeMs !== dirStatAfterStop.mtimeMs || JSON.stringify(dirEntriesBefore) !== JSON.stringify(dirEntriesAfterStop)) problems.push("claimed directory was modified");
+    if (dirSnapshotBefore !== dirSnapshotAfterStop) problems.push("claimed directory's recursive content-sensitive snapshot changed — bakr wrote into it");
 
     if (problems.length > 0) {
       throw new Error(`DEMONSTRATION FAILED: ${problems.join("; ")}`);

@@ -34,11 +34,24 @@ async function seedOffAgent(agentsPath: string): Promise<void> {
   await save(agentsPath, putAgent(emptyAgentStore(), agent));
 }
 
-async function runWorker(mode: "safe" | "broken", agentsPath: string): Promise<{ launched: boolean }> {
-  const proc = Bun.spawn(["bun", "run", WORKER_FIXTURE, mode, agentsPath, AGENT_ID, KEY], { stdout: "pipe", stderr: "pipe" });
+async function runWorker(mode: "safe" | "broken", agentsPath: string, targetStartEpochMs: number): Promise<{ launched: boolean }> {
+  const proc = Bun.spawn(["bun", "run", WORKER_FIXTURE, mode, agentsPath, AGENT_ID, KEY, String(targetStartEpochMs)], { stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   if (exitCode !== 0) throw new Error(`worker exited ${exitCode}\nstdout: ${stdout}\nstderr: ${stderr}`);
   return JSON.parse(stdout.trim());
+}
+
+/**
+ * A shared instant far enough in the future that every one of `CONTENDERS`
+ * `Bun.spawn`ed processes has certainly finished booting the JS runtime and
+ * is blocked in its own `waitUntil` by the time it arrives — even under the
+ * scheduling pressure of the full test suite running concurrently (this
+ * negative control was observed flaky at a fixed, unsynchronized sleep
+ * under that load; a shared start instant closes the gap structurally
+ * rather than by picking a bigger constant).
+ */
+function sharedStartInstant(): number {
+  return Date.now() + 1000;
 }
 
 describe("AC4: exactly one launch on `on` under real concurrent OS processes", () => {
@@ -48,7 +61,8 @@ describe("AC4: exactly one launch on `on` under real concurrent OS processes", (
       const agentsPath = join(dir, "agents.json");
       await seedOffAgent(agentsPath);
 
-      const results = await Promise.all(Array.from({ length: CONTENDERS }, () => runWorker("broken", agentsPath)));
+      const target = sharedStartInstant();
+      const results = await Promise.all(Array.from({ length: CONTENDERS }, () => runWorker("broken", agentsPath, target)));
       const launchedCount = results.filter((r) => r.launched).length;
 
       // The falsifier for THIS test: if the harness cannot make the broken
@@ -74,7 +88,8 @@ describe("AC4: exactly one launch on `on` under real concurrent OS processes", (
       const agentsPath = join(dir, "agents.json");
       await seedOffAgent(agentsPath);
 
-      const results = await Promise.all(Array.from({ length: CONTENDERS }, () => runWorker("safe", agentsPath)));
+      const target = sharedStartInstant();
+      const results = await Promise.all(Array.from({ length: CONTENDERS }, () => runWorker("safe", agentsPath, target)));
       const launchedCount = results.filter((r) => r.launched).length;
 
       expect(launchedCount).toBe(1);
