@@ -1,33 +1,41 @@
-// The daemon's own reconcile cycle and loop (BAKR-12, implementing story
-// BAKR-8). Wires together the claim store (BAKR-6, read-only from here —
-// nothing in this file ever claims or releases a directory) and the spawn
-// substrate (BAKR-7) via bakr's own session-slots store (see
-// session-slots.ts) to bring back, silently, every claimed directory's
-// on-sessions.
+// The daemon's own reconcile cycle and loop (BAKR-19, implementing story
+// BAKR-16). Rewired from session-slots.ts onto the agent store
+// (agent-model.ts / agent-store-io.ts / agent-store-migrate.ts) as the
+// single source of truth for lifecycle and membership (B1). Wires together
+// the claim store (BAKR-6, read-only from here — nothing in this file ever
+// claims or releases a directory) and the spawn substrate (BAKR-7).
 //
-// Structured like brooswit-factory/candlestix's own src/supervisor.ts
-// (verified at candlestix's commit 3801992aae149271e273a3ee48247978b1df6e8c):
-// one listing per cycle, a per-item try/catch so one bad item costs only
-// itself, and a cycle-level try/catch in the loop (below) so one bad cycle
-// costs only itself — ported as a *pattern*, not literal code, since this
-// module's decision shape (restore vs. heartbeat) differs from candlestix's
-// own reconcile.ts.
+// B7: this loop restores only `on` agents and stays spawn-only — there is
+// NO action anywhere in this file that means "stop". An `off` or `archived`
+// agent is never launched. A live session this loop did not expect is never
+// touched.
 //
-// Every launch this file issues goes through spawn/launch.ts's own
-// systemd-run --user --scope wrapper — this file never constructs a `claude
-// --bg` invocation itself, and never stops or resolves a session by
-// directory (BAKR-8's hazard rules).
+// R-F (B12): every mutation of the agent store goes through
+// `withAgentStoreLock` (agent-store-io.ts), which re-reads fresh state
+// INSIDE the lock before applying a change — this file never threads a
+// single top-of-cycle snapshot through multiple later saves the way the old
+// session-slots-based cycle did. AMENDED (R-F.3): for every per-agent
+// decision that leads to a write (begin a launch, reset a retry count, give
+// up), the DECISION itself — not only the write — is re-derived from that
+// same fresh, lock-held read. An outer, unlocked read is used only to
+// enumerate WHICH agent ids to consider this cycle and for logging; it is
+// never trusted for the actual mutation, which always re-checks against the
+// freshest state at the moment it commits.
 
 import { load as loadClaims } from "./claim-store-io";
 import { list as listClaims, emptyStore, type ClaimStoreState } from "./claim-model";
-import { load as loadSlots, save as saveSlots } from "./session-slots-store";
+import { loadOrMigrateAgentStore } from "./agent-store-migrate";
+import { load as loadAgents, withAgentStoreLock } from "./agent-store-io";
 import {
-  emptySessionSlots,
-  slotsOn,
+  type AgentStoreState,
+  emptyAgentStore,
+  agentsInDirectory,
   beginLaunch,
   markLaunchStarted,
   markLaunchFailed,
   resolveLaunch,
+  resolvePendingCreation,
+  mintUniqueAgentId,
   pendingLaunches,
   unresolvedLaunches,
   hasLaunchRecordFor,
@@ -35,325 +43,394 @@ import {
   restoreAttemptCount,
   recordRestoreAttempt,
   resetRestoreAttempts,
-  type SessionSlotsState,
-} from "./session-slots";
-import { listBackgroundSessions, decideLiveness, isPidAlive, launch, type RunCommand } from "./spawn";
+} from "./agent-model";
+import { listBackgroundSessions, decideLiveness, isPidAlive, launch, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import type { ClaimKey } from "./claim-key-resolve";
 import { log } from "./log";
 
-/**
- * A small number, per the story's own reviewer: enough that one slow
- * listing or one transient hiccup doesn't trip it, small enough that the
- * live incident this bound closes — an unbounded spawn loop when a resume
- * silently fails (ticket measurement 5) — costs at most this many process
- * spawns per slot (keyed by its own durable session id — BAKR-13 defect 1),
- * ever, rather than continuing indefinitely. See the bound's own call site
- * for the full incident writeup.
- */
+/** See session-slots.ts's own module comment for the live incident this bound closes — ported unchanged. Now counted per AGENT id (R-C), not per durable session id. */
 const MAX_CONSECUTIVE_UNVERIFIED_RESTORES = 3;
 
 export interface DaemonDeps {
   readonly runCommand: RunCommand;
   readonly claimsPath: string;
+  readonly agentsPath: string;
   readonly sessionSlotsPath: string;
   readonly now: () => number;
   readonly generateAttemptId: () => string;
+  readonly randomBytes: (byteLength: number) => Uint8Array;
+  readonly acquireTimeoutMs?: number;
 }
 
 export interface DaemonState {
   readonly claimDegraded: boolean;
-  readonly sessionSlotsDegraded: boolean;
+  /** Covers BOTH a malformed `agents.json` and a malformed `session-slots.json` discovered while `agents.json` was still absent (R-A.1) — either way, this run never writes the agent store again. */
+  readonly agentsDegraded: boolean;
 }
 
 export function initialDaemonState(): DaemonState {
-  return { claimDegraded: false, sessionSlotsDegraded: false };
+  return { claimDegraded: false, agentsDegraded: false };
 }
 
-interface LoadedStores {
+function lockOpts(deps: DaemonDeps): { acquireTimeoutMs?: number } {
+  const opts: { acquireTimeoutMs?: number } = {};
+  if (deps.acquireTimeoutMs !== undefined) opts.acquireTimeoutMs = deps.acquireTimeoutMs;
+  return opts;
+}
+
+interface LoadedForCycle {
   readonly claimState: ClaimStoreState;
-  readonly sessionSlotsState: SessionSlotsState;
+  readonly agentState: AgentStoreState;
   readonly claimDegraded: boolean;
-  readonly sessionSlotsDegraded: boolean;
+  readonly agentsDegraded: boolean;
+  readonly agentsDegradedError?: string;
 }
 
 /**
- * Loads both of bakr's own stores fresh from disk. Constraint 3 (BAKR-8):
- * `missing` is a SUCCESS (first run — empty, starts normally); `malformed`
- * degrades that store for the rest of this process's life — see
- * `runReconcileCycle`, which never calls this again once a prior cycle
- * already returned a degraded flag, so a degraded store is never re-read
- * and never re-considered "maybe fine now." The session slots store gets
- * the identical discipline as the claim store, for the identical reason —
- * see session-slots-store.ts's own module comment for why it is in the
- * same unreconstructable-from-nothing position the claim store is in.
+ * Loads the claim store (read-only, unchanged discipline) and the agent
+ * store — via `loadOrMigrateAgentStore`, which itself implements R-A.1 (a
+ * malformed `agents.json` is never treated as absent, and never falls back
+ * to reading `session-slots.json`) and the one-time, lock-protected
+ * migration (R-A). Constraint 3: `missing` is a success; `malformed`
+ * degrades for the rest of this process's life.
  */
-async function loadStores(deps: DaemonDeps): Promise<LoadedStores> {
+async function loadStores(deps: DaemonDeps): Promise<LoadedForCycle> {
   const claimResult = await loadClaims(deps.claimsPath);
   let claimState: ClaimStoreState;
   let claimDegraded = false;
   if (claimResult.status === "malformed") {
     claimDegraded = true;
     claimState = emptyStore();
-    log(
-      "error",
-      `claim store at "${deps.claimsPath}" is malformed: ${claimResult.error} — starting/continuing degraded: restoring nothing, never writing to this file for the life of this process (BAKR-8 Constraint 3)`
-    );
+    log("error", `claim store at "${deps.claimsPath}" is malformed: ${claimResult.error} — starting/continuing degraded: restoring nothing, never writing to this file for the life of this process (BAKR-8 Constraint 3)`);
   } else if (claimResult.status === "missing") {
     claimState = emptyStore();
   } else {
     claimState = claimResult.state;
   }
 
-  const slotsResult = await loadSlots(deps.sessionSlotsPath);
-  let sessionSlotsState: SessionSlotsState;
-  let sessionSlotsDegraded = false;
-  if (slotsResult.status === "malformed") {
-    sessionSlotsDegraded = true;
-    sessionSlotsState = emptySessionSlots();
+  const agentsOutcome = await loadOrMigrateAgentStore({
+    agentsPath: deps.agentsPath,
+    sessionSlotsPath: deps.sessionSlotsPath,
+    now: deps.now,
+    randomBytes: deps.randomBytes,
+  });
+
+  if (agentsOutcome.status === "malformed") {
     log(
       "error",
-      `session slots store at "${deps.sessionSlotsPath}" is malformed: ${slotsResult.error} — starting/continuing degraded: restoring nothing, never writing to this file for the life of this process (same discipline as Constraint 3, applied to bakr's own store)`
+      `agent store degraded: ${agentsOutcome.source === "agents" ? `"${deps.agentsPath}"` : `"${deps.sessionSlotsPath}" (read while migrating — "${deps.agentsPath}" was genuinely absent)`} is malformed: ${agentsOutcome.error} — starting/continuing degraded: restoring nothing, never writing to "${deps.agentsPath}" for the life of this process (BAKR-19 R-A.1 / BAKR-8 Constraint 3). ${agentsOutcome.source === "session-slots" ? "A malformed agents.json is NEVER treated as absent, so this path is only reachable when agents.json itself was genuinely missing — session-slots.json is never read as a fallback for a malformed agents.json." : ""}`
     );
-  } else if (slotsResult.status === "missing") {
-    sessionSlotsState = emptySessionSlots();
-  } else {
-    sessionSlotsState = slotsResult.state;
+    return { claimState, agentState: emptyAgentStore(), claimDegraded, agentsDegraded: true, agentsDegradedError: agentsOutcome.error };
   }
 
-  return { claimState, sessionSlotsState, claimDegraded, sessionSlotsDegraded };
+  if (agentsOutcome.status === "migrated") {
+    log(
+      "info",
+      `migrated ${agentsOutcome.summary.agentsCreated} agent(s) from "${deps.sessionSlotsPath}" into "${deps.agentsPath}" across ${agentsOutcome.summary.directories.length} director${agentsOutcome.summary.directories.length === 1 ? "y" : "ies"}: ${JSON.stringify(agentsOutcome.summary.directories)}. This is a one-time migration — a later load reads "${deps.agentsPath}" directly and mints nothing further.`
+    );
+  }
+
+  return { claimState, agentState: agentsOutcome.state, claimDegraded, agentsDegraded: false };
 }
 
 export interface ReconcileResult {
   readonly claimDegraded: boolean;
-  readonly sessionSlotsDegraded: boolean;
-  readonly restored: readonly { readonly key: ClaimKey; readonly sessionId: string }[];
+  readonly agentsDegraded: boolean;
+  /** `sessionId` is the durable id being resumed for a restore, or `undefined` for a fresh launch (no prior session) — see AC4/AC2. `key` is reported as an ATTRIBUTE only, never used to identify the agent (B2). */
+  readonly restored: readonly { readonly agentId: string; readonly key: ClaimKey; readonly sessionId: string | undefined }[];
   readonly skippedListingFailed: boolean;
 }
 
+/** Promotes any launch record left wedged by a crash mid-`launch()` in a PRIOR run — see agent-model.ts's own `promoteUnresolvableLaunches` doc, ported unchanged in spirit, rekeyed to agent id. One locked mutation; a no-op save is skipped. */
+async function promoteWedgedLaunches(deps: DaemonDeps): Promise<{ malformed: boolean; error?: string }> {
+  const result = await withAgentStoreLock(
+    deps.agentsPath,
+    (current) => {
+      const wedged = current.launches.filter((l) => l.launchShortId === undefined && l.error === undefined);
+      if (wedged.length === 0) {
+        return { state: current, result: [] as typeof wedged };
+      }
+      const next = promoteUnresolvableLaunches(
+        current,
+        "the daemon process ended before this launch's outcome was recorded (crashed, or was killed, mid-launch) — cannot distinguish never-detached from detached-then-the-wrapper-failed (BAKR-8 Constraint 2)"
+      );
+      return { state: next, result: wedged };
+    },
+    lockOpts(deps)
+  );
+  if (result.status === "malformed") return { malformed: true, error: result.error };
+  for (const record of result.result) {
+    log(
+      "error",
+      `recovered an unresolvable launch record for agent ${record.agentId} in "${record.key}" (attempt ${record.attemptId}, ${new Date(record.attemptedAt).toISOString()}) left by a prior run that ended mid-launch — marked permanently unresolved, never retried automatically (BAKR-8 Constraint 2)`
+    );
+  }
+  return { malformed: false };
+}
+
 /**
- * One reconcile cycle. Re-reads both stores fresh from disk on every call
- * (so a directory claimed, or a session put "on", after this process
- * started is picked up without a restart) UNLESS `prior` already carries a
- * degraded flag, in which case this function does not touch disk at all
- * this cycle beyond logging — once degraded, always degraded for this
- * process's life, exactly per Constraint 3, with no flip-flopping if the
- * file happens to parse cleanly on some later read.
+ * Resolves any pending launches (fresh or restore) whose short id appears in
+ * THIS cycle's listing — one locked mutation, using the listing already
+ * fetched this cycle rather than issuing a second one. Also resolves
+ * migration-recovered `pendingCreations` (R-C.3 case 3) the identical way,
+ * except a match there MINTS a brand-new agent rather than updating an
+ * existing one — see `resolvePendingCreation`'s own doc for why that is the
+ * one place in this store a resolution creates an agent as a side effect.
+ */
+async function resolvePendingLaunches(deps: DaemonDeps, sessions: readonly BackgroundSessionInfo[]): Promise<{ malformed: boolean; error?: string }> {
+  const result = await withAgentStoreLock(
+    deps.agentsPath,
+    (current) => {
+      let next = current;
+      const resolvedInfo: { attemptId: string; agentId: string; key: ClaimKey; launchShortId: string; sessionId: string; priorSessionId: string | undefined }[] = [];
+      for (const pending of pendingLaunches(next)) {
+        if (pending.launchShortId === undefined) continue;
+        const found = sessions.find((s) => s.id === pending.launchShortId);
+        if (found === undefined) continue;
+        next = resolveLaunch(next, pending.launchShortId, found.sessionId);
+        resolvedInfo.push({ attemptId: pending.attemptId, agentId: pending.agentId, key: pending.key, launchShortId: pending.launchShortId, sessionId: found.sessionId, priorSessionId: pending.priorSessionId });
+      }
+
+      const createdInfo: { attemptId: string; key: ClaimKey; launchShortId: string; sessionId: string; agentId: string }[] = [];
+      for (const pendingCreation of next.pendingCreations) {
+        const found = sessions.find((s) => s.id === pendingCreation.launchShortId);
+        if (found === undefined) continue;
+        const beforeIds = new Set(Object.keys(next.agents));
+        next = resolvePendingCreation(next, pendingCreation.launchShortId, found.sessionId, () => mintUniqueAgentId(next, deps.randomBytes), deps.now());
+        const newId = Object.keys(next.agents).find((id) => !beforeIds.has(id));
+        if (newId !== undefined) {
+          createdInfo.push({ attemptId: pendingCreation.attemptId, key: pendingCreation.key, launchShortId: pendingCreation.launchShortId, sessionId: found.sessionId, agentId: newId });
+        }
+      }
+
+      return { state: next, result: { resolvedInfo, createdInfo } };
+    },
+    lockOpts(deps)
+  );
+  if (result.status === "malformed") return { malformed: true, error: result.error };
+  for (const info of result.result.resolvedInfo) {
+    log(
+      "info",
+      `resolved launch attempt ${info.attemptId} for agent ${info.agentId} in "${info.key}": short id ${info.launchShortId} -> live session ${info.sessionId}${info.priorSessionId !== undefined ? ` (durable id ${info.priorSessionId} unchanged)` : " (new agent session)"}`
+    );
+  }
+  for (const info of result.result.createdInfo) {
+    log(
+      "info",
+      `R-C.3 case 3: migration-recovered pending creation (attempt ${info.attemptId}) in "${info.key}" resolved: short id ${info.launchShortId} -> minted NEW unnamed agent ${info.agentId} holding session ${info.sessionId}`
+    );
+  }
+  return { malformed: false };
+}
+
+export type AgentDecision =
+  | { readonly kind: "skip" }
+  | { readonly kind: "reset" }
+  | { readonly kind: "alive" }
+  | { readonly kind: "not-verifiable"; readonly reason: string }
+  | { readonly kind: "give-up"; readonly attemptsSoFar: number; readonly sessionId: string }
+  | { readonly kind: "begin-fresh-launch"; readonly attemptId: string }
+  | { readonly kind: "begin-restore-launch"; readonly attemptId: string; readonly sessionId: string };
+
+/**
+ * ONE agent's reconcile decision AND its write, made inside a SINGLE lock
+ * hold (AMENDED R-F.3 / AC15) — this is what closes the "decided X is on,
+ * an operator turns it off before beginLaunch runs" race a lock around the
+ * write alone cannot close. Never holds the lock across `launch()` (R-F):
+ * that call happens afterward, unlocked, and its outcome is recorded in a
+ * SECOND, separate locked mutation.
  *
- * Exactly ONE `claude agents --json` listing per cycle (via
- * `listBackgroundSessions`), never one per claimed directory or per
- * on-session — required by the ticket's own scope.
- *
- * A listing failure (including Constraint 1's hardened systematic-failure
- * throw in spawn/parse.ts) makes the WHOLE cycle a no-op with a loud log —
- * never a relaunch, because "the listing failed" and "nothing is running"
- * must never be treated the same way (Constraint 1).
- *
- * Nothing here resolves, adopts, or restores a session by matching its
- * directory alone — every decision is keyed by the claim store's own keys
- * and the session-slots store's own recorded session ids, cross-checked
- * against the listing by session id (or, for in-flight launches, by the
- * short id `launch()` itself returned).
+ * EXPORTED (review, PR #13): AC14's two-process demonstration
+ * (test/integration/agent-decide-race.test.ts) calls this function
+ * directly rather than a hand-written replica of its discipline, so the
+ * test binds to the actual shipped decision boundary and regresses if a
+ * future edit ever moves the read outside the lock.
+ */
+export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, key: ClaimKey, sessions: readonly BackgroundSessionInfo[]): Promise<{ malformed: boolean; error?: string; decision?: AgentDecision }> {
+  const result = await withAgentStoreLock<AgentDecision>(
+    deps.agentsPath,
+    (current) => {
+      const agent = current.agents[agentId];
+      if (agent === undefined || agent.state !== "on") {
+        return { state: current, result: { kind: "skip" } };
+      }
+
+      if (agent.durableSessionId === undefined) {
+        if (hasLaunchRecordFor(current, agentId, undefined)) {
+          return { state: current, result: { kind: "skip" } };
+        }
+        const attemptId = deps.generateAttemptId();
+        const next = beginLaunch(current, agentId, key, undefined, attemptId, deps.now());
+        return { state: next, result: { kind: "begin-fresh-launch", attemptId } };
+      }
+
+      const sessionId = agent.durableSessionId;
+      if (hasLaunchRecordFor(current, agentId, sessionId)) {
+        return { state: current, result: { kind: "skip" } };
+      }
+
+      const entry = sessions.find((s) => s.sessionId === agent.liveSessionId);
+      const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
+      const verdict = decideLiveness(agent.liveSessionId ?? sessionId, entry, pidVerifiedAlive);
+
+      if (verdict.status === "alive") {
+        if (restoreAttemptCount(current, agentId) > 0) {
+          return { state: resetRestoreAttempts(current, agentId), result: { kind: "reset" } };
+        }
+        return { state: current, result: { kind: "alive" } };
+      }
+      if (verdict.status === "not-verifiable") {
+        return { state: current, result: { kind: "not-verifiable", reason: verdict.reason } };
+      }
+
+      const attemptsSoFar = restoreAttemptCount(current, agentId);
+      if (attemptsSoFar >= MAX_CONSECUTIVE_UNVERIFIED_RESTORES) {
+        const giveUpAttemptId = deps.generateAttemptId();
+        let next = beginLaunch(current, agentId, key, sessionId, giveUpAttemptId, deps.now());
+        next = markLaunchFailed(
+          next,
+          giveUpAttemptId,
+          `gave up after ${attemptsSoFar} consecutive restore attempts for this agent, none independently verified alive — likely a silently-failing resume (ticket measurement 5); never retried automatically (BAKR-8 Constraint 2)`
+        );
+        return { state: next, result: { kind: "give-up", attemptsSoFar, sessionId } };
+      }
+
+      const attemptId = deps.generateAttemptId();
+      let next = beginLaunch(current, agentId, key, sessionId, attemptId, deps.now());
+      next = recordRestoreAttempt(next, agentId);
+      return { state: next, result: { kind: "begin-restore-launch", attemptId, sessionId } };
+    },
+    lockOpts(deps)
+  );
+
+  if (result.status === "malformed") return { malformed: true, error: result.error };
+  return { malformed: false, decision: result.result };
+}
+
+/** Records `launch()`'s outcome — a SECOND, separate locked mutation, never sharing a lock hold with `launch()` itself (R-F: never hold the lock across launch()). */
+async function recordLaunchOutcome(deps: DaemonDeps, attemptId: string, outcome: { ok: true; id: string } | { ok: false; error: string }): Promise<void> {
+  await withAgentStoreLock(
+    deps.agentsPath,
+    (current) => ({
+      state: outcome.ok ? markLaunchStarted(current, attemptId, outcome.id) : markLaunchFailed(current, attemptId, outcome.error),
+      result: undefined,
+    }),
+    lockOpts(deps)
+  );
+}
+
+/**
+ * One reconcile cycle. See the module comment for the R-F.3 discipline this
+ * function's per-agent helper enforces. Exactly ONE `claude agents --json`
+ * listing per cycle. A listing failure makes the WHOLE cycle a no-op with a
+ * loud log (BAKR-8 Constraint 1). Only `on` agents are ever considered for
+ * launch (B7) — an `off` or `archived` agent is never touched, and there is
+ * no code path in this file that stops anything.
  */
 export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): Promise<ReconcileResult> {
-  if (prior.claimDegraded || prior.sessionSlotsDegraded) {
+  if (prior.claimDegraded || prior.agentsDegraded) {
     const parts: string[] = [];
     if (prior.claimDegraded) parts.push(`claim store "${deps.claimsPath}" is malformed`);
-    if (prior.sessionSlotsDegraded) parts.push(`session slots store "${deps.sessionSlotsPath}" is malformed`);
+    if (prior.agentsDegraded) parts.push(`agent store at "${deps.agentsPath}" (or its pre-migration session-slots.json) is malformed`);
     log("error", `reconcile skipped this cycle: ${parts.join("; ")} — this process will never write to the affected file(s); restart after repairing on disk`);
-    return { claimDegraded: prior.claimDegraded, sessionSlotsDegraded: prior.sessionSlotsDegraded, restored: [], skippedListingFailed: false };
+    return { claimDegraded: prior.claimDegraded, agentsDegraded: prior.agentsDegraded, restored: [], skippedListingFailed: false };
   }
 
-  const { claimState, sessionSlotsState: loadedSlots, claimDegraded, sessionSlotsDegraded } = await loadStores(deps);
-  if (claimDegraded || sessionSlotsDegraded) {
-    return { claimDegraded, sessionSlotsDegraded, restored: [], skippedListingFailed: false };
+  const { claimState, claimDegraded, agentsDegraded } = await loadStores(deps);
+  if (claimDegraded || agentsDegraded) {
+    return { claimDegraded, agentsDegraded, restored: [], skippedListingFailed: false };
   }
 
-  let sessionSlotsState = loadedSlots;
-
-  // A record still missing BOTH `launchShortId` and `error` can only be a
-  // leftover from a crash mid-`launch()` in a PRIOR run of this process
-  // (see promoteUnresolvableLaunches's own doc for why this is safe to do
-  // unconditionally on every load) — promote it to permanently unresolved
-  // BEFORE anything else touches the store this cycle, so it is reported
-  // rather than silently wedged forever (review fix, BAKR-12 PR #7:
-  // without this, such a record was neither resolvable, nor restorable,
-  // nor ever logged).
-  const wedgedRecords = sessionSlotsState.launches.filter((l) => l.launchShortId === undefined && l.error === undefined);
-  if (wedgedRecords.length > 0) {
-    sessionSlotsState = promoteUnresolvableLaunches(
-      sessionSlotsState,
-      "the daemon process ended before this launch's outcome was recorded (crashed, or was killed, mid-launch) — cannot distinguish never-detached from detached-then-the-wrapper-failed (BAKR-8 Constraint 2)"
-    );
-    await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
-    for (const record of wedgedRecords) {
-      log(
-        "error",
-        `recovered an unresolvable launch record for "${record.key}" (attempt ${record.attemptId}, ${new Date(record.attemptedAt).toISOString()}) left by a prior run that ended mid-launch — marked permanently unresolved, never retried automatically (BAKR-8 Constraint 2)`
-      );
-    }
+  const promoted = await promoteWedgedLaunches(deps);
+  if (promoted.malformed) {
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false };
   }
 
-  let sessions;
+  let sessions: BackgroundSessionInfo[];
   try {
     sessions = await listBackgroundSessions({ runCommand: deps.runCommand });
   } catch (err) {
     log(
       "error",
-      `reconcile skipped this cycle: \`claude agents --json\` listing failed: ${
-        err instanceof Error ? err.message : String(err)
-      } — never treated as "nothing running"; no restore is issued this cycle (BAKR-8 Constraint 1)`
+      `reconcile skipped this cycle: \`claude agents --json\` listing failed: ${err instanceof Error ? err.message : String(err)} — never treated as "nothing running"; no restore is issued this cycle (BAKR-8 Constraint 1)`
     );
-    return { claimDegraded: false, sessionSlotsDegraded: false, restored: [], skippedListingFailed: true };
+    return { claimDegraded: false, agentsDegraded: false, restored: [], skippedListingFailed: true };
   }
 
-  // Resolve any launches (fresh or restore alike) still awaiting a listing
-  // that reveals their real session id, using THIS cycle's listing rather
-  // than issuing a second one.
-  let slotsChangedThisPass = false;
-  for (const pending of pendingLaunches(sessionSlotsState)) {
-    if (pending.launchShortId === undefined) continue; // launch() has not returned yet this cycle
-    const found = sessions.find((s) => s.id === pending.launchShortId);
-    if (found === undefined) continue; // not listed yet — try again next cycle
-    sessionSlotsState = resolveLaunch(sessionSlotsState, pending.launchShortId, found.sessionId);
-    slotsChangedThisPass = true;
-    log(
-      "info",
-      `resolved launch attempt ${pending.attemptId} for "${pending.key}": short id ${pending.launchShortId} -> live session ${found.sessionId}${pending.priorSessionId !== undefined ? ` (durable id ${pending.priorSessionId} unchanged)` : " (new slot)"}`
-    );
+  const resolved = await resolvePendingLaunches(deps, sessions);
+  if (resolved.malformed) {
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false };
   }
 
-  for (const unresolved of unresolvedLaunches(sessionSlotsState)) {
+  // A fresh, unlocked peek to enumerate WHICH agent ids to consider this
+  // cycle and to log currently-pending/unresolved launches. Never trusted
+  // for a mutation decision — each per-agent decision below re-derives
+  // itself from a lock-fresh read (R-F.3).
+  const peeked = await loadAgents(deps.agentsPath);
+  if (peeked.status === "malformed") {
+    log("error", `agent store at "${deps.agentsPath}" became malformed mid-cycle: ${peeked.error} — degrading for the rest of this process's life`);
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false };
+  }
+  const peekedState = peeked.status === "loaded" ? peeked.state : emptyAgentStore();
+
+  for (const unresolved of unresolvedLaunches(peekedState)) {
     log(
       "error",
-      `unresolved launch for "${unresolved.key}" (attempt ${unresolved.attemptId}, ${new Date(unresolved.attemptedAt).toISOString()}): ${
-        unresolved.error
-      } — possibly orphaned; never retried automatically, never adopted by directory (BAKR-8 Constraint 2)`
+      `unresolved launch for agent ${unresolved.agentId} in "${unresolved.key}" (attempt ${unresolved.attemptId}, ${new Date(unresolved.attemptedAt).toISOString()}): ${unresolved.error} — possibly orphaned; never retried automatically, never resolved by directory (BAKR-8 Constraint 2)`
     );
   }
 
-  if (slotsChangedThisPass) {
-    await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
-  }
+  const restored: { agentId: string; key: ClaimKey; sessionId: string | undefined }[] = [];
 
-  const restored: { key: ClaimKey; sessionId: string }[] = [];
   for (const claimEntry of listClaims(claimState)) {
     const key = claimEntry.key;
-    for (const slot of slotsOn(sessionSlotsState, key)) {
-      const sessionId = slot.durableSessionId; // what --resume always takes, and what identifies this slot across its whole life (see session-slots.ts's own module comment on why this is split from liveSessionId)
-      if (hasLaunchRecordFor(sessionSlotsState, key, sessionId)) {
-        // A launch for exactly this DURABLE session is already in flight
-        // (pending resolution) or permanently unresolved (Constraint 2) —
-        // either way, the slot will not change until that record
-        // resolves, so without this guard every cycle in between would
-        // look identical to "never restored" and attempt a duplicate
-        // launch. Already logged above (pendingLaunches / unresolvedLaunches
-        // loops).
-        continue;
+    const onAgents = agentsInDirectory(peekedState, key).filter((a) => a.state === "on");
+    for (const agent of onAgents) {
+      const outcome = await decideAndBeginForAgent(deps, agent.id, key, sessions);
+      if (outcome.malformed) {
+        return { claimDegraded: false, agentsDegraded: true, restored, skippedListingFailed: false };
       }
-      // Liveness is checked against the LIVE id (the last one a listing
-      // actually reported), never the durable one — a listing reports
-      // claude's current, possibly-rotated session id, not the
-      // conversation's own stable identity.
-      const entry = sessions.find((s) => s.sessionId === slot.liveSessionId);
-      const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
-      const verdict = decideLiveness(slot.liveSessionId, entry, pidVerifiedAlive);
+      const decision = outcome.decision as AgentDecision;
 
-      if (verdict.status === "alive") {
-        if (restoreAttemptCount(sessionSlotsState, sessionId) > 0) {
-          // The saga bounded retry exists to interrupt is over: THIS SLOT
-          // (keyed by its own durable session id, not the directory —
-          // BAKR-13 defect 1) has a verified-alive session again. Reset so
-          // a future, unrelated failure gets the full retry budget. Keying
-          // by durable session id rather than by `key` (the claimed
-          // directory) is what keeps this reset from also wiping a
-          // FAILING sibling slot's count in the same directory — that
-          // sibling's count lives under its own durable session id and is
-          // untouched here.
-          sessionSlotsState = resetRestoreAttempts(sessionSlotsState, sessionId);
-          await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
-        }
+      if (decision.kind === "skip" || decision.kind === "alive" || decision.kind === "reset") {
         continue;
       }
-      if (verdict.status === "not-verifiable") {
-        log("warn", `"${key}": session ${sessionId} ${verdict.reason} — not restoring this cycle to avoid a duplicate; re-checked next cycle`);
+      if (decision.kind === "not-verifiable") {
+        log("warn", `agent ${agent.id} in "${key}": session ${agent.liveSessionId ?? agent.durableSessionId} ${decision.reason} — not restoring this cycle to avoid a duplicate; re-checked next cycle`);
         continue;
       }
-
-      // verdict.status === "unknown": genuinely absent from a listing that
-      // ITSELF succeeded this cycle (the listing-failed case already
-      // returned above) — this is the one case Constraint 1 says "may lead
-      // to a restore."
-      //
-      // BUT: a resume can "succeed" at the `launch()` surface — exit 0,
-      // print an ordinary `backgrounded · <id>` line — while actually being
-      // the ticket's own measurement 5: a silent, empty session with no
-      // real conversation. Before the durable/live split (session-slots.ts's
-      // own module comment), `resolveLaunch` could not tell the difference
-      // and overwrote the on-record id with the just-rotated, possibly-
-      // unresumable one — live incident, BAKR-12 PR #9: resuming that
-      // rotated id then failed outright ("No conversation found"), so the
-      // slot became permanently unrestorable by the very act of a
-      // "successful" restore, and the next cycle's "absent" reading
-      // relaunched it again, forever. `durableSessionId` no longer moves,
-      // which fixes the identity half of this; this bound is the
-      // convergence half, kept as an independent line of defence because a
-      // resume can still keep failing for a durable id too (measurement 5
-      // doesn't say why, and neither do we).
-      //
-      // The bound: after MAX_CONSECUTIVE_UNVERIFIED_RESTORES restore
-      // attempts for THIS SLOT's own durable session id (BAKR-13 defect 1
-      // — was keyed by claimed directory; see restoreAttemptCounts's own
-      // doc for why that let an alive sibling slot defeat the bound) with
-      // none independently verified alive in between, give up on the
-      // CURRENT on-record id rather than issuing another launch. This is
-      // deliberately the "bound it" option the story's reviewer offered
-      // rather than "detect it" (reading claude's own
-      // `~/.claude/jobs/<id>/state.json`): it does not depend on an
-      // undocumented internal shape, and per the reviewer's own framing,
-      // the loop is a defect regardless of how often — or why — a resume
-      // actually fails, so bounding closes it without needing to know why.
-      const attemptsSoFar = restoreAttemptCount(sessionSlotsState, sessionId);
-      if (attemptsSoFar >= MAX_CONSECUTIVE_UNVERIFIED_RESTORES) {
-        const giveUpAttemptId = deps.generateAttemptId();
-        sessionSlotsState = beginLaunch(sessionSlotsState, key, sessionId, giveUpAttemptId, deps.now());
-        sessionSlotsState = markLaunchFailed(
-          sessionSlotsState,
-          giveUpAttemptId,
-          `gave up after ${attemptsSoFar} consecutive restore attempts for this session, none independently verified alive — likely a silently-failing resume (ticket measurement 5); never retried automatically (BAKR-8 Constraint 2)`
-        );
-        await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
+      if (decision.kind === "give-up") {
         log(
           "error",
-          `"${key}": giving up on restoring session ${sessionId} after ${attemptsSoFar} consecutive unverified restore attempts — the daemon must converge, not spawn unboundedly; see the unresolved-launch log for this attempt`
+          `agent ${agent.id} in "${key}": giving up on restoring session ${decision.sessionId} after ${decision.attemptsSoFar} consecutive unverified restore attempts — the daemon must converge, not spawn unboundedly; see the unresolved-launch log for this attempt`
         );
         continue;
       }
 
-      const attemptId = deps.generateAttemptId();
-      sessionSlotsState = beginLaunch(sessionSlotsState, key, sessionId, attemptId, deps.now());
-      sessionSlotsState = recordRestoreAttempt(sessionSlotsState, sessionId);
-      // Persisted BEFORE launch() is invoked — Constraint 2's "record the
-      // intent to launch before invoking launch(), and persist it," so a
-      // daemon crash mid-launch still leaves a durable trace.
-      await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
-
-      const result = await launch(key, ["--resume", sessionId], { runCommand: deps.runCommand });
-      if (result.ok) {
-        sessionSlotsState = markLaunchStarted(sessionSlotsState, attemptId, result.id);
-        log("info", `"${key}": restore launched, resuming durable session ${sessionId} -> short id ${result.id}; awaiting a future listing to learn its (possibly-rotated) live session id`);
-        restored.push({ key, sessionId });
+      // begin-fresh-launch or begin-restore-launch: the write already
+      // landed inside the same lock hold as the decision (R-F.3). Now
+      // launch() runs UNLOCKED (R-F: never hold the lock across it).
+      const claudeArgs = decision.kind === "begin-restore-launch" ? ["--resume", decision.sessionId] : [];
+      const launchResult = await launch(key, claudeArgs, { runCommand: deps.runCommand });
+      if (launchResult.ok) {
+        await recordLaunchOutcome(deps, decision.attemptId, launchResult);
+        const sessionId = decision.kind === "begin-restore-launch" ? decision.sessionId : undefined;
+        log(
+          "info",
+          `agent ${agent.id} in "${key}": ${decision.kind === "begin-restore-launch" ? `restore launched, resuming durable session ${decision.sessionId}` : "fresh launch issued"} -> short id ${launchResult.id}; awaiting a future listing to learn its session id`
+        );
+        restored.push({ agentId: agent.id, key, sessionId });
       } else {
-        sessionSlotsState = markLaunchFailed(sessionSlotsState, attemptId, result.error);
+        await recordLaunchOutcome(deps, decision.attemptId, launchResult);
         log(
           "error",
-          `"${key}": restore launch for session ${sessionId} failed: ${result.error} — cannot distinguish "never detached" from "detached, then the wrapper failed"; treated as possibly orphaned, recorded as unresolved, never retried automatically (BAKR-8 Constraint 2)`
+          `agent ${agent.id} in "${key}": launch failed: ${launchResult.error} — cannot distinguish "never detached" from "detached, then the wrapper failed"; treated as possibly orphaned, recorded as unresolved, never retried automatically (BAKR-8 Constraint 2)`
         );
       }
-      await saveSlots(deps.sessionSlotsPath, sessionSlotsState);
     }
   }
 
-  return { claimDegraded: false, sessionSlotsDegraded: false, restored, skippedListingFailed: false };
+  return { claimDegraded: false, agentsDegraded: false, restored, skippedListingFailed: false };
 }
 
 export interface DaemonLoopOptions {
@@ -377,23 +454,16 @@ function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
 
 /**
  * The daemon's own loop: reconcile, sleep, repeat, forever (or until
- * `options.signal` aborts — used by tests and by a clean programmatic
- * stop; the real systemd unit stops this process the ordinary way, by
- * signalling it, which `Restart=on-failure` then brings back per the unit
- * file). A single cycle throwing is caught and logged, never crashing the
- * daemon and never skipping the cycles after it — see this file's own
- * module comment for the candlestix pattern this mirrors.
+ * `options.signal` aborts). A single cycle throwing is caught and logged,
+ * never crashing the daemon and never skipping the cycles after it.
  */
 export async function runDaemonLoop(deps: DaemonDeps, options: DaemonLoopOptions): Promise<void> {
   let state: DaemonState = initialDaemonState();
-  log(
-    "info",
-    `bakr daemon starting: claims="${deps.claimsPath}" session-slots="${deps.sessionSlotsPath}" interval=${options.intervalMs}ms`
-  );
+  log("info", `bakr daemon starting: claims="${deps.claimsPath}" agents="${deps.agentsPath}" interval=${options.intervalMs}ms`);
   while (options.signal?.aborted !== true) {
     try {
       const result = await runReconcileCycle(state, deps);
-      state = { claimDegraded: result.claimDegraded, sessionSlotsDegraded: result.sessionSlotsDegraded };
+      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded };
     } catch (err) {
       log("error", `reconcile cycle threw and was caught, daemon continues: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     }
