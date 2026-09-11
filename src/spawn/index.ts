@@ -37,7 +37,7 @@ export type { LaunchInvocation, ListInvocation, StopInvocation } from "./argv";
 export { buildLaunchInvocation, buildListInvocation, buildStopInvocation } from "./argv";
 
 export type { BackgroundSessionInfo } from "./parse";
-export { parseAgentsJson, parseLaunchId, filterExactCwd } from "./parse";
+export { parseAgentsJson, parseLaunchId, filterExactCwd, detectStaleRegisteredCwdRefusal } from "./parse";
 
 export type { LivenessVerdict } from "./liveness";
 export { isPidAlive, decideLiveness, checkLiveness } from "./liveness";

@@ -613,4 +613,65 @@ describe("BAKR-24 Q4: report, don't launch — an orphaned claim's on-agents are
     // Reported on STATE CHANGE only, not once per cycle — 3 cycles, but the orphan's status never changed after cycle 1, so exactly one report line for it.
     expect(orphanLogLines).toHaveLength(1);
   });
+
+  test("REVIEW FINDING: a PRE-EXISTING unresolved launch record (left by a daemon version that predates Q4) for an agent whose directory is now gone must not keep logging at error level every cycle forever — the orphan report is the single voice instead", async () => {
+    const storeDir = await makeTempDir();
+    const goneDirParent = await mkdtemp(join(tmpdir(), "bakr-q4-stale-record-parent-"));
+    cleanupDirs.push(goneDirParent);
+    const goneDir = join(goneDirParent, "moved-away") as ClaimKey;
+    await mkdir(goneDir);
+    await rm(goneDir, { recursive: true, force: true });
+
+    await saveClaims(join(storeDir, "claims.json"), claim(emptyStore(), goneDir, 1).state);
+
+    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@stale-agent", directory: goneDir, durableSessionId: "durable-x", liveSessionId: "durable-x" }));
+    // Simulate a PRE-EXISTING failed launch record from before this daemon version shipped — exactly what a daemon upgrade finds already sitting in the store for an agent that was orphaned under the OLD code.
+    agentState = { ...agentState, launches: [{ attemptId: "pre-existing-attempt", agentId: "@stale-agent", key: goneDir, priorSessionId: "durable-x", attemptedAt: 1, launchShortId: undefined, error: "gave up after 3 consecutive restore attempts — left by a pre-Q4 daemon" }] };
+    await saveAgents(join(storeDir, "agents.json"), agentState);
+
+    const deps: DaemonDeps = { ...baseDeps(storeDir, async () => ({ exitCode: 0, stdout: "[]", stderr: "" })), probeDeps: realOrphanProbeDeps };
+
+    const capturedLines: string[] = [];
+    const originalConsoleLog = console.log;
+    console.log = (...args: unknown[]) => {
+      capturedLines.push(args.map(String).join(" "));
+    };
+    let state = initialDaemonState();
+    try {
+      for (let i = 0; i < 4; i++) {
+        const result = await runReconcileCycle(state, deps);
+        state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
+      }
+    } finally {
+      console.log = originalConsoleLog;
+    }
+
+    const unresolvedLogLines = capturedLines.filter((line) => line.includes("unresolved launch for agent @stale-agent"));
+    expect(unresolvedLogLines).toEqual([]); // suppressed — the orphan report below is the single voice
+
+    const orphanReportLines = capturedLines.filter((line) => line.includes("@stale-agent") && line.includes(goneDir));
+    expect(orphanReportLines).toHaveLength(1); // once per state change, not once per cycle
+
+    // NEGATIVE CONTROL: the identical stale record, for an agent in a directory that still resolves, is NOT suppressed — proves the suppression is keyed on classification, not on "any unresolved record ever".
+    const presentDir = await mkdtemp(join(tmpdir(), "bakr-q4-stale-record-present-"));
+    cleanupDirs.push(presentDir);
+    const storeDir2 = await makeTempDir();
+    await saveClaims(join(storeDir2, "claims.json"), claim(emptyStore(), presentDir as ClaimKey, 1).state);
+    let agentState2 = putAgent(emptyAgentStore(), makeAgent({ id: "@healthy-agent", directory: presentDir as ClaimKey, durableSessionId: "durable-y", liveSessionId: "durable-y" }));
+    agentState2 = { ...agentState2, launches: [{ attemptId: "pre-existing-attempt-2", agentId: "@healthy-agent", key: presentDir as ClaimKey, priorSessionId: "durable-y", attemptedAt: 1, launchShortId: undefined, error: "gave up after 3 consecutive restore attempts — unrelated to any directory move" }] };
+    await saveAgents(join(storeDir2, "agents.json"), agentState2);
+    const deps2: DaemonDeps = { ...baseDeps(storeDir2, async () => ({ exitCode: 0, stdout: "[]", stderr: "" })), probeDeps: realOrphanProbeDeps };
+    const capturedLines2: string[] = [];
+    console.log = (...args: unknown[]) => {
+      capturedLines2.push(args.map(String).join(" "));
+    };
+    try {
+      await runReconcileCycle(initialDaemonState(), deps2);
+      await runReconcileCycle(initialDaemonState(), deps2);
+    } finally {
+      console.log = originalConsoleLog;
+    }
+    const healthyUnresolvedLines = capturedLines2.filter((line) => line.includes("unresolved launch for agent @healthy-agent"));
+    expect(healthyUnresolvedLines).toHaveLength(2); // unsuppressed, unconditional, every cycle — unchanged Constraint 2 behaviour for a genuinely non-orphaned directory
+  });
 });

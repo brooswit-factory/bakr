@@ -45,7 +45,7 @@ import {
   resetRestoreAttempts,
   sessionToResume,
 } from "./agent-model";
-import { listBackgroundSessions, decideLiveness, isPidAlive, launch, type RunCommand, type BackgroundSessionInfo } from "./spawn";
+import { listBackgroundSessions, decideLiveness, isPidAlive, launch, detectStaleRegisteredCwdRefusal, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import type { ClaimKey } from "./claim-key-resolve";
 import { classifyDirectory, type OrphanVerdict } from "./orphan-model";
 import { probeDirectory, type OrphanProbeDeps } from "./orphan-probe";
@@ -395,7 +395,40 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   }
   const peekedState = peeked.status === "loaded" ? peeked.state : emptyAgentStore();
 
+  // BAKR-24 review finding: classification is memoized per KEY and shared
+  // between the per-claim decide-or-report loop below AND the
+  // unresolved-launches log loop, so a directory is probed at most once per
+  // cycle regardless of how many things reference it.
+  const claimsByKey = new Map(listClaims(claimState).map((c) => [c.key, c] as const));
+  const classificationCache = new Map<ClaimKey, OrphanVerdict>();
+  async function classifyKey(key: ClaimKey): Promise<OrphanVerdict> {
+    const cached = classificationCache.get(key);
+    if (cached !== undefined) return cached;
+    const probe = await probeDirectory(key, deps.probeDeps);
+    const verdict = classifyDirectory(probe, claimsByKey.get(key)?.dirIdentity?.dev);
+    classificationCache.set(key, verdict);
+    return verdict;
+  }
+
+  // BAKR-24 review finding: "the daemon must not loop on it" (Q4) was only
+  // half delivered — this loop, unconditional and at error level every
+  // cycle, still fires FOREVER for a launch record left by a version of
+  // this daemon that predates Q4 (an agent that was already orphaned before
+  // the operator upgraded). A record this ticket's own code creates can
+  // never reach this state (Q4 never creates one for an orphaned
+  // directory), but a PRE-EXISTING one on disk can. Suppressed here when
+  // the agent's CURRENT directory classifies as anything but `present` —
+  // the per-claim orphan report below is the single voice for those
+  // agents instead, exactly once per state change rather than every cycle.
+  // A record whose agent no longer exists at all (should not happen; no
+  // delete verb ships yet) still logs unconditionally rather than going
+  // silently missing.
   for (const unresolved of unresolvedLaunches(peekedState)) {
+    const owner = peekedState.agents[unresolved.agentId];
+    const verdict = owner === undefined ? undefined : await classifyKey(owner.directory);
+    if (verdict !== undefined && verdict.status !== "present") {
+      continue; // the orphan report (below) already covers this agent once per state change
+    }
     log(
       "error",
       `unresolved launch for agent ${unresolved.agentId} in "${unresolved.key}" (attempt ${unresolved.attemptId}, ${new Date(unresolved.attemptedAt).toISOString()}): ${unresolved.error} — possibly orphaned; never retried automatically, never resolved by directory (BAKR-8 Constraint 2)`
@@ -420,8 +453,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
     // (a launch record here is exactly what would make
     // `hasLaunchRecordFor` silently suppress this agent's restore once the
     // directory comes back, per Q4's own "create no launch record at all").
-    const probe = await probeDirectory(key, deps.probeDeps);
-    const verdict: OrphanVerdict = classifyDirectory(probe, claimEntry.dirIdentity?.dev);
+    const verdict = await classifyKey(key);
     if (verdict.status !== "present") {
       const agentIds = onAgents.map((a) => a.id).sort();
       const signature = `${verdict.status}:${agentIds.join(",")}`;
@@ -477,10 +509,26 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
         restored.push({ agentId: agent.id, key, sessionId });
       } else {
         await recordLaunchOutcome(deps, decision.attemptId, launchResult);
-        log(
-          "error",
-          `agent ${agent.id} in "${key}": launch failed: ${launchResult.error} — cannot distinguish "never detached" from "detached, then the wrapper failed"; treated as possibly orphaned, recorded as unresolved, never retried automatically (BAKR-8 Constraint 2)`
-        );
+        const staleRegisteredCwd = detectStaleRegisteredCwdRefusal(launchResult.error);
+        if (staleRegisteredCwd !== undefined) {
+          // BAKR-24: a SPECIFIC, LOUD report for this one failure shape —
+          // claude's OWN internal job registry (not anything bakr writes or
+          // owns) still points at a stale path, refusing to restart this
+          // agent even though it now genuinely lives at `key`. Measured
+          // version-dependent (present on some claude builds, not others,
+          // enforced differently across them) — never asserted here as
+          // universal, and never worked around by writing into
+          // claude's own storage (that decision is the epic's alone).
+          log(
+            "error",
+            `agent ${agent.id}: adoption/restore into "${key}" REFUSED by claude itself — its own internal session registry still points at the STALE path "${staleRegisteredCwd}" (not "${key}", where this agent actually now lives) and refuses to restart until that registry entry is updated. This is a claude-build-dependent limitation outside bakr's own storage (BAKR-24) — bakr does not write into claude's registry to work around it. Never retried automatically (BAKR-8 Constraint 2).`
+          );
+        } else {
+          log(
+            "error",
+            `agent ${agent.id} in "${key}": launch failed: ${launchResult.error} — cannot distinguish "never detached" from "detached, then the wrapper failed"; treated as possibly orphaned, recorded as unresolved, never retried automatically (BAKR-8 Constraint 2)`
+          );
+        }
       }
     }
   }
