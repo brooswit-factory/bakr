@@ -17,7 +17,7 @@ const KEY_B = "/home/alice/other" as ClaimKey;
 describe("claim", () => {
   test("claiming a fresh key creates a claim with the given timestamp", () => {
     const { state, claim: c } = claim(emptyStore(), KEY_A, 1000);
-    expect(c).toEqual({ key: KEY_A, claimedAt: 1000 });
+    expect(c).toEqual({ key: KEY_A, claimedAt: 1000, dirIdentity: undefined });
     expect(lookup(state, KEY_A)).toEqual(c);
   });
 
@@ -124,7 +124,7 @@ describe("BAKR-16 R-D: agentIds is retired from the in-memory model, but the wir
     const result = parseClaimStoreState(JSON.stringify({ version: 1, claims: { "/x": { claimedAt: 5, agentIds: ["some-id"] } } }));
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.state.claims["/x"]).toEqual({ key: "/x" as ClaimKey, claimedAt: 5 });
+      expect(result.state.claims["/x"]).toEqual({ key: "/x" as ClaimKey, claimedAt: 5, dirIdentity: undefined });
     }
   });
 
@@ -132,7 +132,7 @@ describe("BAKR-16 R-D: agentIds is retired from the in-memory model, but the wir
     const result = parseClaimStoreState(JSON.stringify({ version: 1, claims: { "/x": { claimedAt: 5 } } }));
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.state.claims["/x"]).toEqual({ key: "/x" as ClaimKey, claimedAt: 5 });
+      expect(result.state.claims["/x"]).toEqual({ key: "/x" as ClaimKey, claimedAt: 5, dirIdentity: undefined });
     }
   });
 

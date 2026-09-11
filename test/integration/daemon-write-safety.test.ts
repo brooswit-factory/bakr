@@ -20,7 +20,7 @@ import { claim, emptyStore } from "../../src/claim-model";
 import { save as saveClaims } from "../../src/claim-store-io";
 import { lexicallyNormalize } from "../../src/claim-key";
 import { resolveClaimKey } from "../../src/claim-key-resolve";
-import { realResolveInputs } from "../../src/paths";
+import { realResolveInputs, realOrphanProbeDeps } from "../../src/paths";
 import { beginLaunch, emptySessionSlots, markLaunchStarted, resolveLaunch } from "../../src/session-slots";
 import { save as saveSlots } from "../../src/session-slots-store";
 import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
@@ -124,6 +124,7 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
       now: () => Date.now(),
       generateAttemptId: () => "restore-attempt",
       randomBytes: (n: number) => new Uint8Array(n).fill(0x42),
+      probeDeps: realOrphanProbeDeps,
     };
 
     const before = await snapshot(claimedDir);
@@ -168,6 +169,7 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
       now: () => Date.now(),
       generateAttemptId: () => "restore-attempt",
       randomBytes: (n: number) => new Uint8Array(n).fill(0x42),
+      probeDeps: realOrphanProbeDeps,
     };
 
     // Any write attempt into claimedDir from here on would throw EACCES and fail this test outright.

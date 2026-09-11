@@ -145,3 +145,33 @@ export function parseLaunchId(stdout: string): string {
   }
   return match[1];
 }
+
+/**
+ * Detects one SPECIFIC launch-failure shape (BAKR-24): claude's own
+ * internal background-job registry (observed to live at
+ * `~/.claude/jobs/<shortId>/state.json`, NOT anything under this
+ * substrate's own project-slug transcript directories) records the cwd a
+ * session was ORIGINALLY started in, and `claude --bg --resume <id>`
+ * refuses to restart it when THAT recorded path no longer exists — even
+ * when the actual invoking process's cwd is a different, real, existing
+ * directory. Measured present but NOT enforced on claude 2.1.251, and
+ * enforced on 2.1.268 — a genuine behaviour difference between builds, not
+ * a probe error (re-verify on your own build before trusting either
+ * finding — see BAKR-24's own ticket comments for the full measurement).
+ *
+ * This is exactly the same class of misattribution the ticket's own Q4
+ * already calls out for a missing CWD ("posix_spawn 'systemd-run'" blaming
+ * the wrong thing) — here the raw text blames neither systemd-run nor the
+ * directory bakr actually launched into, so isolating detection to one
+ * pure, text-matching function (same discipline as `parseLaunchId` above:
+ * brittle to a future wording change, bounded to one place) is what lets a
+ * caller (daemon.ts) report the REAL cause instead of the generic
+ * "launch failed" text. Text pinned as observed on claude 2.1.268,
+ * 2026-09-11: "Couldn't start a background session (working directory no
+ * longer exists or is not accessible: <path>)". Returns the STALE path
+ * when this exact shape matches, `undefined` for any other failure.
+ */
+export function detectStaleRegisteredCwdRefusal(errorText: string): string | undefined {
+  const match = errorText.match(/working directory no longer exists or is not accessible: (.+?)\)/);
+  return match?.[1];
+}

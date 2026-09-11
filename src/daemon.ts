@@ -43,9 +43,12 @@ import {
   restoreAttemptCount,
   recordRestoreAttempt,
   resetRestoreAttempts,
+  sessionToResume,
 } from "./agent-model";
-import { listBackgroundSessions, decideLiveness, isPidAlive, launch, type RunCommand, type BackgroundSessionInfo } from "./spawn";
+import { listBackgroundSessions, decideLiveness, isPidAlive, launch, detectStaleRegisteredCwdRefusal, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import type { ClaimKey } from "./claim-key-resolve";
+import { classifyDirectory, type OrphanVerdict } from "./orphan-model";
+import { probeDirectory, type OrphanProbeDeps } from "./orphan-probe";
 import { log } from "./log";
 
 /** See session-slots.ts's own module comment for the live incident this bound closes — ported unchanged. Now counted per AGENT id (R-C), not per durable session id. */
@@ -59,6 +62,8 @@ export interface DaemonDeps {
   readonly now: () => number;
   readonly generateAttemptId: () => string;
   readonly randomBytes: (byteLength: number) => Uint8Array;
+  /** BAKR-24 Q1/Q4: real `stat`, injected for the same reason every other filesystem seam in this tree is — unit-testable with fakes. See orphan-probe.ts / paths.ts's `realOrphanProbeDeps`. */
+  readonly probeDeps: OrphanProbeDeps;
   readonly acquireTimeoutMs?: number;
 }
 
@@ -66,10 +71,24 @@ export interface DaemonState {
   readonly claimDegraded: boolean;
   /** Covers BOTH a malformed `agents.json` and a malformed `session-slots.json` discovered while `agents.json` was still absent (R-A.1) — either way, this run never writes the agent store again. */
   readonly agentsDegraded: boolean;
+  /**
+   * BAKR-24 Q4: one signature per claimed directory CURRENTLY classified
+   * `gone`/`unavailable` AND holding at least one `on` agent — `"<status>:<sorted on-agent ids>"`.
+   * Carried cycle-to-cycle so the orphan report below logs only on a
+   * CHANGE (a directory going orphaned, its verdict flipping between
+   * `gone`/`unavailable`, or its set of `on` agents changing) rather than
+   * once per cycle forever — the same "must not loop on it" requirement
+   * Q4 states explicitly for launching, applied here to logging. A
+   * directory that resolves again (or loses its last `on` agent) is simply
+   * absent from this map on the next cycle — nothing needs an explicit
+   * "cleared" transition logged; the next time it orphans, it is a fresh
+   * signature and reports again.
+   */
+  readonly orphanReportSignatures: Readonly<Record<string, string>>;
 }
 
 export function initialDaemonState(): DaemonState {
-  return { claimDegraded: false, agentsDegraded: false };
+  return { claimDegraded: false, agentsDegraded: false, orphanReportSignatures: {} };
 }
 
 function lockOpts(deps: DaemonDeps): { acquireTimeoutMs?: number } {
@@ -139,6 +158,8 @@ export interface ReconcileResult {
   /** `sessionId` is the durable id being resumed for a restore, or `undefined` for a fresh launch (no prior session) — see AC4/AC2. `key` is reported as an ATTRIBUTE only, never used to identify the agent (B2). */
   readonly restored: readonly { readonly agentId: string; readonly key: ClaimKey; readonly sessionId: string | undefined }[];
   readonly skippedListingFailed: boolean;
+  /** See `DaemonState.orphanReportSignatures` — carried forward into the next cycle's `DaemonState` by `runDaemonLoop`. */
+  readonly orphanReportSignatures: Readonly<Record<string, string>>;
 }
 
 /** Promotes any launch record left wedged by a crash mid-`launch()` in a PRIOR run — see agent-model.ts's own `promoteUnresolvableLaunches` doc, ported unchanged in spirit, rekeyed to agent id. One locked mutation; a no-op save is skipped. */
@@ -255,7 +276,8 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
         return { state: current, result: { kind: "skip" } };
       }
 
-      if (agent.durableSessionId === undefined) {
+      const resumeSessionId = sessionToResume(agent);
+      if (resumeSessionId === undefined) {
         if (hasLaunchRecordFor(current, agentId, undefined)) {
           return { state: current, result: { kind: "skip" } };
         }
@@ -264,7 +286,7 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
         return { state: next, result: { kind: "begin-fresh-launch", attemptId } };
       }
 
-      const sessionId = agent.durableSessionId;
+      const sessionId = resumeSessionId;
       if (hasLaunchRecordFor(current, agentId, sessionId)) {
         return { state: current, result: { kind: "skip" } };
       }
@@ -333,17 +355,17 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
     if (prior.claimDegraded) parts.push(`claim store "${deps.claimsPath}" is malformed`);
     if (prior.agentsDegraded) parts.push(`agent store at "${deps.agentsPath}" (or its pre-migration session-slots.json) is malformed`);
     log("error", `reconcile skipped this cycle: ${parts.join("; ")} — this process will never write to the affected file(s); restart after repairing on disk`);
-    return { claimDegraded: prior.claimDegraded, agentsDegraded: prior.agentsDegraded, restored: [], skippedListingFailed: false };
+    return { claimDegraded: prior.claimDegraded, agentsDegraded: prior.agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
   }
 
   const { claimState, claimDegraded, agentsDegraded } = await loadStores(deps);
   if (claimDegraded || agentsDegraded) {
-    return { claimDegraded, agentsDegraded, restored: [], skippedListingFailed: false };
+    return { claimDegraded, agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
   }
 
   const promoted = await promoteWedgedLaunches(deps);
   if (promoted.malformed) {
-    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false };
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
   }
 
   let sessions: BackgroundSessionInfo[];
@@ -354,12 +376,12 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       "error",
       `reconcile skipped this cycle: \`claude agents --json\` listing failed: ${err instanceof Error ? err.message : String(err)} — never treated as "nothing running"; no restore is issued this cycle (BAKR-8 Constraint 1)`
     );
-    return { claimDegraded: false, agentsDegraded: false, restored: [], skippedListingFailed: true };
+    return { claimDegraded: false, agentsDegraded: false, restored: [], skippedListingFailed: true, orphanReportSignatures: prior.orphanReportSignatures };
   }
 
   const resolved = await resolvePendingLaunches(deps, sessions);
   if (resolved.malformed) {
-    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false };
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
   }
 
   // A fresh, unlocked peek to enumerate WHICH agent ids to consider this
@@ -369,11 +391,44 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   const peeked = await loadAgents(deps.agentsPath);
   if (peeked.status === "malformed") {
     log("error", `agent store at "${deps.agentsPath}" became malformed mid-cycle: ${peeked.error} — degrading for the rest of this process's life`);
-    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false };
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
   }
   const peekedState = peeked.status === "loaded" ? peeked.state : emptyAgentStore();
 
+  // BAKR-24 review finding: classification is memoized per KEY and shared
+  // between the per-claim decide-or-report loop below AND the
+  // unresolved-launches log loop, so a directory is probed at most once per
+  // cycle regardless of how many things reference it.
+  const claimsByKey = new Map(listClaims(claimState).map((c) => [c.key, c] as const));
+  const classificationCache = new Map<ClaimKey, OrphanVerdict>();
+  async function classifyKey(key: ClaimKey): Promise<OrphanVerdict> {
+    const cached = classificationCache.get(key);
+    if (cached !== undefined) return cached;
+    const probe = await probeDirectory(key, deps.probeDeps);
+    const verdict = classifyDirectory(probe, claimsByKey.get(key)?.dirIdentity?.dev);
+    classificationCache.set(key, verdict);
+    return verdict;
+  }
+
+  // BAKR-24 review finding: "the daemon must not loop on it" (Q4) was only
+  // half delivered — this loop, unconditional and at error level every
+  // cycle, still fires FOREVER for a launch record left by a version of
+  // this daemon that predates Q4 (an agent that was already orphaned before
+  // the operator upgraded). A record this ticket's own code creates can
+  // never reach this state (Q4 never creates one for an orphaned
+  // directory), but a PRE-EXISTING one on disk can. Suppressed here when
+  // the agent's CURRENT directory classifies as anything but `present` —
+  // the per-claim orphan report below is the single voice for those
+  // agents instead, exactly once per state change rather than every cycle.
+  // A record whose agent no longer exists at all (should not happen; no
+  // delete verb ships yet) still logs unconditionally rather than going
+  // silently missing.
   for (const unresolved of unresolvedLaunches(peekedState)) {
+    const owner = peekedState.agents[unresolved.agentId];
+    const verdict = owner === undefined ? undefined : await classifyKey(owner.directory);
+    if (verdict !== undefined && verdict.status !== "present") {
+      continue; // the orphan report (below) already covers this agent once per state change
+    }
     log(
       "error",
       `unresolved launch for agent ${unresolved.agentId} in "${unresolved.key}" (attempt ${unresolved.attemptId}, ${new Date(unresolved.attemptedAt).toISOString()}): ${unresolved.error} — possibly orphaned; never retried automatically, never resolved by directory (BAKR-8 Constraint 2)`
@@ -381,14 +436,46 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   }
 
   const restored: { agentId: string; key: ClaimKey; sessionId: string | undefined }[] = [];
+  // BAKR-24 Q4: only entries for claims CURRENTLY orphaned (with >=1 `on`
+  // agent) survive into next cycle's DaemonState — a directory that
+  // resolves again, or loses its last `on` agent, simply has no entry here,
+  // so a future re-orphaning reports fresh rather than staying silent.
+  const nextOrphanReportSignatures: Record<string, string> = {};
 
   for (const claimEntry of listClaims(claimState)) {
     const key = claimEntry.key;
     const onAgents = agentsInDirectory(peekedState, key).filter((a) => a.state === "on");
+    if (onAgents.length === 0) continue;
+
+    // Q4: classify BEFORE deciding to launch anything. `gone`/`unavailable`
+    // -> report, do not launch, and — critically — never call
+    // `decideAndBeginForAgent` at all, so NO launch record is created
+    // (a launch record here is exactly what would make
+    // `hasLaunchRecordFor` silently suppress this agent's restore once the
+    // directory comes back, per Q4's own "create no launch record at all").
+    const verdict = await classifyKey(key);
+    if (verdict.status !== "present") {
+      const agentIds = onAgents.map((a) => a.id).sort();
+      const signature = `${verdict.status}:${agentIds.join(",")}`;
+      nextOrphanReportSignatures[key] = signature;
+      if (prior.orphanReportSignatures[key] !== signature) {
+        // [CORRECTED per Q4]: name the agent id(s), name the MISSING
+        // DIRECTORY explicitly, and state the verdict — never echo a launch
+        // failure's own ENOENT text (which misattributes the cause to
+        // `systemd-run`). This log line is the only place that cause is
+        // ever reported for these agents this cycle.
+        log(
+          verdict.status === "gone" ? "error" : "warn",
+          `agent(s) ${agentIds.join(", ")}: claimed directory "${key}" no longer resolves (verdict: ${verdict.status}${verdict.status === "gone" ? `, ${verdict.confidence} confidence` : ""}) — ${verdict.reason}. NOT launching, no launch record created; this directory, not systemd-run, is the actual cause. Reported once per state change, not every cycle. Adopt these agents into a new directory to bring them back (BAKR-24).`
+        );
+      }
+      continue;
+    }
+
     for (const agent of onAgents) {
       const outcome = await decideAndBeginForAgent(deps, agent.id, key, sessions);
       if (outcome.malformed) {
-        return { claimDegraded: false, agentsDegraded: true, restored, skippedListingFailed: false };
+        return { claimDegraded: false, agentsDegraded: true, restored, skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
       }
       const decision = outcome.decision as AgentDecision;
 
@@ -422,15 +509,31 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
         restored.push({ agentId: agent.id, key, sessionId });
       } else {
         await recordLaunchOutcome(deps, decision.attemptId, launchResult);
-        log(
-          "error",
-          `agent ${agent.id} in "${key}": launch failed: ${launchResult.error} — cannot distinguish "never detached" from "detached, then the wrapper failed"; treated as possibly orphaned, recorded as unresolved, never retried automatically (BAKR-8 Constraint 2)`
-        );
+        const staleRegisteredCwd = detectStaleRegisteredCwdRefusal(launchResult.error);
+        if (staleRegisteredCwd !== undefined) {
+          // BAKR-24: a SPECIFIC, LOUD report for this one failure shape —
+          // claude's OWN internal job registry (not anything bakr writes or
+          // owns) still points at a stale path, refusing to restart this
+          // agent even though it now genuinely lives at `key`. Measured
+          // version-dependent (present on some claude builds, not others,
+          // enforced differently across them) — never asserted here as
+          // universal, and never worked around by writing into
+          // claude's own storage (that decision is the epic's alone).
+          log(
+            "error",
+            `agent ${agent.id}: adoption/restore into "${key}" REFUSED by claude itself — its own internal session registry still points at the STALE path "${staleRegisteredCwd}" (not "${key}", where this agent actually now lives) and refuses to restart until that registry entry is updated. This is a claude-build-dependent limitation outside bakr's own storage (BAKR-24) — bakr does not write into claude's registry to work around it. Never retried automatically (BAKR-8 Constraint 2).`
+          );
+        } else {
+          log(
+            "error",
+            `agent ${agent.id} in "${key}": launch failed: ${launchResult.error} — cannot distinguish "never detached" from "detached, then the wrapper failed"; treated as possibly orphaned, recorded as unresolved, never retried automatically (BAKR-8 Constraint 2)`
+          );
+        }
       }
     }
   }
 
-  return { claimDegraded: false, agentsDegraded: false, restored, skippedListingFailed: false };
+  return { claimDegraded: false, agentsDegraded: false, restored, skippedListingFailed: false, orphanReportSignatures: nextOrphanReportSignatures };
 }
 
 export interface DaemonLoopOptions {
@@ -463,7 +566,7 @@ export async function runDaemonLoop(deps: DaemonDeps, options: DaemonLoopOptions
   while (options.signal?.aborted !== true) {
     try {
       const result = await runReconcileCycle(state, deps);
-      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded };
+      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
     } catch (err) {
       log("error", `reconcile cycle threw and was caught, daemon continues: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     }

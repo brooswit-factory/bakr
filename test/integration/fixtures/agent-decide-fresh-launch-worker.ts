@@ -42,6 +42,11 @@ function unusedDeps(): DaemonDeps {
     now: () => 1,
     generateAttemptId: () => "fixed-attempt",
     randomBytes: () => new Uint8Array(0),
+    probeDeps: {
+      stat: () => {
+        throw new Error("unused by decideAndBeginForAgent");
+      },
+    },
   };
 }
 
