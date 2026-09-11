@@ -225,7 +225,7 @@ async function resolvePendingLaunches(deps: DaemonDeps, sessions: readonly Backg
   return { malformed: false };
 }
 
-type AgentDecision =
+export type AgentDecision =
   | { readonly kind: "skip" }
   | { readonly kind: "reset" }
   | { readonly kind: "alive" }
@@ -241,8 +241,14 @@ type AgentDecision =
  * write alone cannot close. Never holds the lock across `launch()` (R-F):
  * that call happens afterward, unlocked, and its outcome is recorded in a
  * SECOND, separate locked mutation.
+ *
+ * EXPORTED (review, PR #13): AC14's two-process demonstration
+ * (test/integration/agent-decide-race.test.ts) calls this function
+ * directly rather than a hand-written replica of its discipline, so the
+ * test binds to the actual shipped decision boundary and regresses if a
+ * future edit ever moves the read outside the lock.
  */
-async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, key: ClaimKey, sessions: readonly BackgroundSessionInfo[]): Promise<{ malformed: boolean; error?: string; decision?: AgentDecision }> {
+export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, key: ClaimKey, sessions: readonly BackgroundSessionInfo[]): Promise<{ malformed: boolean; error?: string; decision?: AgentDecision }> {
   const result = await withAgentStoreLock<AgentDecision>(
     deps.agentsPath,
     (current) => {

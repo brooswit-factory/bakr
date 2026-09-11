@@ -1,16 +1,17 @@
-// Test fixture for AC14 (R-F.3): exercises daemon.ts's `decideAndBeginForAgent`
-// re-validation-inside-the-lock discipline directly, via a real, separate
-// `bun` process racing against another real process (agent-flip-off-worker.ts)
-// that turns the agent `off`. Prints "LAUNCHED" or "SKIPPED" as its last
-// stdout line so the test can tell which happened without re-reading the
-// store itself (avoiding a third source of truth in the assertion).
+// Test fixture for AC14 (R-F.3). The "fixed" mode calls daemon.ts's own
+// EXPORTED `decideAndBeginForAgent` directly — not a hand-written replica
+// of its discipline — so this test binds to the actual shipped decision
+// boundary: if a future edit ever moves the read outside the lock, this
+// test regresses (review, PR #13, round 1: the original version of this
+// fixture reimplemented the discipline inline, which meant the assertion
+// never actually exercised src/daemon.ts at all).
 //
-// Also used to reproduce the OLD, pre-fix shape for the negative control:
-// with `--naive`, this fixture reads the decision OUTSIDE any lock, sleeps
-// (simulating the time an old-style cycle would spend elsewhere before
-// reaching beginLaunch), and only then takes the lock to blindly begin the
-// launch WITHOUT re-checking — reproducing exactly the race R-F.3 exists to
-// close. This is test-only code; nothing resembling it ships in src/.
+// The "naive" mode is, deliberately, still a hand-written reproduction of
+// the OLD, pre-fix shape (decide OUTSIDE any lock, sleep, then blindly
+// write) — there is no "naive" function in src/ to call, because the whole
+// point is that shape was never shipped. This is test-only code modeling a
+// bug class, not a stand-in for production code.
+import { decideAndBeginForAgent, type DaemonDeps } from "../../../src/daemon";
 import { load, withAgentStoreLock } from "../../../src/agent-store-io";
 import { beginLaunch, hasLaunchRecordFor } from "../../../src/agent-model";
 import type { ClaimKey } from "../../../src/claim-key-resolve";
@@ -29,22 +30,34 @@ const agentsPath: string = agentsPathRaw;
 const agentId: string = agentIdRaw;
 const key = keyRaw as ClaimKey;
 
+function unusedDeps(): DaemonDeps {
+  // decideAndBeginForAgent only reads deps.agentsPath, deps.generateAttemptId, deps.now, and the optional lock-tuning fields — the rest of DaemonDeps is structurally required but never touched by this call, so these are harmless placeholders, never exercised.
+  return {
+    runCommand: () => {
+      throw new Error("unused by decideAndBeginForAgent");
+    },
+    claimsPath: "/unused",
+    agentsPath,
+    sessionSlotsPath: "/unused",
+    now: () => 1,
+    generateAttemptId: () => "fixed-attempt",
+    randomBytes: () => new Uint8Array(0),
+  };
+}
+
 async function main(): Promise<void> {
   if (mode === "fixed") {
-    // The REAL discipline: decision AND write inside ONE lock hold.
-    const result = await withAgentStoreLock(agentsPath, (current) => {
-      const agent = current.agents[agentId];
-      if (agent === undefined || agent.state !== "on" || hasLaunchRecordFor(current, agentId, undefined)) {
-        return { state: current, result: "SKIPPED" as const };
-      }
-      const next = beginLaunch(current, agentId, key, undefined, "fixed-attempt", 1);
-      return { state: next, result: "LAUNCHED" as const };
-    });
-    console.log(result.status === "ok" ? result.result : "MALFORMED");
+    // Calls the REAL, exported production function — no reimplementation.
+    const outcome = await decideAndBeginForAgent(unusedDeps(), agentId, key, []);
+    if (outcome.malformed) {
+      console.log("MALFORMED");
+      return;
+    }
+    console.log(outcome.decision?.kind === "begin-fresh-launch" ? "LAUNCHED" : "SKIPPED");
     return;
   }
 
-  // The NAIVE (pre-fix) shape: decide from an UNLOCKED read, sleep (simulating time spent elsewhere in an old-style cycle), THEN take the lock to blindly write — never re-checking.
+  // The NAIVE (pre-fix, never-shipped) shape: decide from an UNLOCKED read, sleep (simulating time spent elsewhere in an old-style cycle), THEN take the lock to blindly write — never re-checking.
   const loaded = await load(agentsPath);
   const state = loaded.status === "loaded" ? loaded.state : undefined;
   const agent = state?.agents[agentId];
