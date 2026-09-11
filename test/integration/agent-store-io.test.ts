@@ -22,7 +22,7 @@ async function makeTempDir(): Promise<string> {
 }
 
 function makeAgent(id: string): AgentRecord {
-  return { id, name: undefined, directory: "/x" as ClaimKey, state: "on", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined };
+  return { id, name: undefined, directory: "/x" as ClaimKey, state: "on", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined };
 }
 
 describe("load: missing / malformed / loaded are three distinct outcomes", () => {

@@ -8,8 +8,10 @@
 //                    recorded identity, never by killing a scope/cgroup or
 //                    touching `claude daemon run`
 //   - liveness.ts — pid verification is a positive fact, never an
-//                    inference from absence; alive/not-verifiable/unknown
-//                    are kept distinct, never collapsed to a boolean
+//                    inference from absence; alive/not-verifiable/absent
+//                    (plus listing-failed, which only the impure
+//                    `checkLiveness` can return) are kept distinct, never
+//                    collapsed to a boolean
 //   - argv.ts     — pure, injection-free argv construction for all of the
 //                    above, fully unit tested without shelling out
 //   - parse.ts    — pure parsing of everything read back from `claude`
@@ -50,3 +52,6 @@ export { listBackgroundSessions } from "./list";
 
 export type { StopDeps, StopResult } from "./stop";
 export { stopSession } from "./stop";
+
+export type { RespawnDeps, RespawnResult } from "./respawn";
+export { respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal } from "./respawn";

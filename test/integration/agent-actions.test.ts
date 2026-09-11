@@ -73,6 +73,10 @@ function makeFakeClaude(opts?: { failListing?: boolean; stopBehavior?: (id: stri
       if (idx !== -1) listing.splice(idx, 1);
       return { exitCode: 0, stdout: "", stderr: "" };
     }
+    if (argv[0] === "claude" && argv[1] === "respawn") {
+      const shortId = argv[2] as string;
+      return { exitCode: 0, stdout: `respawned ${shortId}\n`, stderr: "" };
+    }
     if (argv[0] === "systemd-run") {
       const shortId = `short-${nextShortId++}`;
       const sessionId = `session-${shortId}`;
@@ -101,7 +105,7 @@ function baseDeps(dir: string, runCommand: AgentActionDeps["runCommand"]): Agent
 }
 
 function makeAgent(overrides: Partial<AgentRecord> & { id: string }): AgentRecord {
-  return { name: undefined, directory: KEY, state: "on", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined, ...overrides };
+  return { name: undefined, directory: KEY, state: "on", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined, ...overrides };
 }
 
 async function seedAgent(agentsPath: string, agent: AgentRecord): Promise<void> {
@@ -119,7 +123,7 @@ describe("create", () => {
     if (!result.ok) throw new Error("expected ok");
     expect(result.agent.state).toBe("on");
     expect(result.agent.name).toBeUndefined();
-    expect(result.agent.durableSessionId).toBeUndefined(); // honest: never known synchronously (Q3)
+    expect(result.agent.birthSessionId).toBeUndefined(); // honest: never known synchronously (Q3)
     expect(result.launch.ok).toBe(true);
 
     const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
@@ -171,23 +175,28 @@ describe("create", () => {
 // --- on: resume-id routes through exactly one function, B8, no-change, archived refusal ---
 
 describe("on", () => {
-  test("restore: argv is EXACTLY --resume <durableSessionId> — the resume id is never hard-coded inline in agent-actions.ts", async () => {
+  test("restore: dispatches EXACTLY `claude respawn <shortId>` — the resume id is never hard-coded inline in agent-actions.ts", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off", durableSessionId: "durable-xyz" }));
+    const fake = makeFakeClaude();
+    const deps = baseDeps(dir, fake.runCommand);
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off", birthSessionId: "durable-xyz", restoreTarget: { sessionId: "durable-xyz", shortId: "durable-x" } }));
     const result = await on(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.kind).toBe("turn-on");
       expect(result.launchIssued).toBe(true);
     }
+    expect(fake.calls).toEqual([
+      ["claude", "agents", "--json"], // the liveness-gate listing, fetched before any decision
+      ["claude", "respawn", "durable-x"], // EXACTLY this — BAKR-22's argv-exactness
+    ]);
   });
 
-  test("fresh (no durable session yet): argv has NO --resume and NO other args", async () => {
+  test("fresh (no restoreTarget yet): a real launch() with NO args at all — no --resume, nothing else", async () => {
     const dir = await makeTempDir();
     const fake = makeFakeClaude();
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off", durableSessionId: undefined }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off", restoreTarget: undefined }));
     await on(deps, KEY, "@a1");
 
     const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
@@ -195,11 +204,16 @@ describe("on", () => {
     expect(systemdCall.slice(dashIdx + 3)).toEqual([]);
   });
 
-  test("no-change: already on, healthy (no launch issued, nothing reported as cleared)", async () => {
+  test("no-change: already on, healthy (verified alive by the liveness gate) — no launch issued, nothing reported as cleared", async () => {
     const dir = await makeTempDir();
     const fake = makeFakeClaude();
+    // BAKR-22: `on()` always fetches a listing first now (the liveness
+    // gate) — seed it so this agent's short id verifies ALIVE, which is
+    // what makes "no-change, healthy" the correct outcome rather than an
+    // attempted (and wrongly-issued) respawn of a live session.
+    fake.listing.push({ id: "d1shortx", sessionId: "d1", cwd: KEY, startedAt: 1, kind: "background", pid: process.pid });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", durableSessionId: "d1", liveSessionId: "d1" }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: "d1shortx" } }));
     const result = await on(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -207,7 +221,20 @@ describe("on", () => {
       expect(result.launchIssued).toBe(false);
       expect(result.wedgeCleared).toBe(false);
     }
-    expect(fake.calls.length).toBe(0); // nothing was launched or listed
+    expect(fake.calls).toEqual([["claude", "agents", "--json"]]); // the liveness-gate listing, and NOTHING else — never respawns a verified-alive session
+  });
+
+  test("BAKR-22 liveness gate: an already-on agent whose session cannot be independently verified alive is left ALONE this call — never respawned on an uncertain signal", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaude();
+    // Listed, but with NO pid reported this cycle — `decideLiveness` calls this `not-verifiable`, distinct from both "alive" and "dead".
+    fake.listing.push({ id: "d1shortx", sessionId: "d1", cwd: KEY, startedAt: 1, kind: "background" });
+    const deps = baseDeps(dir, fake.runCommand);
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: "d1shortx" } }));
+    const result = await on(deps, KEY, "@a1");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.launchIssued).toBe(false);
+    expect(fake.calls).toEqual([["claude", "agents", "--json"]]); // never respawns — not-verifiable is not "dead"
   });
 
   test("refused: archived", async () => {
@@ -218,13 +245,15 @@ describe("on", () => {
     expect(result.ok).toBe(false);
   });
 
-  // Review finding 2 (PR #16, round 1): the previous version of this scan
-  // read `agent-actions.ts`, but the real (and only) call site is
-  // `agent-lifecycle.ts`'s `decideOn` — a file that scan never opened — so
-  // it could not have caught `decideOn` reverting to `agent.durableSessionId`
-  // directly. Fixed to read the file that actually contains the call, and
-  // to make BOTH the false-negative and false-positive directions provable.
-  test("resume-id: 'which session id do I resume' has EXACTLY ONE call site, in agent-lifecycle.ts — not agent-actions.ts, not daemon.ts", async () => {
+  // BAKR-22: `sessionToResume` (a bare session id) is retired in favor of
+  // `planRestore` (a `RestorePlan` — `fresh` or `respawn`), for the same
+  // "exactly one seam" reason the original review finding cared about:
+  // whichever function answers "what do I do to restore this agent" must
+  // have exactly the call sites this test pins, so a future edit that
+  // reverts a call site to reading `agent.restoreTarget`/`agent.birthSessionId`
+  // inline (instead of going through the seam) is caught here rather than
+  // discovered as a silent behavioural drift.
+  test("restore-plan: 'what do I do to restore this agent' has EXACTLY ONE call site each in agent-lifecycle.ts and daemon.ts — not agent-actions.ts", async () => {
     const srcDir = join(import.meta.dir, "..", "..", "src");
     const [modelSrc, lifecycleSrc, actionsSrc, daemonSrc] = await Promise.all([
       readFile(join(srcDir, "agent-model.ts"), "utf8"),
@@ -235,64 +264,54 @@ describe("on", () => {
 
     // Strips `//` and `/* */` comments first (crudely — good enough for
     // this codebase's own style, and exactly the class of false positive
-    // review finding 2 named: a doc comment MENTIONING the function's name
-    // must never count as a call site). A CALL is then the name immediately
-    // followed by "(" that is NOT part of "function sessionToResume("
+    // a prior review finding named: a doc comment MENTIONING the function's
+    // name must never count as a call site). A CALL is then the name
+    // immediately followed by "(" that is NOT part of "function planRestore("
     // (the definition itself, in agent-model.ts).
     function stripComments(source: string): string {
       return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     }
     function callSiteCount(source: string): number {
       const code = stripComments(source);
-      const all = code.match(/sessionToResume\(/g) ?? [];
-      const definitions = code.match(/function sessionToResume\(/g) ?? [];
+      const all = code.match(/planRestore\(/g) ?? [];
+      const definitions = code.match(/function planRestore\(/g) ?? [];
       return all.length - definitions.length;
     }
 
-    // PROBE CONTROL, anchored on something genuinely load-bearing (per the
-    // review: not merely "a string is present somewhere"): the definition
-    // line itself must exist in agent-model.ts, AND this scan's own
-    // call-vs-definition arithmetic must correctly exclude it — a scan that
-    // could not tell "function sessionToResume(" from a call would report
+    // PROBE CONTROL, anchored on something genuinely load-bearing: the
+    // definition line itself must exist in agent-model.ts, AND this scan's
+    // own call-vs-definition arithmetic must correctly exclude it — a scan
+    // that could not tell "function planRestore(" from a call would report
     // 1 here instead of 0, silently inflating every other file's count too.
-    expect(modelSrc).toContain("export function sessionToResume(agent: AgentRecord)");
+    expect(modelSrc).toContain("export function planRestore(agent: AgentRecord)");
     expect(callSiteCount(modelSrc)).toBe(0);
 
     // FALSIFIER: this is 0, not 1, if `decideOn` ever reverts to reading
-    // `agent.durableSessionId` inline instead of calling the seam function
-    // — exactly the mutation the review applied and this version catches.
+    // `agent.restoreTarget` inline instead of calling the seam function.
     expect(callSiteCount(lifecycleSrc)).toBe(1);
 
-    // The effect layer must have NO call site of its own — the decision
-    // routes through agent-lifecycle.ts exclusively, never duplicated.
+    // The effect layer must have NO call site of its own — the DECISION
+    // routes through agent-lifecycle.ts exclusively. (It DOES read the
+    // already-decided `decision.agent.restoreTarget` to recover the
+    // forkFrom source id after the decision is made — that is reading an
+    // outcome, not re-deciding one, so it is not a `planRestore` call.)
     expect(callSiteCount(actionsSrc)).toBe(0);
-    expect(actionsSrc).not.toContain(".durableSessionId");
 
-    // POST-MERGE WITH BAKR-18 (2026-09-11): daemon.ts now routes its own
-    // restore decision through this SAME seam — BAKR-18 wired it when it
-    // landed `sessionToResume`. So the expected count here is 1, not 0.
+    // daemon.ts routes its OWN restore decision through the SAME seam.
     // FALSIFIER: 2 would mean a second, unsynchronised decision point; 0
-    // would mean daemon.ts had reverted to reading `.durableSessionId`
-    // inline for its decision. Either breaks BAKR-23's one-line change.
+    // would mean daemon.ts reads `.restoreTarget` inline for its decision.
     expect(callSiteCount(daemonSrc)).toBe(1);
 
-    // daemon.ts does still contain the literal `.durableSessionId` once, but
-    // ONLY inside a log string — never as a resume decision. Asserting its
-    // absence here would be wrong; asserting the call-site count above is
-    // the check that actually constrains behaviour.
-
-    // THE MERGE GUARD, and the reason this test changed at all: BAKR-21 and
-    // BAKR-18 independently shipped IDENTICAL seams under DIFFERENT names
-    // (`sessionIdToResume` and `sessionToResume`). They never conflicted
-    // textually, so git merged both in happily — a merge that is silently
-    // wrong is exactly the failure this epic keeps naming. BAKR-2 required
-    // one name. This pins the retired one as gone from every source file,
-    // so it cannot quietly come back on a future merge.
-    // Checked against STRIPPED source, deliberately: agent-model.ts's own doc
-    // comment narrates this unification and names the retired function, which
-    // is worth keeping. The invariant is that no CODE references it.
+    // THE RETIRED NAMES must never quietly come back on a future merge —
+    // `sessionToResume` (BAKR-18/23-era) and `sessionIdToResume` (its own
+    // BAKR-17/21-era duplicate, retired before it) are BOTH gone from every
+    // source file. Checked against STRIPPED source, deliberately:
+    // agent-model.ts's own doc comment may narrate this history and name a
+    // retired function, which is worth keeping — the invariant is that no
+    // CODE references it.
     for (const src of [modelSrc, lifecycleSrc, actionsSrc, daemonSrc]) {
       expect(stripComments(src)).not.toContain("sessionIdToResume");
+      expect(stripComments(src)).not.toMatch(/[^a-zA-Z]sessionToResume\(/);
     }
   });
 });
@@ -352,12 +371,12 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     expect(fake.listing.length).toBe(2); // both siblings still present — nothing was removed
   });
 
-  test("off calls stopLiveSession and clears liveSessionId on success", async () => {
+  test("off calls stopLiveSession, but BAKR-22 leaves restoreTarget INTACT on success — clearing it would make the next `on` take the `fresh` branch and silently discard the conversation", async () => {
     const dir = await makeTempDir();
     const fake = makeFakeClaude();
     fake.listing.push({ id: "short-1", sessionId: "live-1", cwd: KEY, startedAt: 1, kind: "background" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", liveSessionId: "live-1" }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-1", shortId: "short-1" } }));
 
     const result = await off(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
@@ -370,7 +389,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const store = await loadAgents(deps.agentsPath);
     if (store.status === "loaded") {
       expect(store.state.agents["@a1"]?.state).toBe("off");
-      expect(store.state.agents["@a1"]?.liveSessionId).toBeUndefined();
+      expect(store.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: "live-1", shortId: "short-1" }); // UNCHANGED — a future `on` still respawns it
     }
   });
 
@@ -379,7 +398,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const fake = makeFakeClaude();
     fake.listing.push({ id: "short-2", sessionId: "live-2", cwd: KEY, startedAt: 1, kind: "background" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", liveSessionId: "live-2" }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-2", shortId: "short-2" } }));
 
     const result = await archive(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
@@ -395,7 +414,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const fake = makeFakeClaude();
     fake.listing.push({ id: "short-3", sessionId: "live-3", cwd: KEY, startedAt: 1, kind: "background" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", liveSessionId: "live-3" }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-3", shortId: "short-3" } }));
 
     const result = await deleteAgent(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
@@ -416,56 +435,56 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const dir = await makeTempDir();
     const fake = makeFakeClaude();
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", liveSessionId: undefined }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: undefined }));
     const result = await off(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("nothing-to-stop");
     expect(fake.calls.length).toBe(0);
   });
 
-  test("off: session already gone from a SUCCESSFUL listing — liveSessionId cleared", async () => {
+  test("off: session already gone from a SUCCESSFUL listing — restoreTarget left INTACT (BAKR-22: it is not a liveness cache any more, see the dedicated 'restoreTarget INTACT' test above)", async () => {
     const dir = await makeTempDir();
     const deps = baseDeps(await makeTempDir(), makeFakeClaude().runCommand); // empty listing
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", liveSessionId: "vanished" }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "vanished", shortId: "vanished" } }));
     const result = await off(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("already-gone");
     const store = await loadAgents(deps.agentsPath);
-    if (store.status === "loaded") expect(store.state.agents["@a1"]?.liveSessionId).toBeUndefined();
+    if (store.status === "loaded") expect(store.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: "vanished", shortId: "vanished" });
   });
 
-  test("off: a LISTING FAILURE is reported distinctly and liveSessionId is LEFT ALONE (BAKR-17 Q2: never collapse to 'nothing running')", async () => {
+  test("off: a LISTING FAILURE is reported distinctly and restoreTarget is LEFT ALONE (BAKR-17 Q2: never collapse to 'nothing running')", async () => {
     const dir = await makeTempDir();
     const fake = makeFakeClaude({ failListing: true });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", liveSessionId: "live-1" }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-1", shortId: "short-1" } }));
     const result = await off(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("listing-failed");
     const store = await loadAgents(deps.agentsPath);
     if (store.status === "loaded") {
       expect(store.state.agents["@a1"]?.state).toBe("off"); // the INTENT is still recorded
-      expect(store.state.agents["@a1"]?.liveSessionId).toBe("live-1"); // but the outcome is honest: unknown, so untouched — a retry is meaningful
+      expect(store.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: "live-1", shortId: "short-1" }); // untouched either way — a retry is meaningful
     }
   });
 
-  test("off: a failed `claude stop` is reported and liveSessionId is left alone so a retry is meaningful", async () => {
+  test("off: a failed `claude stop` is reported and restoreTarget is left alone so a retry is meaningful", async () => {
     const dir = await makeTempDir();
     const fake = makeFakeClaude({ stopBehavior: () => ({ ok: false, error: "claude: no such session" }) });
     fake.listing.push({ id: "short-4", sessionId: "live-4", cwd: KEY, startedAt: 1, kind: "background" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", liveSessionId: "live-4" }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-4", shortId: "short-4" } }));
     const result = await off(deps, KEY, "@a1");
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("stop-failed");
     const store = await loadAgents(deps.agentsPath);
-    if (store.status === "loaded") expect(store.state.agents["@a1"]?.liveSessionId).toBe("live-4");
+    if (store.status === "loaded") expect(store.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: "live-4", shortId: "short-4" });
   });
 
   test("delete: when the stop cannot be confirmed, the agent is PARKED as archived, not removed — retrying delete is meaningful", async () => {
     const dir = await makeTempDir();
     const fake = makeFakeClaude({ failListing: true });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", liveSessionId: "live-5" }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-5", shortId: "short-5" } }));
     const result = await deleteAgent(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.kind).toBe("parked");
@@ -484,11 +503,22 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     if (retryResult.ok) expect(retryResult.kind).toBe("deleted");
   });
 
-  test("delete leaves Claude Code's own conversation storage untouched — nothing in this file references it at all", async () => {
+  test("delete leaves Claude Code's own conversation storage untouched — this file may READ it (BAKR-22's transcriptProbeDeps seam) but never writes to it", async () => {
+    // BAKR-22 UPDATE: this file now legitimately references Claude Code's
+    // own conversation-storage tree — read-only, via the injected
+    // `transcriptProbeDeps` seam (`hasResumableTranscript`, transcript-probe.ts),
+    // for the never-spoken-to-then-moved decision. The epic's own ruling:
+    // "reading Claude Code's storage is not forbidden — writing into a
+    // claimed directory [or, by the same principle, into Claude's own
+    // storage] is." So the invariant this test locks in narrows from "no
+    // reference at all" to "no WRITE call" — `rm(`/`unlink` never appear,
+    // and the one path-shape reference that does exist is confined to a
+    // doc comment plus a call to an injected, purely-reading dependency,
+    // never a literal write.
     const source = await readFile(join(import.meta.dir, "..", "..", "src", "agent-actions.ts"), "utf8");
-    expect(source.toLowerCase()).not.toContain(".claude/projects"); // Claude Code's own per-cwd conversation store path shape
     expect(source).not.toContain("rm(");
     expect(source).not.toContain("unlink");
+    expect(source).not.toContain("writeFile");
   });
 });
 
@@ -573,12 +603,12 @@ describe("attachTarget", () => {
   test("on + live: returns the session identity, refuses nothing", async () => {
     const dir = await makeTempDir();
     const deps = baseDeps(dir, makeFakeClaude().runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", durableSessionId: "d1", liveSessionId: "l1" }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "l1", shortId: "l1short0" } }));
     const result = await attachTarget(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.liveSessionId).toBe("l1");
-      expect(result.durableSessionId).toBe("d1");
+      expect(result.restoreSessionId).toBe("l1");
+      expect(result.birthSessionId).toBe("d1");
     }
   });
 

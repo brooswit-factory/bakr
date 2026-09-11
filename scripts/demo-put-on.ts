@@ -35,8 +35,8 @@ import { resolveClaimKey } from "../src/claim-key-resolve";
 import { lexicallyNormalize } from "../src/claim-key";
 import { claimsPath, agentsPath, realRandomBytes } from "../src/paths";
 import { withAgentStoreLock } from "../src/agent-store-io";
-import { beginLaunch, markLaunchFailed, markLaunchStarted, mintUniqueAgentId, putAgent, resolveAgent, resolveLaunch, type AgentRecord } from "../src/agent-model";
-import { launch, listBackgroundSessions, runCommand } from "../src/spawn";
+import { beginLaunch, markLaunchFailed, markLaunchStarted, mintUniqueAgentId, putAgent, resolveAgent, resolveLaunch, resolveRespawnAttempt, type AgentRecord, type AttemptKey } from "../src/agent-model";
+import { launch, listBackgroundSessions, respawnSession, runCommand } from "../src/spawn";
 
 function parseArgs(argv: string[]): { directory: string; agentId: string | undefined } {
   const directory = argv[0];
@@ -75,20 +75,21 @@ async function main(): Promise<void> {
 
   const path = agentsPath();
   let attemptId: string;
-  let priorSessionId: string | undefined;
+  let respawnShortId: string | undefined;
   let targetAgentId: string;
 
   if (agentId !== undefined) {
-    // Restore path: the named agent must already exist, in THIS directory, with a durable session id.
-    const decision = await withAgentStoreLock<{ ok: true; attemptId: string; sessionId: string } | { ok: false; error: string }>(path, (current) => {
+    // Restore path (BAKR-22: now `respawn <shortId>`, not `--resume <fullId>`) — the named agent must already exist, in THIS directory, with a restoreTarget.
+    const decision = await withAgentStoreLock<{ ok: true; attemptId: string; shortId: string } | { ok: false; error: string }>(path, (current) => {
       const outcome = resolveAgent(current, key, agentId);
       if (outcome.outcome === "not-found") return { state: current, result: { ok: false, error: `no agent "${agentId}" found in "${key}"` } };
       if (outcome.outcome === "found-elsewhere") return { state: current, result: { ok: false, error: `agent "${agentId}" belongs to a different directory: "${outcome.directory}"` } };
       const agent = outcome.agent;
-      if (agent.durableSessionId === undefined) return { state: current, result: { ok: false, error: `agent "${agentId}" has no session yet — omit --agent to mint a fresh one` } };
+      if (agent.restoreTarget === undefined) return { state: current, result: { ok: false, error: `agent "${agentId}" has no session yet — omit --agent to mint a fresh one` } };
       const newAttemptId = crypto.randomUUID();
-      const next = beginLaunch(current, agent.id, key, agent.durableSessionId, newAttemptId, Date.now());
-      return { state: next, result: { ok: true, attemptId: newAttemptId, sessionId: agent.durableSessionId } };
+      const attemptKey: AttemptKey = { kind: "respawn", shortId: agent.restoreTarget.shortId };
+      const next = beginLaunch(current, agent.id, key, attemptKey, newAttemptId, Date.now());
+      return { state: next, result: { ok: true, attemptId: newAttemptId, shortId: agent.restoreTarget.shortId } };
     });
     if (decision.status === "malformed") {
       console.error(`refusing to write: agent store at "${path}" is malformed: ${decision.error}`);
@@ -99,13 +100,13 @@ async function main(): Promise<void> {
       process.exit(1);
     }
     attemptId = decision.result.attemptId;
-    priorSessionId = decision.result.sessionId;
+    respawnShortId = decision.result.shortId;
     targetAgentId = agentId;
   } else {
     // Fresh path: mint a brand-new, unnamed `on` agent with no session yet.
     const decision = await withAgentStoreLock<{ attemptId: string; agentId: string }>(path, (current) => {
       const id = mintUniqueAgentId(current, realRandomBytes);
-      const agent: AgentRecord = { id, name: undefined, directory: key, state: "on", createdAt: Date.now(), durableSessionId: undefined, liveSessionId: undefined };
+      const agent: AgentRecord = { id, name: undefined, directory: key, state: "on", createdAt: Date.now(), birthSessionId: undefined, restoreTarget: undefined };
       let next = putAgent(current, agent);
       const newAttemptId = crypto.randomUUID();
       next = beginLaunch(next, id, key, undefined, newAttemptId, Date.now());
@@ -120,15 +121,26 @@ async function main(): Promise<void> {
     console.log(`minted: unnamed agent ${targetAgentId} in "${key}"`);
   }
 
-  const claudeArgs = priorSessionId !== undefined ? ["--resume", priorSessionId] : [];
-  const result = await launch(key, claudeArgs, { runCommand });
+  if (respawnShortId !== undefined) {
+    const result = await respawnSession(respawnShortId, { runCommand });
+    if (!result.ok) {
+      await withAgentStoreLock(path, (current) => ({ state: markLaunchFailed(current, attemptId, result.error), result: undefined }));
+      console.error(`respawn failed: ${result.error}`);
+      process.exit(1);
+    }
+    await withAgentStoreLock(path, (current) => ({ state: resolveRespawnAttempt(current, attemptId), result: undefined }));
+    console.log(`respawned: short id ${respawnShortId} for agent ${targetAgentId} in "${key}" — same session, no fork`);
+    return;
+  }
+
+  const result = await launch(key, [], { runCommand });
   if (!result.ok) {
     await withAgentStoreLock(path, (current) => ({ state: markLaunchFailed(current, attemptId, result.error), result: undefined }));
     console.error(`launch failed: ${result.error}`);
     process.exit(1);
   }
   await withAgentStoreLock(path, (current) => ({ state: markLaunchStarted(current, attemptId, result.id), result: undefined }));
-  console.log(`launched: short id ${result.id} for agent ${targetAgentId} in "${key}"${priorSessionId !== undefined ? ` (resumed from ${priorSessionId})` : ""}`);
+  console.log(`launched: short id ${result.id} for agent ${targetAgentId} in "${key}"`);
 
   const sessions = await listBackgroundSessions({ runCommand });
   const listed = sessions.find((s) => s.id === result.id);
@@ -141,7 +153,7 @@ async function main(): Promise<void> {
     return { state: next, result: next.agents[targetAgentId] };
   });
   if (afterResolve.status === "ok" && afterResolve.result !== undefined) {
-    console.log(`resolved: agent ${targetAgentId} now holds durable session ${afterResolve.result.durableSessionId}`);
+    console.log(`resolved: agent ${targetAgentId} now holds birth session ${afterResolve.result.birthSessionId}`);
   }
 }
 

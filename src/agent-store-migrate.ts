@@ -151,8 +151,8 @@ export function migrateSessionSlots(slots: SessionSlotsState, deps: { readonly n
         directory: key,
         state: "on",
         createdAt: deps.now(),
-        durableSessionId: slot.durableSessionId,
-        liveSessionId: slot.liveSessionId,
+        birthSessionId: slot.durableSessionId,
+        restoreTarget: { sessionId: slot.liveSessionId, shortId: slot.liveSessionId.slice(0, 8) },
       };
       state = putAgent(state, agent);
       agentsCreated += 1;
@@ -199,7 +199,7 @@ export function migrateSessionSlots(slots: SessionSlotsState, deps: { readonly n
       attemptId: record.attemptId,
       agentId,
       key: record.key,
-      priorSessionId: record.priorSessionId,
+      attemptKey: record.priorSessionId === undefined ? undefined : { kind: "respawn", shortId: record.priorSessionId.slice(0, 8) },
       attemptedAt: record.attemptedAt,
       launchShortId: record.launchShortId,
       error: record.error,

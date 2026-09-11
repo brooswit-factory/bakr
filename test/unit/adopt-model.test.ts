@@ -7,7 +7,7 @@ const SOURCE = "/old/path" as ClaimKey;
 const DEST = "/new/path" as ClaimKey;
 
 function makeAgent(overrides: Partial<AgentRecord> & { id: string; directory: ClaimKey }): AgentRecord {
-  return { name: undefined, state: "on", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined, ...overrides };
+  return { name: undefined, state: "on", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined, ...overrides };
 }
 
 function baseInputs(overrides: Partial<AdoptInputs> & { agentState: AgentStoreState }): AdoptInputs {
@@ -155,7 +155,7 @@ describe("applyAdopt: the single state transition (Q3/Q5/Q7)", () => {
     agentState = putAgent(agentState, makeAgent({ id: "@a2", directory: SOURCE }));
     agentState = recordRestoreAttempt(agentState, "@a1");
     agentState = recordRestoreAttempt(agentState, "@a1");
-    agentState = beginLaunch(agentState, "@a1", SOURCE, "some-session", "attempt-1", 100);
+    agentState = beginLaunch(agentState, "@a1", SOURCE, { kind: "respawn", shortId: "some-session" }, "attempt-1", 100);
     agentState = markLaunchFailed(agentState, "attempt-1", "gave up after 3 consecutive restore attempts — unrelated to the move (BAKR-24 required fixture)");
 
     const result = applyAdopt(agentState, DEST, ["@a1", "@a2"]);
@@ -163,36 +163,36 @@ describe("applyAdopt: the single state transition (Q3/Q5/Q7)", () => {
     expect(lookupAgentById(result.state, "@a1")?.directory).toBe(DEST);
     expect(lookupAgentById(result.state, "@a2")?.directory).toBe(DEST);
     expect(restoreAttemptCount(result.state, "@a1")).toBe(0);
-    expect(hasLaunchRecordFor(result.state, "@a1", "some-session")).toBe(false);
+    expect(hasLaunchRecordFor(result.state, "@a1", { kind: "respawn", shortId: "some-session" })).toBe(false);
     expect(result.clearedLaunchRecords).toEqual([{ agentId: "@a1", attemptId: "attempt-1", error: expect.stringContaining("gave up after 3 consecutive restore attempts") }]);
   });
 
   test("REQUIRED FIXTURE (B13/Q5, named explicitly by the epic): a given-up launch record whose cause is UNRELATED to the move is discarded on adopt, and the agent becomes eligible to restore in its new home, AND adopt's typed result reports it as cleared", () => {
-    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: SOURCE, durableSessionId: "durable-x", liveSessionId: "durable-x" }));
+    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: SOURCE, birthSessionId: "durable-x", restoreTarget: { sessionId: "durable-x", shortId: "durable-x" } }));
     // A give-up recorded for a reason that has NOTHING to do with the directory moving (e.g. a flaky network blip during the original restore attempts).
-    agentState = beginLaunch(agentState, "@a1", SOURCE, "durable-x", "given-up-attempt", 100);
+    agentState = beginLaunch(agentState, "@a1", SOURCE, { kind: "respawn", shortId: "durable-x" }, "given-up-attempt", 100);
     agentState = markLaunchFailed(agentState, "given-up-attempt", "gave up after 3 consecutive restore attempts for this agent, none independently verified alive — likely a silently-failing resume (ticket measurement 5); never retried automatically (BAKR-8 Constraint 2)");
 
     // Before adopt: this agent IS blocked from a fresh restore attempt (hasLaunchRecordFor is true for its durable session).
-    expect(hasLaunchRecordFor(agentState, "@a1", "durable-x")).toBe(true);
+    expect(hasLaunchRecordFor(agentState, "@a1", { kind: "respawn", shortId: "durable-x" })).toBe(true);
 
     const decision = decideAdopt({ agentState, source: SOURCE, destination: DEST, agentIds: ["@a1"], sourceVerdictStatus: "gone" });
     expect(decision.ok).toBe(true);
     if (!decision.ok) return;
 
     // BOTH assertions B13 requires: discarded, AND reported.
-    expect(hasLaunchRecordFor(decision.state, "@a1", "durable-x")).toBe(false); // eligible to restore in its new home
+    expect(hasLaunchRecordFor(decision.state, "@a1", { kind: "respawn", shortId: "durable-x" })).toBe(false); // eligible to restore in its new home
     expect(decision.clearedLaunchRecords).toEqual([{ agentId: "@a1", attemptId: "given-up-attempt", error: expect.stringContaining("gave up after 3 consecutive restore attempts") }]);
   });
 
   test("records belonging to agents that were NOT adopted are untouched", () => {
     let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: SOURCE }));
     agentState = putAgent(agentState, makeAgent({ id: "@untouched", directory: SOURCE }));
-    agentState = beginLaunch(agentState, "@untouched", SOURCE, "other-session", "other-attempt", 100);
+    agentState = beginLaunch(agentState, "@untouched", SOURCE, { kind: "respawn", shortId: "other-session" }, "other-attempt", 100);
     agentState = markLaunchFailed(agentState, "other-attempt", "unrelated give-up");
 
     const result = applyAdopt(agentState, DEST, ["@a1"]);
-    expect(hasLaunchRecordFor(result.state, "@untouched", "other-session")).toBe(true);
+    expect(hasLaunchRecordFor(result.state, "@untouched", { kind: "respawn", shortId: "other-session" })).toBe(true);
     expect(lookupAgentById(result.state, "@untouched")?.directory).toBe(SOURCE); // never moved
     expect(result.clearedLaunchRecords).toEqual([]); // nothing cleared for @a1 (it had no records) and @untouched wasn't adopted
   });

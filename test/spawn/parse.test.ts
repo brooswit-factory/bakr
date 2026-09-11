@@ -105,6 +105,18 @@ describe("parseLaunchId", () => {
 });
 
 describe("detectStaleRegisteredCwdRefusal (BAKR-24)", () => {
+  // PINNED STRING, BUILDS MEASURED: "Couldn't start a background session
+  // (working directory no longer exists or is not accessible: <path>)" —
+  // observed on claude 2.1.268 by BAKR-24 (2026-09-11) for `claude --bg
+  // --resume`, and independently re-observed by BAKR-22 (2026-09-11, same
+  // host) for `claude respawn` failing with the IDENTICAL text for the
+  // identical cause — see spawn/respawn.ts's own `isRecognizedStaleCwdRefusal`,
+  // which reuses this exact function rather than re-deriving the string.
+  // THIS IS DELIBERATELY FRAGILE: if a future claude build rewords this
+  // message, `isRecognizedStaleCwdRefusal` stops matching, `forkFrom` is
+  // never reached, and bakr REFUSES (recoverable) rather than silently
+  // forking on a misread — the fragility is the safety property, not a bug
+  // to harden away.
   test("extracts the stale path from the observed exact wording", () => {
     const text = `launch exited 1: Couldn't start a background session (working directory no longer exists or is not accessible: /tmp/bakr-live-e2e/work1)`;
     expect(detectStaleRegisteredCwdRefusal(text)).toBe("/tmp/bakr-live-e2e/work1");

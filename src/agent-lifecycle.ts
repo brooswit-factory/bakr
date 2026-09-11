@@ -26,7 +26,7 @@
 // directory.
 
 import type { ClaimKey } from "./claim-key-resolve";
-import { type AgentRecord, type AgentStoreState, checkNameAvailability, resolveAgent, sessionToResume, validateNameSyntax } from "./agent-model";
+import { type AgentRecord, type AgentStoreState, type RestorePlan, checkNameAvailability, planRestore, resolveAgent, validateNameSyntax } from "./agent-model";
 
 // --- Shared resolution (every verb starts here) ---------------------------
 
@@ -63,7 +63,7 @@ export function resolveOrRefuse(state: AgentStoreState, scope: ClaimKey, ref: st
 export type OnDecision =
   | ResolutionRefusal
   | { readonly ok: false; readonly reason: "archived"; readonly message: string; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly agent: AgentRecord; readonly wasOff: boolean; readonly priorSessionId: string | undefined };
+  | { readonly ok: true; readonly agent: AgentRecord; readonly wasOff: boolean; readonly plan: RestorePlan };
 
 /**
  * Resolution and the LIFECYCLE half of `on` only — refuse archived,
@@ -73,8 +73,9 @@ export type OnDecision =
  * `hasLaunchRecordFor`/`clearFailedLaunchRecord` (agent-model.ts) — kept in
  * `agent-actions.ts`'s `on` so this function stays pure. `wasOff` tells the
  * caller whether a real transition happened (for the "no-change" vs
- * "turn-on" diagonal); `priorSessionId` is `sessionToResume(agent)` —
- * the one call site the ticket's in-place correction requires — computed
+ * "turn-on" diagonal); the launch record is keyed by `attemptKey(agent)`,
+ * derived from `planRestore(agent)` (agent-model.ts) — the one call site
+ * the ticket's in-place correction requires — computed
  * here EITHER WAY, because B13's wedge-clearing applies to an already-"on"
  * agent too (an agent stuck "on" with a wedged fresh-launch record, e.g.
  * from `create` crashing, needs the identical check `on` performs for the
@@ -95,18 +96,18 @@ export function decideOn(state: AgentStoreState, scope: ClaimKey, ref: string): 
   }
 
   const wasOff = agent.state === "off";
-  const priorSessionId = sessionToResume(agent);
+  const plan = planRestore(agent);
   const nextAgent: AgentRecord = wasOff ? { ...agent, state: "on" } : agent;
-  return { ok: true, agent: nextAgent, wasOff, priorSessionId };
+  return { ok: true, agent: nextAgent, wasOff, plan };
 }
 
-// --- off: on -> off (B6), and the caller stops `liveSessionId` -------------
+// --- off: on -> off (B6), and the caller stops `restoreTarget` -------------
 
 export type OffDecision =
   | ResolutionRefusal
   | { readonly ok: false; readonly reason: "archived"; readonly message: string; readonly agent: AgentRecord }
   | { readonly ok: true; readonly kind: "no-change"; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "turn-off"; readonly agent: AgentRecord; readonly liveSessionId: string | undefined };
+  | { readonly ok: true; readonly kind: "turn-off"; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined };
 
 /**
  * Archived is refused rather than treated as an "off" no-change — a
@@ -135,7 +136,7 @@ export function decideOff(state: AgentStoreState, scope: ClaimKey, ref: string):
   if (agent.state === "off") {
     return { ok: true, kind: "no-change", agent };
   }
-  return { ok: true, kind: "turn-off", agent: { ...agent, state: "off" }, liveSessionId: agent.liveSessionId };
+  return { ok: true, kind: "turn-off", agent: { ...agent, state: "off" }, restoreSessionId: agent.restoreTarget?.sessionId };
 }
 
 // --- archive: {on, off} -> archived, keeping the name (B6) -----------------
@@ -143,7 +144,7 @@ export function decideOff(state: AgentStoreState, scope: ClaimKey, ref: string):
 export type ArchiveDecision =
   | ResolutionRefusal
   | { readonly ok: true; readonly kind: "no-change"; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "archive"; readonly agent: AgentRecord; readonly liveSessionId: string | undefined };
+  | { readonly ok: true; readonly kind: "archive"; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined };
 
 export function decideArchive(state: AgentStoreState, scope: ClaimKey, ref: string): ArchiveDecision {
   const resolved = resolveOrRefuse(state, scope, ref);
@@ -155,7 +156,7 @@ export function decideArchive(state: AgentStoreState, scope: ClaimKey, ref: stri
   }
   // `name` is left untouched (B6: archived agents keep their name, so a
   // later unarchive can never collide).
-  return { ok: true, kind: "archive", agent: { ...agent, state: "archived" }, liveSessionId: agent.liveSessionId };
+  return { ok: true, kind: "archive", agent: { ...agent, state: "archived" }, restoreSessionId: agent.restoreTarget?.sessionId };
 }
 
 // --- unarchive: archived -> off, NEVER on (B6) ------------------------------
@@ -242,7 +243,7 @@ export function decideCreateName(state: AgentStoreState, scope: ClaimKey, name: 
 
 // --- delete: any state -> removed, id retired, name freed (B6) -------------
 
-export type DeleteDecision = ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord; readonly liveSessionId: string | undefined };
+export type DeleteDecision = ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined };
 
 /**
  * No "no-change" diagonal: a second `delete` of the same ref resolves
@@ -256,7 +257,7 @@ export type DeleteDecision = ResolutionRefusal | { readonly ok: true; readonly a
 export function decideDelete(state: AgentStoreState, scope: ClaimKey, ref: string): DeleteDecision {
   const resolved = resolveOrRefuse(state, scope, ref);
   if (!resolved.ok) return resolved;
-  return { ok: true, agent: resolved.agent, liveSessionId: resolved.agent.liveSessionId };
+  return { ok: true, agent: resolved.agent, restoreSessionId: resolved.agent.restoreTarget?.sessionId };
 }
 
 // --- attach target: a query, never an act (R18) ----------------------------
@@ -266,7 +267,7 @@ export type AttachDecision =
   | { readonly ok: false; readonly reason: "archived"; readonly message: string; readonly agent: AgentRecord }
   | { readonly ok: false; readonly reason: "off"; readonly message: string; readonly agent: AgentRecord }
   | { readonly ok: false; readonly reason: "not-yet-live"; readonly message: string; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly agent: AgentRecord; readonly liveSessionId: string; readonly durableSessionId: string };
+  | { readonly ok: true; readonly agent: AgentRecord; readonly restoreSessionId: string; readonly birthSessionId: string };
 
 /**
  * Resolves an attach target and decides whether it is attachable NOW — it
@@ -275,7 +276,7 @@ export type AttachDecision =
  * never silently started; `archived` is refused for the same reason
  * on-while-archived is. A THIRD case this file adds, not named explicitly
  * in the epic's list: an `on` agent whose fresh launch has not yet resolved
- * a session at all (`liveSessionId`/`durableSessionId` both still
+ * a session at all (`restoreTarget`/`birthSessionId` both still
  * `undefined`) — distinct from both `off` and a genuine live target, so a
  * caller is told to retry shortly rather than being handed a session id
  * that does not exist yet.
@@ -291,8 +292,8 @@ export function decideAttachTarget(state: AgentStoreState, scope: ClaimKey, ref:
   if (agent.state === "off") {
     return { ok: false, reason: "off", message: `agent ${agent.id} is off — turning it on is the way to attach to it; "attach" never silently starts an agent`, agent };
   }
-  if (agent.liveSessionId === undefined || agent.durableSessionId === undefined) {
+  if (agent.restoreTarget === undefined || agent.birthSessionId === undefined) {
     return { ok: false, reason: "not-yet-live", message: `agent ${agent.id} is on, but its launch has not resolved a session yet — try again shortly`, agent };
   }
-  return { ok: true, agent, liveSessionId: agent.liveSessionId, durableSessionId: agent.durableSessionId };
+  return { ok: true, agent, restoreSessionId: agent.restoreTarget.sessionId, birthSessionId: agent.birthSessionId };
 }
