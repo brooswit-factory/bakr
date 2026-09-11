@@ -9,12 +9,19 @@
 // `agent.directory`, not anything this script does by hand), reconcile
 // (respawn correctly refuses stale-cwd, escapes via forkFrom into B),
 // attach again to the fork (TOKEN2, since a silent fork mints no
-// transcript of its own until spoken to), stop, reconcile AGAIN (the
-// second restore after the move — the actual "does it keep working"
-// question) — verify both tokens from the model's own answer. Content-hash
+// transcript of its own until spoken to), stop, reconcile AGAIN, THEN AT
+// LEAST TWO MORE reconcile cycles (BAKR-27 AC7: at least 3 total after the
+// escape) — verify both tokens from the model's own answer. Content-hash
 // snapshot of B taken immediately after the move/adopt (BEFORE any
-// reconcile cycle runs) and again after both reconcile cycles, diffed with
+// reconcile cycle runs) and again after every reconcile cycle, diffed with
 // the real, content-sensitive `diffTreeSnapshots`.
+//
+// BAKR-27 (B13a): every reconcile cycle's console output from immediately
+// after the escape (cycle #1) through the end is captured, and this
+// script's own PASS/FAIL below REQUIRES zero "unresolved launch" lines for
+// the adopted agent across ALL of them — the false "possibly orphaned"
+// ERROR this ticket exists to stop, which the pre-fix daemon logged on
+// every cycle from cycle #2 onward, forever.
 
 import { randomUUID } from "node:crypto";
 import { lstat, readlink, writeFile } from "node:fs/promises";
@@ -80,6 +87,7 @@ async function main(): Promise<void> {
 
   let scratchDirB = "";
   let startedShortId: string | undefined;
+  const originalConsoleLog = console.log; // BAKR-27: hoisted above `try` so `finally` can always restore it
 
   try {
     // Pre-existing content BEFORE claiming, so the content-hash check has
@@ -155,6 +163,16 @@ async function main(): Promise<void> {
       probeDeps: realOrphanProbeDeps,
     };
 
+    // BAKR-27: capture every reconcile cycle's raw console output from here
+    // through the last of AT LEAST THREE post-escape cycles below — this is
+    // the raw evidence AC7 asks be pasted, not a summary of it.
+    const capturedLines: string[] = [];
+    console.log = (...a: unknown[]) => {
+      const line = a.map(String).join(" ");
+      capturedLines.push(line);
+      originalConsoleLog(...a);
+    };
+
     log("\n--- reconcile cycle #1: respawn should refuse (stale cwd), escape via forkFrom into B ---");
     let cycle = await runReconcileCycle(initialDaemonState(), daemonDeps);
     log(`restored: ${JSON.stringify(cycle.restored)}`);
@@ -203,6 +221,37 @@ async function main(): Promise<void> {
     if (agent?.restoreTarget?.shortId !== forkedShortId) throw new Error(`FAIL: restoreTarget moved again on an ORDINARY second restore — expected it to stay at the fork (${forkedShortId}), got ${agent?.restoreTarget?.shortId}`);
     log(`PASS: second restore after the move used plain respawn — same forked id, no further fork`);
 
+    // BAKR-27 AC7: at least 3 reconcile cycles AFTER the escape are
+    // required — cycle #2 above is the first. Two more, #3 and #4, run
+    // here before this script's own B13a check below, so the false
+    // "possibly orphaned" ERROR this ticket fixes (it logged on every
+    // cycle from #2 onward, forever, pre-fix) has every chance to recur if
+    // it still could.
+    for (const n of [3, 4]) {
+      log(`\n--- reconcile cycle #${n}: BAKR-27 AC7 — a further cycle after the escape, zero "unresolved launch" lines expected ---`);
+      cycle = await runReconcileCycle({ claimDegraded: cycle.claimDegraded, agentsDegraded: cycle.agentsDegraded, orphanReportSignatures: cycle.orphanReportSignatures }, daemonDeps);
+      log(`restored: ${JSON.stringify(cycle.restored)}`);
+      await sleep(1500);
+    }
+
+    // BAKR-27 (B13a): the actual check this ticket exists for — across
+    // EVERY reconcile cycle run above (cycle #1 through #4), zero
+    // "unresolved launch" lines for this agent, and the one-time stale-cwd
+    // refusal line naming it exactly once.
+    console.log = originalConsoleLog;
+    const unresolvedLines = capturedLines.filter((l) => l.includes("unresolved launch for agent") && l.includes(agentId));
+    if (unresolvedLines.length > 0) {
+      log("FAIL lines:");
+      for (const l of unresolvedLines) log(`  - ${l}`);
+      throw new Error(`FAIL (B13a): ${unresolvedLines.length} "unresolved launch" line(s) logged for agent ${agentId} across the escape + ${4} reconcile cycles — the false "possibly orphaned" report this ticket exists to stop`);
+    }
+    log(`PASS (B13a AC2): zero "unresolved launch" lines for agent ${agentId} across all 4 reconcile cycles`);
+    const staleCwdRefusalLines = capturedLines.filter((l) => l.includes(agentId) && l.includes("respawn REFUSED with the recognised stale-cwd shape"));
+    if (staleCwdRefusalLines.length !== 1) {
+      throw new Error(`FAIL (B13a AC2): expected the one-time stale-cwd refusal line exactly once, got ${staleCwdRefusalLines.length}: ${JSON.stringify(staleCwdRefusalLines)}`);
+    }
+    log(`PASS (B13a AC2): the one-time stale-cwd refusal line was logged exactly once`);
+
     // Verify from the model's own answer and the transcript, never bakr's own record.
     await execFileP(process.env["HOME"] + "/.local/bin/claude", ["stop", forkedShortId]).catch(() => {});
     await sleep(1000);
@@ -230,6 +279,7 @@ async function main(): Promise<void> {
     }
     log("PASS: content-hash snapshot shows ZERO changes to the claimed directory across the move, both reconcile cycles, and every attach/stop call");
   } finally {
+    console.log = originalConsoleLog; // BAKR-27: safe even if never overridden (module-scope const captured before the override) or already restored above
     if (startedShortId !== undefined) {
       // The short id changes across a fork — stop whatever it currently is by re-reading the store.
       const finalStore = await loadAgents(agentsPath).catch(() => undefined);
