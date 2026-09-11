@@ -88,11 +88,35 @@ async function resolveOneLaunch(agentsPath: string, launchShortId: string, maxWa
   for (;;) {
     const sessions = await listBackgroundSessions({ runCommand: realRunCommand });
     const found = sessions.find((s) => s.id === launchShortId);
-    if (found !== undefined) {
+    // WAIT FOR A RESOLVABLE pid, not merely for the session to be LISTED.
+    // spawn/parse.ts documents that `pid` is ABSENT (not null, not zero)
+    // whenever claude's own daemon has no resolvable backing process for a
+    // session *right now*, and that this is a TRANSIENT state — "never as
+    // proof the session had died". The product agrees: `decideLiveness`
+    // returns `not-verifiable` for it rather than `dead`.
+    //
+    // This harness used to resolve on the first listing hit and then assert
+    // a pid immediately, which made it STRICTER THAN THE PRODUCT IT
+    // DEMONSTRATES and left it dependent on the session happening to have
+    // been assigned a pid by the time it first appeared. That assumption
+    // held on the author's host and on BAKR-2's, and FAILED on BAKR-17's
+    // (claude 2.1.251) at merge-verification time: both sessions launched
+    // and were listed, both reported `pid=undefined`, and the demo aborted
+    // on its own guard with no product defect involved. Waiting for the pid
+    // — bounded by the same deadline — is the honest fix; retrying the
+    // whole demo until it happened to pass would have been a check passing
+    // for the wrong reason.
+    if (found !== undefined && found.pid !== undefined) {
       await withAgentStoreLock(agentsPath, (current) => ({ state: resolveLaunch(current, launchShortId, found.sessionId), result: undefined }));
       return found;
     }
-    if (Date.now() > deadline) throw new Error(`timed out waiting for launch ${launchShortId} to appear in a listing`);
+    if (Date.now() > deadline) {
+      throw new Error(
+        found === undefined
+          ? `timed out waiting for launch ${launchShortId} to appear in a listing`
+          : `timed out waiting for launch ${launchShortId} to report a resolvable pid (it was listed as ${found.sessionId}, state=${found.state ?? "unknown"}, but claude reported no backing process within ${maxWaitMs}ms)`
+      );
+    }
     await sleep(500);
   }
 }
