@@ -459,12 +459,14 @@ export function parseSessionSlotsState(source: string): ParseResult {
   // written by the pre-BAKR-13 code loads exactly as it did before. Its
   // old directory-keyed entries simply never match a durable session id
   // going forward (a claimed directory path and a claude session id look
-  // nothing alike), so they sit inert — read once, never written back
-  // out under their old key, never causing a parse error — until this
-  // process's own writes eventually replace the whole file. This is
-  // conservative, not lossy: the practical effect is that any in-progress
-  // restore saga at upgrade time gets a fresh budget, the same safe
-  // direction `missing` already takes for a first run.
+  // nothing alike). `parse` keeps the whole map as-is and `serialize`
+  // writes it back out unchanged, so an old directory key IS carried
+  // forward and re-persisted under its old key, indefinitely — it is
+  // never read as a hit, so it never affects a lookup or causes a parse
+  // error, but it also never gets cleaned up. This is harmless dead
+  // weight, not silent data loss: the practical effect is that any
+  // in-progress restore saga at upgrade time gets a fresh budget, the same
+  // safe direction `missing` already takes for a first run.
   const restoreAttemptCountsField = isPlainObject(parsed) ? parsed["restoreAttemptCounts"] : undefined;
   const onByKeyRaw = isPlainObject(parsed) ? parsed["onByKey"] : undefined;
   const onByKeyShapeOk = isPlainObject(onByKeyRaw) && Object.values(onByKeyRaw).every((v) => Array.isArray(v));

@@ -55,26 +55,52 @@ works identically to `./scripts/install.sh` if you prefer to spell it out.
 separate, explicit step, so "installed" and "running" stay observably
 distinct.
 
-**Works from any clone location, not only `~/code/brooswit-factory/bakr`.**
-`systemd/bakr.service`'s `ExecStart` is a template (`@@BUN_PATH@@ run
-@@REPO_ROOT@@/src/index.ts`); the installer resolves `bun`'s real path
-(`command -v bun`) and this clone's real root, substitutes both into the
-copy it writes, and **refuses to install — no unit written, nothing
-enabled — if either does not resolve** (no `bun` on `PATH`, or no
-`src/index.ts` at the resolved root), rather than reporting success for a
-unit that can only ever fail at boot (found in BAKR-1's review of PR #10:
-the previous installer copied the unit verbatim and reported success
-regardless).
+**Works from any clone location, not only `~/code/brooswit-factory/bakr`** —
+including a clone or `bun` path containing whitespace, `%`, `&`, or `\`,
+each demonstrated with `systemd-analyze --user verify` on the actually
+installed unit — **except a path containing a literal `|`**, which the
+installer refuses outright (below). `systemd/bakr.service`'s `ExecStart` is
+a template (`"@@BUN_PATH@@" run "@@REPO_ROOT@@/src/index.ts"`); the
+installer resolves `bun`'s real path (`command -v bun`) and this clone's
+real root, substitutes both into the copy it writes, and **refuses to
+install — no unit written, nothing enabled — if either does not resolve**
+(no `bun` on `PATH`, or no `src/index.ts` at the resolved root), rather
+than reporting success for a unit that can only ever fail at boot (found
+in BAKR-1's review of PR #10: the previous installer copied the unit
+verbatim and reported success regardless).
 
-The substituted values are escaped before they reach `sed`'s replacement
+`ExecStart` is not a shell line — systemd splits it on whitespace and
+expands `%` specifiers on its own, unquoted grammar (found in a later
+round of the same review: a clone path containing a space was silently
+split into two argv entries, and one containing `%d` was silently expanded
+into the unit's own credentials directory, in both cases while the
+installer still reported success). Both substituted arguments are now
+double-quoted in the template, and the installer escapes a literal `%`,
+`"`, or `\` in the resolved values before they land inside those quotes,
+per systemd's own unit-file quoting rules.
+
+The same values are *also* escaped before they reach `sed`'s replacement
 side — an unescaped `&` or `\` there has special meaning (`&` means "the
 whole match"), which previously let a clone path *containing* `&` silently
 substitute the placeholder back into itself while the installer still
 reported success (also found in review; tested by cloning to a path with a
-literal `&` in it). As a second, independent line of defence, the installer
-also refuses — again, nothing written or enabled — if the rendered unit
-still contains an unsubstituted `@@..@@` placeholder for any reason, rather
-than ever installing silently-corrupted content.
+literal `&` in it). A path containing a literal `|` still defeats this
+particular `sed` invocation, which uses `|` as its own delimiter — the
+installer fails loudly there (a `sed` syntax error) and writes nothing, but
+this is an incidental refusal, not a designed one, so don't rely on the
+exact error text.
+
+As an independent line of defence, the installer also refuses — again,
+nothing written or enabled — if the rendered unit still contains an
+unsubstituted `@@..@@` placeholder for any reason, or if `systemd-analyze
+--user verify` (when present on `PATH`) rejects the rendered unit outright.
+**That verify guard is a real but partial safety net, not full coverage:**
+its exit code reliably catches corruption of the `bun` path (the `ExecStart`
+command itself) but, measured directly against this unit's own shape, does
+**not** catch corruption of the clone-path argument — systemd does not
+resolve or validate argument text the way it validates the command — so the
+quoting/escaping above, not this guard, is what actually keeps a clone path
+safe.
 
 **One sharp edge, confirmed the hard way (BAKR-7/BAKR-8):** for a systemd
 *user* unit, the system-level `journalctl -u bakr.service` (no `--user`)

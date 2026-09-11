@@ -26,7 +26,20 @@ Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # substitution and stays systemd-native: it is for subprocesses THIS
 # process spawns (e.g. `claude`), not for finding bun itself, so the
 # reasoning above for why it exists keeps holding regardless.
-ExecStart=@@BUN_PATH@@ run @@REPO_ROOT@@/src/index.ts
+#
+# Both substituted arguments are double-quoted (BAKR-14, review of PR #10
+# round 3): ExecStart is not a shell line — systemd splits it on whitespace
+# and expands `%` specifiers on its own, unquoted grammar — so a clone or
+# `bun` path containing a space is split into two argv entries and one
+# containing `%` (e.g. a literal `%d`) is silently expanded into a
+# specifier value, in either case yielding a unit that can never start
+# while install.sh still reported success. Quoting keeps embedded
+# whitespace as one token; install.sh additionally escapes `%` -> `%%` and
+# any literal `"` / `\` in the resolved values before they land inside
+# these quotes, per systemd's own unit-file quoting rules (see
+# scripts/install.sh's `escape_systemd_arg`), so the quotes themselves can
+# never be broken out of by a hostile-looking-but-real path.
+ExecStart="@@BUN_PATH@@" run "@@REPO_ROOT@@/src/index.ts"
 Restart=on-failure
 RestartSec=5
 
