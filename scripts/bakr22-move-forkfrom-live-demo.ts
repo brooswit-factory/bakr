@@ -21,6 +21,7 @@ import { lstat, readlink, writeFile } from "node:fs/promises";
 import { mkdtemp, rm, rename } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { snapshotTree, diffTreeSnapshots } from "../test/integration/fixtures/tree-snapshot";
@@ -59,8 +60,10 @@ async function resolveOneLaunch(agentsPath: string, launchShortId: string, maxWa
   }
 }
 
+const ATTACH_PROBE_PATH = join(dirname(fileURLToPath(import.meta.url)), "attach-probe.py");
+
 async function attachAndSay(shortId: string, message: string): Promise<void> {
-  await execFileP("python3", ["/tmp/claude-1001/-home-wroosbit-butchr-workspaces-BAKR-22/scratchpad/attach_probe.py", shortId, message], { timeout: 40_000 });
+  await execFileP("python3", [ATTACH_PROBE_PATH, shortId, message], { timeout: 40_000 });
 }
 
 async function main(): Promise<void> {

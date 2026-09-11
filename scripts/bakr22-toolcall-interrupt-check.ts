@@ -10,7 +10,8 @@ import { randomUUID } from "node:crypto";
 import { lstat, readlink } from "node:fs/promises";
 import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { claim, emptyStore } from "../src/claim-model";
@@ -48,11 +49,13 @@ async function resolveOneLaunch(agentsPath: string, launchShortId: string, maxWa
   }
 }
 
+const ATTACH_PROBE_PATH = join(dirname(fileURLToPath(import.meta.url)), "attach-probe.py");
+
 async function attachAndSayNoWait(shortId: string, message: string): Promise<void> {
   // Fire-and-forget: does NOT await the pty script's own internal 20s
   // settle sleep — we want to poll the transcript ourselves and kill as
   // soon as a tool_use appears, not wait for the script's own timeline.
-  execFileP("python3", ["/tmp/claude-1001/-home-wroosbit-butchr-workspaces-BAKR-22/scratchpad/attach_probe.py", shortId, message], { timeout: 40_000 }).catch(() => {});
+  execFileP("python3", [ATTACH_PROBE_PATH, shortId, message], { timeout: 40_000 }).catch(() => {});
 }
 
 async function findTranscriptPath(cwdSlugHint: string, sessionId: string): Promise<string | undefined> {

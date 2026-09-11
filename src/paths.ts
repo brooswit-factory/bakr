@@ -55,7 +55,7 @@ export const realOrphanProbeDeps: OrphanProbeDeps = {
   },
 };
 
-/** The real read-only filesystem access for `hasResumableTranscript` (transcript-probe.ts) — Claude Code's own `~/.claude/projects/` tree. Reading is permitted; nothing here ever writes. Every failure mode (missing root, permission error, not a regular file) reads as "not found" rather than throwing, per that module's own "prefer fresh" direction. */
+/** The real read-only filesystem access for `probeResumableTranscript` (transcript-probe.ts) — Claude Code's own `~/.claude/projects/` tree. Reading is permitted; nothing here ever writes. ONLY confirmed absence reads as "not found": `ENOENT` on a specific `<sessionId>.jsonl` file, or that file existing but not being a regular file. A missing/unreadable projects ROOT, or any other error (e.g. `EACCES`) checking an individual directory, is surfaced as `{ok:false}` — `could-not-tell`, never folded into "not found" — per that module's own explicit correction away from a boolean. */
 export const realTranscriptProbeDeps: TranscriptProbeDeps = {
   listProjectDirs: async () => {
     try {
