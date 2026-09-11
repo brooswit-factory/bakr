@@ -245,11 +245,22 @@ type OnLockResult =
  *
  * B8 still binds absolutely: no prompt, ever. The id a restore resumes is
  * NOT hard-coded here — it comes from `decideOn`'s own call to
- * `agent-model.ts`'s `sessionIdToResume`, the one function/call site the
- * ticket's in-place correction (2026-09-11) requires, so adopting BAKR-23's
- * eventual rule for "which id do I resume" is a one-line change there, not
- * a hunt through this file. A never-launched agent's fresh launch passes
+ * `agent-model.ts`'s `sessionToResume`, which is THE single function that
+ * answers "which id do I resume" for the whole tree: `decideOn` (this
+ * file's `on`) and `daemon.ts`'s restore path are its only call sites, so
+ * BAKR-23's eventual rule lands inside that one function rather than in a
+ * hunt across call sites. A never-launched agent's fresh launch passes
  * nothing (that function returns `undefined` for it).
+ *
+ * (This comment named `sessionIdToResume` until the BAKR-18 merge. BAKR-21
+ * and BAKR-18 had independently shipped identical seams under different
+ * names, which git merged cleanly because nothing conflicted textually;
+ * BAKR-2 required one name and `sessionToResume` won, being already on
+ * `main` and already wired into the daemon. Worth recording because the
+ * seam test scans COMMENT-STRIPPED source — by design, so the history can
+ * be told — which means a stale comment like the old one is exactly the
+ * thing that test structurally cannot catch, and it would have sent
+ * BAKR-23 looking for a function that no longer exists.)
  */
 export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<OnResult> {
   const decided = await withAgentStoreLock<OnLockResult>(
