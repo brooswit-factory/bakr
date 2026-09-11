@@ -10,7 +10,7 @@
 
 import { randomUUID } from "node:crypto";
 import { runCommand } from "./spawn";
-import { claimsPath, sessionSlotsPath, agentsPath, realRandomBytes, realOrphanProbeDeps } from "./paths";
+import { claimsPath, sessionSlotsPath, agentsPath, realRandomBytes, realOrphanProbeDeps, realTranscriptProbeDeps } from "./paths";
 import { runDaemonLoop, type DaemonDeps } from "./daemon";
 import { log } from "./log";
 
@@ -43,6 +43,7 @@ function realDeps(): DaemonDeps {
     generateAttemptId: () => randomUUID(),
     randomBytes: realRandomBytes,
     probeDeps: realOrphanProbeDeps,
+    transcriptProbeDeps: realTranscriptProbeDeps,
   };
 }
 

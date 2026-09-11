@@ -20,9 +20,9 @@ function entry(overrides: Partial<BackgroundSessionInfo> = {}): BackgroundSessio
 }
 
 describe("decideLiveness", () => {
-  test("no entry in the listing -> unknown, never dead", () => {
+  test("no entry in the listing -> absent, never dead", () => {
     expect(decideLiveness("abc", undefined, false)).toEqual({
-      status: "unknown",
+      status: "absent",
       reason: expect.stringContaining('"abc"'),
     });
   });
@@ -65,17 +65,27 @@ describe("checkLiveness", () => {
     expect(verdict.status).toBe("not-verifiable");
   });
 
-  test("a listing that does not contain the session reports unknown, not dead", async () => {
+  test("a listing that does not contain the session reports absent, not dead", async () => {
     const verdict = await checkLiveness("abc", {
       runCommand: async () => ({ exitCode: 0, stdout: "[]", stderr: "" }),
     });
-    expect(verdict.status).toBe("unknown");
+    expect(verdict.status).toBe("absent");
   });
 
-  test("a failed listing reports unknown, not dead, and never throws", async () => {
+  // BAKR-22: THIS is the test that closes the epic's incident — a listing
+  // FAILURE must report its OWN verdict (`listing-failed`), DISTINCT from
+  // `absent` (a listing that succeeded and simply did not find the
+  // session). Before this split, both cases were folded into `unknown`,
+  // and a respawn-style gate reachable on "not alive" could not tell a
+  // genuinely-gone session apart from a transient CLI hiccup — killing and
+  // restarting a session an operator was actively using. Falsifier: if
+  // `checkLiveness` still folded these together, this test's `.status`
+  // would read `absent` (or the old `unknown`), not `listing-failed`.
+  test("a failed listing reports its OWN verdict, listing-failed — NEVER absent, and never throws", async () => {
     const verdict = await checkLiveness("abc", {
       runCommand: async () => ({ exitCode: 1, stdout: "", stderr: "not logged in" }),
     });
-    expect(verdict).toEqual({ status: "unknown", reason: expect.stringContaining("not logged in") });
+    expect(verdict).toEqual({ status: "listing-failed", reason: expect.stringContaining("not logged in") });
+    expect(verdict.status).not.toBe("absent");
   });
 });

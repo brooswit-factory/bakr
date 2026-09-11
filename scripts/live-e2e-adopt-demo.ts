@@ -92,8 +92,8 @@ async function main(): Promise<void> {
   const claimState = claimLoaded.status === "loaded" ? claimLoaded.state : emptyStore();
   await saveClaims(claimsFile, claim(claimState, source, Date.now()).state);
 
-  const agent1: AgentRecord = { id: "@demo-unnamed", name: undefined, directory: source, state: "on", createdAt: Date.now(), durableSessionId: sessionId1, liveSessionId: sessionId1 };
-  const agent2: AgentRecord = { id: "@demo-named", name: "worker-two", directory: source, state: "on", createdAt: Date.now(), durableSessionId: sessionId2, liveSessionId: sessionId2 };
+  const agent1: AgentRecord = { id: "@demo-unnamed", name: undefined, directory: source, state: "on", createdAt: Date.now(), birthSessionId: sessionId1, restoreTarget: { sessionId: sessionId1, shortId: sessionId1.slice(0, 8) } };
+  const agent2: AgentRecord = { id: "@demo-named", name: "worker-two", directory: source, state: "on", createdAt: Date.now(), birthSessionId: sessionId2, restoreTarget: { sessionId: sessionId2, shortId: sessionId2.slice(0, 8) } };
   const agentsLoaded = await loadAgents(agentsFile);
   let agentState = agentsLoaded.status === "loaded" ? agentsLoaded.state : emptyAgentStore();
   agentState = putAgent(agentState, agent1);
@@ -166,16 +166,16 @@ async function main(): Promise<void> {
     if (finalAgents.status !== "loaded") throw new Error("final agents store not loaded");
     const final1 = finalAgents.state.agents["@demo-unnamed"];
     const final2 = finalAgents.state.agents["@demo-named"];
-    console.log(`final @demo-unnamed: durable=${final1?.durableSessionId} live=${final1?.liveSessionId} directory=${final1?.directory}`);
-    console.log(`final @demo-named:   durable=${final2?.durableSessionId} live=${final2?.liveSessionId} directory=${final2?.directory}`);
+    console.log(`final @demo-unnamed: birth=${final1?.birthSessionId} restore=${final1?.restoreTarget?.sessionId} directory=${final1?.directory}`);
+    console.log(`final @demo-named:   birth=${final2?.birthSessionId} restore=${final2?.restoreTarget?.sessionId} directory=${final2?.directory}`);
 
-    if (final1?.durableSessionId !== sessionId1 || final2?.durableSessionId !== sessionId2) throw new Error("FAIL: a durableSessionId changed — it must never be overwritten by a restore");
-    if (final1?.liveSessionId === sessionId1 || final2?.liveSessionId === sessionId2) throw new Error("FAIL: liveSessionId did not rotate — fact 2 says --resume always forks a NEW session id");
-    console.log("PASS: durable id unchanged, live id rotated on both agents (matches the ticket's own measured fact 2)");
+    if (final1?.birthSessionId !== sessionId1 || final2?.birthSessionId !== sessionId2) throw new Error("FAIL: a birthSessionId changed — it must never be overwritten by a restore");
+    if (final1?.restoreTarget?.sessionId === sessionId1 || final2?.restoreTarget?.sessionId === sessionId2) throw new Error("FAIL: restoreTarget did not advance — a moved directory must escape via forkFrom, minting a NEW session id");
+    console.log("PASS: birth id unchanged, restoreTarget advanced via forkFrom on both agents (BAKR-22's moved-directory escape)");
 
     console.log(`[6/6] INDEPENDENT VERIFICATION — never trusting bakr's own record`);
-    const t1 = await findTranscriptText(newDir, final1!.liveSessionId!);
-    const t2 = await findTranscriptText(newDir, final2!.liveSessionId!);
+    const t1 = await findTranscriptText(newDir, final1!.restoreTarget!.sessionId);
+    const t2 = await findTranscriptText(newDir, final2!.restoreTarget!.sessionId);
     console.log(`on-disk transcript for demo-unnamed's NEW session exists under the NEW path's slug: ${t1 !== undefined}`);
     console.log(`on-disk transcript for demo-named's NEW session exists under the NEW path's slug: ${t2 !== undefined}`);
   } else {

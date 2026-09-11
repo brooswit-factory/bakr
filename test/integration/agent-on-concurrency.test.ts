@@ -30,7 +30,7 @@ const AGENT_ID = "@race-on-agent0000";
 const CONTENDERS = 8;
 
 async function seedOffAgent(agentsPath: string): Promise<void> {
-  const agent: AgentRecord = { id: AGENT_ID, name: undefined, directory: KEY, state: "off", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined };
+  const agent: AgentRecord = { id: AGENT_ID, name: undefined, directory: KEY, state: "off", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined };
   await save(agentsPath, putAgent(emptyAgentStore(), agent));
 }
 

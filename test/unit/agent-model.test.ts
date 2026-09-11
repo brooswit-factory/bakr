@@ -38,8 +38,8 @@ function makeAgent(overrides: Partial<AgentRecord> & { id: string }): AgentRecor
     directory: DIR_A,
     state: "on",
     createdAt: 1000,
-    durableSessionId: undefined,
-    liveSessionId: undefined,
+    birthSessionId: undefined,
+    restoreTarget: undefined,
     ...overrides,
   };
 }
@@ -272,16 +272,16 @@ describe("hasLaunchRecordFor: keyed by AGENT id, not directory (AC4)", () => {
 });
 
 describe("resolveLaunch: attaches by AGENT id, never by directory arrival order (the fix for defect 1, AC4)", () => {
-  test("fresh launch: sets the requesting agent's durable+live session id", () => {
+  test("fresh launch: sets the requesting agent's birth session id AND restoreTarget", () => {
     let state = emptyAgentStore();
-    state = putAgent(state, makeAgent({ id: "@agent-1", directory: DIR_A, durableSessionId: undefined }));
+    state = putAgent(state, makeAgent({ id: "@agent-1", directory: DIR_A, birthSessionId: undefined }));
     state = beginLaunch(state, "@agent-1", DIR_A, undefined, "attempt-1", 1000);
     state = markLaunchStarted(state, "attempt-1", "short-1");
     state = resolveLaunch(state, "short-1", "session-uuid-1");
 
     const agent = state.agents["@agent-1"] as AgentRecord;
-    expect(agent.durableSessionId).toBe("session-uuid-1");
-    expect(agent.liveSessionId).toBe("session-uuid-1");
+    expect(agent.birthSessionId).toBe("session-uuid-1");
+    expect(agent.restoreTarget).toEqual({ sessionId: "session-uuid-1", shortId: "short-1" });
     expect(pendingLaunches(state)).toEqual([]);
   });
 
@@ -299,31 +299,40 @@ describe("resolveLaunch: attaches by AGENT id, never by directory arrival order 
     state = resolveLaunch(state, "short-2", "session-for-agent-2");
     state = resolveLaunch(state, "short-1", "session-for-agent-1");
 
-    expect((state.agents["@agent-1"] as AgentRecord).durableSessionId).toBe("session-for-agent-1");
-    expect((state.agents["@agent-2"] as AgentRecord).durableSessionId).toBe("session-for-agent-2");
+    expect((state.agents["@agent-1"] as AgentRecord).birthSessionId).toBe("session-for-agent-1");
+    expect((state.agents["@agent-2"] as AgentRecord).birthSessionId).toBe("session-for-agent-2");
   });
 
-  test("restore: updates ONLY liveSessionId — durableSessionId is NEVER overwritten (ported fix from session-slots.ts)", () => {
+  test("forkFrom: updates ONLY restoreTarget — birthSessionId is NEVER overwritten (BAKR-22: the moved-directory escape must never touch birth provenance)", () => {
     let state = emptyAgentStore();
-    state = putAgent(state, makeAgent({ id: "@agent-1", directory: DIR_A, durableSessionId: "durable-1", liveSessionId: "durable-1" }));
-    state = beginLaunch(state, "@agent-1", DIR_A, "durable-1", "attempt-2", 2000);
+    state = putAgent(state, makeAgent({ id: "@agent-1", directory: DIR_A, birthSessionId: "durable-1", restoreTarget: { sessionId: "durable-1", shortId: "durabl-1" } }));
+    state = beginLaunch(state, "@agent-1", DIR_A, { kind: "forkFrom", sessionId: "durable-1" }, "attempt-2", 2000);
     state = markLaunchStarted(state, "attempt-2", "short-2");
-    state = resolveLaunch(state, "short-2", "rotated-live-id");
+    state = resolveLaunch(state, "short-2", "forked-session-id");
 
     const agent = state.agents["@agent-1"] as AgentRecord;
-    expect(agent.durableSessionId).toBe("durable-1"); // unchanged
-    expect(agent.liveSessionId).toBe("rotated-live-id");
+    expect(agent.birthSessionId).toBe("durable-1"); // unchanged
+    expect(agent.restoreTarget).toEqual({ sessionId: "forked-session-id", shortId: "short-2" });
   });
 
-  test("a restore whose priorSessionId no longer matches the agent's current durableSessionId is a defensive no-op on the agent (never silently reassigns a durable id)", () => {
+  test("a forkFrom whose sessionId no longer matches the agent's CURRENT restoreTarget.sessionId is a defensive no-op on the agent (never silently reassigns the restore target from a stale source)", () => {
     let state = emptyAgentStore();
-    state = putAgent(state, makeAgent({ id: "@agent-1", directory: DIR_A, durableSessionId: "durable-current" }));
-    state = beginLaunch(state, "@agent-1", DIR_A, "stale-durable-id", "attempt-1", 1000);
+    state = putAgent(state, makeAgent({ id: "@agent-1", directory: DIR_A, birthSessionId: "durable-current", restoreTarget: { sessionId: "durable-current", shortId: "durabl-c" } }));
+    state = beginLaunch(state, "@agent-1", DIR_A, { kind: "forkFrom", sessionId: "stale-durable-id" }, "attempt-1", 1000);
     state = markLaunchStarted(state, "attempt-1", "short-1");
     state = resolveLaunch(state, "short-1", "new-live-id");
 
-    expect((state.agents["@agent-1"] as AgentRecord).durableSessionId).toBe("durable-current");
-    expect((state.agents["@agent-1"] as AgentRecord).liveSessionId).toBeUndefined();
+    expect((state.agents["@agent-1"] as AgentRecord).restoreTarget).toEqual({ sessionId: "durable-current", shortId: "durabl-c" });
+  });
+
+  test("a respawn-kind attemptKey resolving via resolveLaunch touches nothing on the agent — respawn attempts resolve synchronously via resolveRespawnAttempt instead, never through this function", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@agent-1", directory: DIR_A, birthSessionId: "durable-1", restoreTarget: { sessionId: "durable-1", shortId: "durabl-1" } }));
+    state = beginLaunch(state, "@agent-1", DIR_A, { kind: "respawn", shortId: "durabl-1" }, "attempt-2", 2000);
+    state = markLaunchStarted(state, "attempt-2", "short-2");
+    const before = state.agents["@agent-1"];
+    state = resolveLaunch(state, "short-2", "some-session-id");
+    expect(state.agents["@agent-1"]).toEqual(before as AgentRecord);
   });
 
   test("resolving an unknown short id is a no-op, not an error", () => {
@@ -355,7 +364,7 @@ describe("failed launches: permanently unresolved, never auto-cleared (ported)",
 describe("promoteUnresolvableLaunches: closes the crash-mid-launch wedge (ported)", () => {
   test("a record with no launchShortId and no error is promoted to unresolved", () => {
     let state = emptyAgentStore();
-    state = beginLaunch(state, "@agent-1", DIR_A, "prior-id", "attempt-1", 1000);
+    state = beginLaunch(state, "@agent-1", DIR_A, { kind: "respawn", shortId: "prior-id" }, "attempt-1", 1000);
     state = promoteUnresolvableLaunches(state, "crashed mid-launch");
     expect(unresolvedLaunches(state)).toHaveLength(1);
     expect(unresolvedLaunches(state)[0]?.error).toBe("crashed mid-launch");
@@ -403,12 +412,19 @@ describe("wire format round-trip", () => {
 
   test("a store with agents, launches, retired ids, and retry counts round-trips", () => {
     let state = emptyAgentStore();
-    state = putAgent(state, makeAgent({ id: "@a1", name: "build", directory: DIR_A, durableSessionId: "d1", liveSessionId: "l1" }));
+    state = putAgent(state, makeAgent({ id: "@a1", name: "build", directory: DIR_A, birthSessionId: "d1", restoreTarget: { sessionId: "l1", shortId: "l1shortx" } }));
     state = putAgent(state, makeAgent({ id: "@a2", directory: DIR_B, state: "archived" }));
-    state = beginLaunch(state, "@a1", DIR_A, "d1", "attempt-1", 1000);
+    state = beginLaunch(state, "@a1", DIR_A, { kind: "respawn", shortId: "d1short0" }, "attempt-1", 1000);
     state = markLaunchFailed(state, "attempt-1", "boom");
     state = recordRestoreAttempt(state, "@a1");
     state = { ...state, retiredIds: ["@retired-1"] };
+    expectRoundTrips(state);
+  });
+
+  test("a store with a forkFrom-kind launch record round-trips", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A, birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: "d1short0" } }));
+    state = beginLaunch(state, "@a1", DIR_A, { kind: "forkFrom", sessionId: "d1" }, "attempt-1", 1000);
     expectRoundTrips(state);
   });
 
@@ -421,16 +437,16 @@ describe("wire format round-trip", () => {
   });
 
   test("a wrong version number is reported as a typed error", () => {
-    expect(parseAgentStoreState(JSON.stringify({ version: 2, agents: {}, retiredIds: [], launches: [], restoreAttemptCounts: {} })).ok).toBe(false);
+    expect(parseAgentStoreState(JSON.stringify({ version: 3, agents: {}, retiredIds: [], launches: [], restoreAttemptCounts: {} })).ok).toBe(false);
   });
 
   test("an invalid lifecycle state value is reported as a typed error", () => {
-    const bad = { version: 1, agents: { "@a1": { id: "@a1", name: null, directory: "/x", state: "paused", createdAt: 1, durableSessionId: null, liveSessionId: null } }, launches: [] };
+    const bad = { version: 2, agents: { "@a1": { id: "@a1", name: null, directory: "/x", state: "paused", createdAt: 1, birthSessionId: null, restoreTarget: null } }, launches: [] };
     expect(parseAgentStoreState(JSON.stringify(bad)).ok).toBe(false);
   });
 
   test("retiredIds and restoreAttemptCounts are OPTIONAL in the persisted shape — absence defaults, not malformed", () => {
-    const result = parseAgentStoreState(JSON.stringify({ version: 1, agents: {}, launches: [] }));
+    const result = parseAgentStoreState(JSON.stringify({ version: 2, agents: {}, launches: [] }));
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.state.retiredIds).toEqual([]);
@@ -439,15 +455,95 @@ describe("wire format round-trip", () => {
   });
 
   test("a PRESENT but invalid retiredIds/restoreAttemptCounts is still rejected — a default for absence, not a loosened shape check", () => {
-    expect(parseAgentStoreState(JSON.stringify({ version: 1, agents: {}, launches: [], retiredIds: "not-an-array" })).ok).toBe(false);
-    expect(parseAgentStoreState(JSON.stringify({ version: 1, agents: {}, launches: [], restoreAttemptCounts: { a: "x" } })).ok).toBe(false);
+    expect(parseAgentStoreState(JSON.stringify({ version: 2, agents: {}, launches: [], retiredIds: "not-an-array" })).ok).toBe(false);
+    expect(parseAgentStoreState(JSON.stringify({ version: 2, agents: {}, launches: [], restoreAttemptCounts: { a: "x" } })).ok).toBe(false);
   });
 
   test("a malformed agent entry is reported as a typed error", () => {
-    expect(parseAgentStoreState(JSON.stringify({ version: 1, agents: { "@a1": { id: "@a1" } }, launches: [] })).ok).toBe(false);
+    expect(parseAgentStoreState(JSON.stringify({ version: 2, agents: { "@a1": { id: "@a1" } }, launches: [] })).ok).toBe(false);
   });
 
   test("a malformed launch record is reported as a typed error", () => {
-    expect(parseAgentStoreState(JSON.stringify({ version: 1, agents: {}, launches: [{ attemptId: 5 }] })).ok).toBe(false);
+    expect(parseAgentStoreState(JSON.stringify({ version: 2, agents: {}, launches: [{ attemptId: 5 }] })).ok).toBe(false);
+  });
+
+  // --- BAKR-22: v1 -> v2 migration, in-memory, on parse -------------------
+
+  describe("v1 store migration (durableSessionId/liveSessionId/priorSessionId -> birthSessionId/restoreTarget/attemptKey)", () => {
+    test("a plain v1 agent (no fork ever happened: durableSessionId === liveSessionId) migrates cleanly", () => {
+      const v1 = {
+        version: 1,
+        agents: {
+          "@a1": { id: "@a1", name: null, directory: "/x", state: "on", createdAt: 1000, durableSessionId: "abcd1234-full-uuid", liveSessionId: "abcd1234-full-uuid" },
+        },
+        launches: [],
+      };
+      const result = parseAgentStoreState(JSON.stringify(v1));
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const agent = result.state.agents["@a1"] as AgentRecord;
+      expect(agent.birthSessionId).toBe("abcd1234-full-uuid");
+      expect(agent.restoreTarget).toEqual({ sessionId: "abcd1234-full-uuid", shortId: "abcd1234" });
+    });
+
+    test("THE SUBTLE CASE: a v1 agent whose liveSessionId is a 2.1.251-era FORK of its durableSessionId — restoreTarget must prefer the MORE RECENT liveSessionId, never fall back to birth", () => {
+      const v1 = {
+        version: 1,
+        agents: {
+          "@a1": { id: "@a1", name: null, directory: "/x", state: "on", createdAt: 1000, durableSessionId: "birth0000-uuid", liveSessionId: "forked111-uuid" },
+        },
+        launches: [],
+      };
+      const result = parseAgentStoreState(JSON.stringify(v1));
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const agent = result.state.agents["@a1"] as AgentRecord;
+      expect(agent.birthSessionId).toBe("birth0000-uuid"); // birth provenance preserved exactly
+      expect(agent.restoreTarget).toEqual({ sessionId: "forked111-uuid", shortId: "forked11" }); // but restore advances to the fork, not birth
+    });
+
+    test("a v1 agent with no session at all yet gets no restoreTarget either — planRestore already treats that as fresh", () => {
+      const v1 = { version: 1, agents: { "@a1": { id: "@a1", name: null, directory: "/x", state: "on", createdAt: 1000, durableSessionId: null, liveSessionId: null } }, launches: [] };
+      const result = parseAgentStoreState(JSON.stringify(v1));
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const agent = result.state.agents["@a1"] as AgentRecord;
+      expect(agent.birthSessionId).toBeUndefined();
+      expect(agent.restoreTarget).toBeUndefined();
+    });
+
+    test("a v1 launch record's priorSessionId migrates to a respawn-kind attemptKey, derived-short-id-consistent with the agent's own migrated restoreTarget (B13 give-up survives migration)", () => {
+      const v1 = {
+        version: 1,
+        agents: {
+          "@a1": { id: "@a1", name: null, directory: "/x", state: "on", createdAt: 1000, durableSessionId: "given0000-up-uuid", liveSessionId: "given0000-up-uuid" },
+        },
+        launches: [{ attemptId: "att-1", agentId: "@a1", key: "/x", priorSessionId: "given0000-up-uuid", attemptedAt: 1, launchShortId: null, error: "gave up" }],
+      };
+      const result = parseAgentStoreState(JSON.stringify(v1));
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      const agent = result.state.agents["@a1"] as AgentRecord;
+      const launch = result.state.launches[0];
+      expect(launch?.attemptKey).toEqual({ kind: "respawn", shortId: "given000" });
+      expect(agent.restoreTarget?.shortId).toBe("given000"); // same derived short id — the give-up still matches on the next respawn attempt
+    });
+
+    test("a v1 fresh-launch attempt (priorSessionId absent) stays a fresh (undefined) attemptKey after migration", () => {
+      const v1 = {
+        version: 1,
+        agents: {},
+        launches: [{ attemptId: "att-1", agentId: "@a1", key: "/x", priorSessionId: null, attemptedAt: 1, launchShortId: null, error: "boom" }],
+      };
+      const result = parseAgentStoreState(JSON.stringify(v1));
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.state.launches[0]?.attemptKey).toBeUndefined();
+    });
+
+    test("a v2 store round-tripped through v1-shaped parsing paths is rejected as malformed (v1 agent entries require durableSessionId/liveSessionId, not birthSessionId/restoreTarget)", () => {
+      const mixedUp = { version: 1, agents: { "@a1": { id: "@a1", name: null, directory: "/x", state: "on", createdAt: 1, birthSessionId: "x", restoreTarget: null } }, launches: [] };
+      expect(parseAgentStoreState(JSON.stringify(mixedUp)).ok).toBe(false);
+    });
   });
 });

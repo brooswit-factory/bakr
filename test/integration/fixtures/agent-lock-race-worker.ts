@@ -29,7 +29,7 @@ const workerId: string = workerIdRaw;
 const count = Number(countRaw);
 
 function makeAgent(id: string): AgentRecord {
-  return { id, name: undefined, directory: "/race" as ClaimKey, state: "on", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined };
+  return { id, name: undefined, directory: "/race" as ClaimKey, state: "on", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined };
 }
 
 async function main(): Promise<void> {

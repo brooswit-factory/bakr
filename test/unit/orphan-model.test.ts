@@ -8,7 +8,7 @@ import type { ClaimKey } from "../../src/claim-key-resolve";
 const KEY = "/old/path" as ClaimKey;
 
 function makeAgent(overrides: Partial<AgentRecord> & { id: string; directory: ClaimKey }): AgentRecord {
-  return { name: undefined, state: "on", createdAt: 1, durableSessionId: undefined, liveSessionId: undefined, ...overrides };
+  return { name: undefined, state: "on", createdAt: 1, birthSessionId: undefined, restoreTarget: undefined, ...overrides };
 }
 
 describe("classifyDirectory (Q1)", () => {
