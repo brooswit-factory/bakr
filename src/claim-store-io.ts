@@ -51,7 +51,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, open, readFile, rename } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { type ClaimStoreState, parseClaimStoreState, serializeClaimStoreState } from "./claim-model";
+import { type ClaimStoreState, emptyStore, parseClaimStoreState, serializeClaimStoreState } from "./claim-model";
+import { acquireStoreLockForFixture, withStoreLock, type MutateOutcome } from "./store-lock";
 
 export type LoadOutcome =
   | { readonly status: "missing" }
@@ -117,4 +118,29 @@ export async function save(path: string, state: ClaimStoreState): Promise<void> 
   } finally {
     await dirHandle.close();
   }
+}
+
+// --- Cross-process lock (BAKR-24) --------------------------------------
+//
+// Until this ticket, nothing wrote this store under lock — the only writer
+// was the provisional, single-process `demo-claim.ts` harness. Adoption
+// (Q6) needs to claim a destination directory that a concurrent adopt (or
+// operator) may be claiming at the same instant, so this store now gets the
+// identical B12 discipline agents.json already has: re-read fresh INSIDE
+// the lock, mutate that fresh snapshot, save atomically, release. See
+// store-lock.ts for the shared kernel-flock implementation this and
+// agent-store-io.ts both wrap.
+
+/** See store-lock.ts's own doc — identical discipline, specialized to `ClaimStoreState`. */
+export async function acquireClaimStoreLockForFixture(claimsPath: string, acquireTimeoutMs?: number): Promise<{ readonly release: () => Promise<void> }> {
+  return acquireStoreLockForFixture(claimsPath, acquireTimeoutMs);
+}
+
+/** See store-lock.ts's `withStoreLock` doc — identical discipline, specialized to `ClaimStoreState`. THE ONE HELPER every mutation of `claims.json` goes through from here on (adopt.ts's destination-claim step in particular — see that file). */
+export async function withClaimStoreLock<T>(
+  path: string,
+  mutate: (current: ClaimStoreState) => { readonly state: ClaimStoreState; readonly result: T },
+  opts?: { readonly acquireTimeoutMs?: number }
+): Promise<MutateOutcome<T>> {
+  return withStoreLock(path, emptyStore(), load, save, mutate, opts);
 }

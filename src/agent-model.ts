@@ -242,6 +242,21 @@ export function putAgent(state: AgentStoreState, agent: AgentRecord): AgentStore
   return { ...state, agents: { ...state.agents, [agent.id]: agent } };
 }
 
+/**
+ * Raw, unvalidated rewrite of one agent's `directory` — the primitive
+ * adopt.ts's validated wrapper builds on (this file ships no "adopt" verb
+ * of its own, per the module comment above). Performs no name-collision,
+ * source-membership, or claim check; the caller is responsible for every
+ * refusal in B11's typed set before calling this. A no-op (same object
+ * returned) when `agentId` names no agent, mirroring every other total
+ * mutator in this file.
+ */
+export function setAgentDirectory(state: AgentStoreState, agentId: string, directory: ClaimKey): AgentStoreState {
+  const agent = state.agents[agentId];
+  if (agent === undefined || agent.directory === directory) return state;
+  return { ...state, agents: { ...state.agents, [agentId]: { ...agent, directory } } };
+}
+
 // --- The resolver (B4, R-E) ----------------------------------------------
 
 export type ResolveOutcome =
@@ -279,6 +294,24 @@ export function resolveAgent(state: AgentStoreState, scope: ClaimKey, ref: strin
 
   const agent = Object.values(state.agents).find((a) => a.directory === scope && a.name === ref);
   return agent === undefined ? { outcome: "not-found" } : { outcome: "found", agent };
+}
+
+// --- Which session to resume (BAKR-24 correction) -------------------------
+
+/**
+ * THE SINGLE FUNCTION every restore/adopt caller must go through to answer
+ * "which session id do I pass `--resume`?" — never read `agent.durableSessionId`
+ * inline at a call site. `durableSessionId` is correct and sufficient for now,
+ * but BAKR-23 (a sibling story under the same epic) is going to change this
+ * rule once it has measured which id a silently-failed restore can actually
+ * resume (see this file's own header on the substrate's fork-on-resume
+ * behaviour and the fact that a `--bg --resume` given no prompt writes NO
+ * transcript at all). Funneling every caller through this one function is
+ * what lets that future change land in one place instead of a hunt across
+ * daemon.ts and every adoption/restore call site.
+ */
+export function sessionToResume(agent: AgentRecord): string | undefined {
+  return agent.durableSessionId;
 }
 
 // --- Restore-attempt bookkeeping (R-C: rekeyed to agent id) ---------------
@@ -353,6 +386,26 @@ export function markLaunchStarted(state: AgentStoreState, attemptId: string, lau
 
 export function markLaunchFailed(state: AgentStoreState, attemptId: string, error: string): AgentStoreState {
   return updateLaunch(state, attemptId, (record) => ({ ...record, error }));
+}
+
+/**
+ * Removes EVERY launch record (pending or already-errored/given-up) belonging
+ * to any of `agentIds` — the primitive adopt.ts's validated wrapper uses to
+ * implement the Q5 decision (BAKR-24): adoption discards ALL of the adopted
+ * agents' launch records, not only the ones the move itself would explain,
+ * because the only available signal for "this record's cause no longer
+ * applies" (its error string) has already been measured to misattribute its
+ * own cause (a missing-cwd launch failure reads as a `systemd-run` problem).
+ * An explicit operator act (adopt) is treated as a deliberate reset of any
+ * prior give-up, consistent with — not a hole in — BAKR-8 Constraint 2's
+ * "never retried automatically" (the daemon never calls this on its own).
+ * A no-op (same object) when none of `agentIds` has any launch record.
+ */
+export function discardLaunchRecordsForAgents(state: AgentStoreState, agentIds: readonly string[]): AgentStoreState {
+  const ids = new Set(agentIds);
+  const launches = state.launches.filter((l) => !ids.has(l.agentId));
+  if (launches.length === state.launches.length) return state;
+  return { ...state, launches };
 }
 
 /**
