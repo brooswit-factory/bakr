@@ -57,7 +57,22 @@ export function claimsPath(inputs: XdgInputs): string {
  * session ids are on" store (see session-slots.ts), deliberately alongside
  * `claims.json` rather than inside the working tree, same directory, same
  * durability rationale as the claim store above.
+ *
+ * SUBSUMED by `agents.json` (BAKR-16 R-A) — kept exactly as-is, forever, as
+ * a recoverable breadcrumb the one-time migration reads from. Never written
+ * to again once `agents.json` exists; see agent-store-migrate.ts.
  */
 export function sessionSlotsPath(inputs: XdgInputs): string {
   return join(resolveStateHome(inputs), "bakr", "session-slots.json");
+}
+
+/**
+ * `$XDG_STATE_HOME/bakr/agents.json` (BAKR-16 R-A) — the agent record store
+ * that subsumes `session-slots.json` as the single source of truth for
+ * lifecycle and membership. Same directory, same durability rationale as
+ * the claim store above. Authoritative whenever it exists (see
+ * agent-store-migrate.ts for the exact migration rule).
+ */
+export function agentsPath(inputs: XdgInputs): string {
+  return join(resolveStateHome(inputs), "bakr", "agents.json");
 }

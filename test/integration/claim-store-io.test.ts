@@ -54,7 +54,7 @@ describe("load: missing / malformed / loaded are three distinct outcomes", () =>
     const result = await load(path);
     expect(result.status).toBe("loaded");
     if (result.status === "loaded") {
-      expect(lookup(result.state, key)).toEqual({ key, claimedAt: 1234, agentIds: [] });
+      expect(lookup(result.state, key)).toEqual({ key, claimedAt: 1234 });
     }
   });
 
@@ -98,8 +98,8 @@ describe("save: atomic write leaves no trace of the temp file", () => {
     const result = await load(path);
     expect(result.status).toBe("loaded");
     if (result.status === "loaded") {
-      expect(lookup(result.state, keyA)).toEqual({ key: keyA, claimedAt: 1, agentIds: [] });
-      expect(lookup(result.state, keyB)).toEqual({ key: keyB, claimedAt: 2, agentIds: [] });
+      expect(lookup(result.state, keyA)).toEqual({ key: keyA, claimedAt: 1 });
+      expect(lookup(result.state, keyB)).toEqual({ key: keyB, claimedAt: 2 });
     }
   });
 
@@ -116,7 +116,7 @@ describe("save: atomic write leaves no trace of the temp file", () => {
     expect(result.status).toBe("loaded");
     if (result.status === "loaded") {
       expect(lookup(result.state, keyA)).toBeUndefined();
-      expect(lookup(result.state, keyB)).toEqual({ key: keyB, claimedAt: 2, agentIds: [] });
+      expect(lookup(result.state, keyB)).toEqual({ key: keyB, claimedAt: 2 });
     }
   });
 });

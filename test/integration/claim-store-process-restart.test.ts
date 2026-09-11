@@ -62,7 +62,8 @@ describe("the claim store round-trips through a genuine process restart", () => 
         const loadedClaim = JSON.parse(second.stdout);
         expect(loadedClaim.key).toBe(key);
         expect(loadedClaim.claimedAt).toBe(1234567890);
-        expect(loadedClaim.agentIds).toEqual([]);
+        // BAKR-16 R-D: agentIds is retired from the in-memory Claim — membership is now a derived query over the agent store, not a second stored copy.
+        expect(loadedClaim.agentIds).toBeUndefined();
       } finally {
         await rm(claimsDir, { recursive: true, force: true });
         await rm(claimedDir, { recursive: true, force: true });

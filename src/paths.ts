@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { lstat, readlink } from "node:fs/promises";
+import { randomBytes as nodeRandomBytes } from "node:crypto";
 import * as xdg from "./xdg";
 import type { ResolveInputs } from "./claim-key-resolve";
 
@@ -32,9 +33,13 @@ export function currentXdgInputs(): xdg.XdgInputs {
 
 export const claimsPath = (): string => xdg.claimsPath(currentXdgInputs());
 export const sessionSlotsPath = (): string => xdg.sessionSlotsPath(currentXdgInputs());
+export const agentsPath = (): string => xdg.agentsPath(currentXdgInputs());
 
 /** The real `lstat`/`readlink`, for wiring into `resolveClaimKey` (see claim-key-resolve.ts). */
 export const realResolveInputs: ResolveInputs = {
   lstat: (path: string) => lstat(path),
   readlink: (path: string) => readlink(path),
 };
+
+/** The real CSPRNG source, for wiring into `mintAgentId`/`mintUniqueAgentId` (see agent-model.ts) — never called directly from anywhere pure. */
+export const realRandomBytes = (byteLength: number): Uint8Array => nodeRandomBytes(byteLength);

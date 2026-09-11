@@ -1,56 +1,63 @@
-// EXPLICITLY PROVISIONAL demonstration harness (BAKR-12) — not a CLI
-// grammar. See demo-claim.ts's own banner comment. This script does
-// exactly the second thing the ticket's scope names: put one agent's
-// session into an already-claimed directory's on-set, via the real spawn
-// substrate — the same launch()/listBackgroundSessions() the daemon itself
-// uses, and the same beginLaunch/markLaunchStarted/resolveLaunch sequence
-// the daemon's own reconcile cycle follows (see daemon.ts), so this script
-// exercises the real integration rather than a shortcut.
+// EXPLICITLY PROVISIONAL demonstration harness (BAKR-12, updated BAKR-19) —
+// NOT a CLI grammar. See demo-claim.ts's own banner comment. Updated to
+// exercise the agent store (agent-model.ts / agent-store-io.ts) rather than
+// the session-slots store it subsumes (B1) — same spirit as before: give
+// the daemon (src/index.ts) something real to reconcile against, via the
+// SAME real spawn substrate and the SAME `withAgentStoreLock` discipline the
+// daemon itself uses (R-F: "every mutation of agents.json — the daemon's
+// and the harness's alike — goes through one helper"), never a shortcut.
 //
-// Usage:
-//   bun run scripts/demo-put-on.ts <directory>                 # fresh launch
-//   bun run scripts/demo-put-on.ts <directory> --resume <id>   # resume a known session id
+// This script performs exactly two things, neither of them a lifecycle
+// verb (create/on/off/rename/archive/unarchive/delete/adopt are a sibling
+// story — see BAKR-16 §3):
+//
+//   bun run scripts/demo-put-on.ts <directory>
+//     Mints a fresh, unnamed `on` agent with no session yet, then performs
+//     ONE fresh launch for it and resolves its session id (a second listing,
+//     immediately — fine for a one-shot script, see the daemon's own
+//     one-listing-per-cycle comment in daemon.ts for why that budget does
+//     NOT apply here).
+//
+//   bun run scripts/demo-put-on.ts <directory> --agent <agentId>
+//     Performs ONE restore launch (--resume <durableSessionId>) for an
+//     EXISTING `on` agent already holding a session — the same path the
+//     daemon's own reconcile loop takes when it finds that agent's session
+//     absent from a listing.
 //
 // Unlike the daemon's own reconcile cycle, this is a one-shot script, not a
-// running loop — it performs a SECOND listing after a successful launch to
-// resolve the new session id immediately, rather than waiting for a future
-// reconcile cycle. That is fine here (this is an operator-facing one-shot
-// action, not the "one listing per cycle" the daemon's own loop is scoped
-// to) but would defeat the daemon's own per-cycle listing budget if ported
-// there — it is not.
+// running loop.
 
 import { lstat, readlink } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { lookup } from "../src/claim-model";
 import { load as loadClaims } from "../src/claim-store-io";
 import { resolveClaimKey } from "../src/claim-key-resolve";
 import { lexicallyNormalize } from "../src/claim-key";
-import { claimsPath, sessionSlotsPath } from "../src/paths";
-import { load as loadSlots, save as saveSlots } from "../src/session-slots-store";
-import { beginLaunch, emptySessionSlots, markLaunchFailed, markLaunchStarted, resolveLaunch, sessionsOn } from "../src/session-slots";
+import { claimsPath, agentsPath, realRandomBytes } from "../src/paths";
+import { withAgentStoreLock } from "../src/agent-store-io";
+import { beginLaunch, markLaunchFailed, markLaunchStarted, mintUniqueAgentId, putAgent, resolveAgent, resolveLaunch, type AgentRecord } from "../src/agent-model";
 import { launch, listBackgroundSessions, runCommand } from "../src/spawn";
 
-function parseArgs(argv: string[]): { directory: string; resume: string | undefined } {
+function parseArgs(argv: string[]): { directory: string; agentId: string | undefined } {
   const directory = argv[0];
   if (directory === undefined) {
-    console.error("usage: bun run scripts/demo-put-on.ts <directory> [--resume <sessionId>]");
+    console.error("usage: bun run scripts/demo-put-on.ts <directory> [--agent <agentId>]");
     process.exit(1);
   }
-  let resume: string | undefined;
-  const idx = argv.indexOf("--resume");
+  let agentId: string | undefined;
+  const idx = argv.indexOf("--agent");
   if (idx !== -1) {
-    resume = argv[idx + 1];
-    if (resume === undefined) {
-      console.error("--resume requires a session id");
+    agentId = argv[idx + 1];
+    if (agentId === undefined) {
+      console.error("--agent requires an agent id");
       process.exit(1);
     }
   }
-  return { directory, resume };
+  return { directory, agentId };
 }
 
 async function main(): Promise<void> {
-  const { directory, resume } = parseArgs(process.argv.slice(2));
+  const { directory, agentId } = parseArgs(process.argv.slice(2));
 
   const lexical = lexicallyNormalize(directory, { cwd: process.cwd(), home: homedir() });
   const resolved = await resolveClaimKey(lexical, { lstat, readlink });
@@ -66,29 +73,62 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const slotsPath = sessionSlotsPath();
-  const slotsLoaded = await loadSlots(slotsPath);
-  if (slotsLoaded.status === "malformed") {
-    console.error(`refusing to write: session slots store at "${slotsPath}" is malformed: ${slotsLoaded.error}`);
-    process.exit(1);
+  const path = agentsPath();
+  let attemptId: string;
+  let priorSessionId: string | undefined;
+  let targetAgentId: string;
+
+  if (agentId !== undefined) {
+    // Restore path: the named agent must already exist, in THIS directory, with a durable session id.
+    const decision = await withAgentStoreLock<{ ok: true; attemptId: string; sessionId: string } | { ok: false; error: string }>(path, (current) => {
+      const outcome = resolveAgent(current, key, agentId);
+      if (outcome.outcome === "not-found") return { state: current, result: { ok: false, error: `no agent "${agentId}" found in "${key}"` } };
+      if (outcome.outcome === "found-elsewhere") return { state: current, result: { ok: false, error: `agent "${agentId}" belongs to a different directory: "${outcome.directory}"` } };
+      const agent = outcome.agent;
+      if (agent.durableSessionId === undefined) return { state: current, result: { ok: false, error: `agent "${agentId}" has no session yet — omit --agent to mint a fresh one` } };
+      const newAttemptId = crypto.randomUUID();
+      const next = beginLaunch(current, agent.id, key, agent.durableSessionId, newAttemptId, Date.now());
+      return { state: next, result: { ok: true, attemptId: newAttemptId, sessionId: agent.durableSessionId } };
+    });
+    if (decision.status === "malformed") {
+      console.error(`refusing to write: agent store at "${path}" is malformed: ${decision.error}`);
+      process.exit(1);
+    }
+    if (!decision.result.ok) {
+      console.error(decision.result.error);
+      process.exit(1);
+    }
+    attemptId = decision.result.attemptId;
+    priorSessionId = decision.result.sessionId;
+    targetAgentId = agentId;
+  } else {
+    // Fresh path: mint a brand-new, unnamed `on` agent with no session yet.
+    const decision = await withAgentStoreLock<{ attemptId: string; agentId: string }>(path, (current) => {
+      const id = mintUniqueAgentId(current, realRandomBytes);
+      const agent: AgentRecord = { id, name: undefined, directory: key, state: "on", createdAt: Date.now(), durableSessionId: undefined, liveSessionId: undefined };
+      let next = putAgent(current, agent);
+      const newAttemptId = crypto.randomUUID();
+      next = beginLaunch(next, id, key, undefined, newAttemptId, Date.now());
+      return { state: next, result: { attemptId: newAttemptId, agentId: id } };
+    });
+    if (decision.status === "malformed") {
+      console.error(`refusing to write: agent store at "${path}" is malformed: ${decision.error}`);
+      process.exit(1);
+    }
+    attemptId = decision.result.attemptId;
+    targetAgentId = decision.result.agentId;
+    console.log(`minted: unnamed agent ${targetAgentId} in "${key}"`);
   }
-  let state = slotsLoaded.status === "loaded" ? slotsLoaded.state : emptySessionSlots();
 
-  const attemptId = randomUUID();
-  state = beginLaunch(state, key, resume, attemptId, Date.now());
-  await saveSlots(slotsPath, state); // Constraint 2 discipline, same as the daemon's own
-
-  const claudeArgs = resume !== undefined ? ["--resume", resume] : [];
+  const claudeArgs = priorSessionId !== undefined ? ["--resume", priorSessionId] : [];
   const result = await launch(key, claudeArgs, { runCommand });
   if (!result.ok) {
-    state = markLaunchFailed(state, attemptId, result.error);
-    await saveSlots(slotsPath, state);
+    await withAgentStoreLock(path, (current) => ({ state: markLaunchFailed(current, attemptId, result.error), result: undefined }));
     console.error(`launch failed: ${result.error}`);
     process.exit(1);
   }
-  state = markLaunchStarted(state, attemptId, result.id);
-  await saveSlots(slotsPath, state);
-  console.log(`launched: short id ${result.id} in "${key}"${resume !== undefined ? ` (resumed from ${resume})` : ""}`);
+  await withAgentStoreLock(path, (current) => ({ state: markLaunchStarted(current, attemptId, result.id), result: undefined }));
+  console.log(`launched: short id ${result.id} for agent ${targetAgentId} in "${key}"${priorSessionId !== undefined ? ` (resumed from ${priorSessionId})` : ""}`);
 
   const sessions = await listBackgroundSessions({ runCommand });
   const listed = sessions.find((s) => s.id === result.id);
@@ -96,9 +136,13 @@ async function main(): Promise<void> {
     console.log(`not yet visible in \`claude agents --json\` — it will resolve on the daemon's next reconcile cycle, or re-run this listing later`);
     return;
   }
-  state = resolveLaunch(state, result.id, listed.sessionId);
-  await saveSlots(slotsPath, state);
-  console.log(`resolved: session ${listed.sessionId} is on for "${key}" (on-set: ${JSON.stringify(sessionsOn(state, key))})`);
+  const afterResolve = await withAgentStoreLock<AgentRecord | undefined>(path, (current) => {
+    const next = resolveLaunch(current, result.id, listed.sessionId);
+    return { state: next, result: next.agents[targetAgentId] };
+  });
+  if (afterResolve.status === "ok" && afterResolve.result !== undefined) {
+    console.log(`resolved: agent ${targetAgentId} now holds durable session ${afterResolve.result.durableSessionId}`);
+  }
 }
 
 main().catch((err) => {

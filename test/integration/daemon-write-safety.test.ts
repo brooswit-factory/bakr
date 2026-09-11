@@ -119,9 +119,11 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     const deps: DaemonDeps = {
       runCommand: fakeRunCommand(),
       claimsPath: join(storeDir, "claims.json"),
+      agentsPath: join(storeDir, "agents.json"),
       sessionSlotsPath: join(storeDir, "session-slots.json"),
       now: () => Date.now(),
       generateAttemptId: () => "restore-attempt",
+      randomBytes: (n: number) => new Uint8Array(n).fill(0x42),
     };
 
     const before = await snapshot(claimedDir);
@@ -161,9 +163,11 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     const deps: DaemonDeps = {
       runCommand: fakeRunCommand(),
       claimsPath: join(storeDir, "claims.json"),
+      agentsPath: join(storeDir, "agents.json"),
       sessionSlotsPath: join(storeDir, "session-slots.json"),
       now: () => Date.now(),
       generateAttemptId: () => "restore-attempt",
+      randomBytes: (n: number) => new Uint8Array(n).fill(0x42),
     };
 
     // Any write attempt into claimedDir from here on would throw EACCES and fail this test outright.

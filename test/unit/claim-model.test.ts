@@ -15,9 +15,9 @@ const KEY_A = "/home/alice/project" as ClaimKey;
 const KEY_B = "/home/alice/other" as ClaimKey;
 
 describe("claim", () => {
-  test("claiming a fresh key creates a claim with the given timestamp and an empty agent list", () => {
+  test("claiming a fresh key creates a claim with the given timestamp", () => {
     const { state, claim: c } = claim(emptyStore(), KEY_A, 1000);
-    expect(c).toEqual({ key: KEY_A, claimedAt: 1000, agentIds: [] });
+    expect(c).toEqual({ key: KEY_A, claimedAt: 1000 });
     expect(lookup(state, KEY_A)).toEqual(c);
   });
 
@@ -115,6 +115,35 @@ describe("wire format round-trip", () => {
 
   test("a claim entry with the wrong shape is reported as a typed error", () => {
     const result = parseClaimStoreState(JSON.stringify({ version: 1, claims: { "/x": { claimedAt: "not-a-number", agentIds: [] } } }));
+    expect(result.ok).toBe(false);
+  });
+});
+
+describe("BAKR-16 R-D: agentIds is retired from the in-memory model, but the wire format stays compatible both ways", () => {
+  test("a claim entry carrying agentIds (written by an older binary) still parses — the field is accepted and then dropped from the in-memory Claim", () => {
+    const result = parseClaimStoreState(JSON.stringify({ version: 1, claims: { "/x": { claimedAt: 5, agentIds: ["some-id"] } } }));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.state.claims["/x"]).toEqual({ key: "/x" as ClaimKey, claimedAt: 5 });
+    }
+  });
+
+  test("a claim entry with NO agentIds field at all also parses — absence has an obvious correct reading and must not trip the malformed path", () => {
+    const result = parseClaimStoreState(JSON.stringify({ version: 1, claims: { "/x": { claimedAt: 5 } } }));
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.state.claims["/x"]).toEqual({ key: "/x" as ClaimKey, claimedAt: 5 });
+    }
+  });
+
+  test("serializeClaimStoreState always writes agentIds: [] on every claim, as a frozen compatibility field an older binary's parser still requires", () => {
+    const { state } = claim(emptyStore(), KEY_A, 1000);
+    const written = JSON.parse(serializeClaimStoreState(state));
+    expect(written.claims[KEY_A].agentIds).toEqual([]);
+  });
+
+  test("a present-but-wrong agentIds is still rejected as malformed — this is a default for ABSENCE, not a loosened shape check", () => {
+    const result = parseClaimStoreState(JSON.stringify({ version: 1, claims: { "/x": { claimedAt: 5, agentIds: "not-an-array" } } }));
     expect(result.ok).toBe(false);
   });
 });
