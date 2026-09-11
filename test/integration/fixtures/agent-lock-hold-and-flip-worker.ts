@@ -1,8 +1,8 @@
 // Test fixture for AC14 (R-F.3), round 2 (review, PR #13): holds the SAME
-// raw lock file `agent-lock-hold-worker.ts` uses, but ALSO flips the named
+// real lock `agent-lock-hold-worker.ts` uses, but ALSO flips the named
 // agent to `off` partway through the hold, directly (bypassing
-// `withAgentStoreLock` — this process already holds exclusivity via the
-// raw lock file, the same way `agent-lock-hold-worker.ts` does).
+// `withAgentStoreLock` — this process already holds exclusivity via that
+// same lock, the same way `agent-lock-hold-worker.ts` does).
 //
 // This is what makes AC14's two-process test a genuine regression guard
 // rather than one that only agrees with itself: a competing decision
@@ -16,8 +16,12 @@
 // THEN the decision worker starts) could not distinguish these two shapes,
 // because both a stale and a fresh read would see "off" — this file closes
 // that gap.
-import { open, rm } from "node:fs/promises";
-import { load, save } from "../../../src/agent-store-io";
+//
+// BAKR-20: goes through `acquireAgentStoreLockForFixture` rather than a
+// raw `open(lockPath, "wx")` — see that fixture's own comment for why a
+// hand-rolled stand-in no longer models "the lock" once it is a kernel
+// flock on an fd.
+import { acquireAgentStoreLockForFixture, load, save } from "../../../src/agent-store-io";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -31,38 +35,33 @@ if (!agentsPathRaw || !agentIdRaw || !holdMsRaw) {
 const agentsPath: string = agentsPathRaw;
 const agentId: string = agentIdRaw;
 const holdMs = Number(holdMsRaw);
-const lockPath = `${agentsPath}.lock`;
 
 async function main(): Promise<void> {
-  const handle = await open(lockPath, "wx");
-  try {
-    await handle.writeFile(JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }), "utf8");
-  } finally {
-    await handle.close();
-  }
+  const held = await acquireAgentStoreLockForFixture(agentsPath);
   console.log("READY");
+  try {
+    // Hold for the first half — long enough for a competing worker to have
+    // started, done any PRE-lock read (the mutation this test exists to
+    // catch would read here), and be blocked retrying lock acquisition.
+    await sleep(holdMs / 2);
 
-  // Hold for the first half — long enough for a competing worker to have
-  // started, done any PRE-lock read (the mutation this test exists to
-  // catch would read here), and be blocked retrying lock acquisition.
-  await sleep(holdMs / 2);
-
-  const loaded = await load(agentsPath);
-  if (loaded.status === "loaded") {
-    const agent = loaded.state.agents[agentId];
-    if (agent !== undefined) {
-      const next = { ...loaded.state, agents: { ...loaded.state.agents, [agentId]: { ...agent, state: "off" as const } } };
-      await save(agentsPath, next);
+    const loaded = await load(agentsPath);
+    if (loaded.status === "loaded") {
+      const agent = loaded.state.agents[agentId];
+      if (agent !== undefined) {
+        const next = { ...loaded.state, agents: { ...loaded.state.agents, [agentId]: { ...agent, state: "off" as const } } };
+        await save(agentsPath, next);
+      }
     }
+
+    // Hold for the second half — a competing worker's PRE-lock read (if any)
+    // already happened before the flip above; this second sleep just keeps
+    // the lock held a little past the flip so a correct (in-lock) reader
+    // cannot possibly race the write itself.
+    await sleep(holdMs / 2);
+  } finally {
+    await held.release();
   }
-
-  // Hold for the second half — a competing worker's PRE-lock read (if any)
-  // already happened before the flip above; this second sleep just keeps
-  // the lock held a little past the flip so a correct (in-lock) reader
-  // cannot possibly race the write itself.
-  await sleep(holdMs / 2);
-
-  await rm(lockPath, { force: true });
 }
 
 main().catch((err) => {

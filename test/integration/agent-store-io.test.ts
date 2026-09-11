@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { emptyAgentStore, putAgent, type AgentRecord } from "../../src/agent-model";
-import { load, save, withAgentStoreLock } from "../../src/agent-store-io";
+import { acquireAgentStoreLockForFixture, load, save, withAgentStoreLock } from "../../src/agent-store-io";
 import type { ClaimKey } from "../../src/claim-key-resolve";
 
 const cleanupDirs: string[] = [];
@@ -88,8 +88,11 @@ describe("AC6: a malformed store is never overwritten by withAgentStoreLock", ()
     expect(mutateCalled).toBe(false); // never even reaches the mutation
     const raw = await Bun.file(path).text();
     expect(raw).toBe(original); // byte-for-byte unchanged — never written to
-    // No lock file left behind either.
-    expect(await readdir(dir)).toEqual(["agents.json"]);
+    // BAKR-20: acquiring the lock necessarily creates "agents.json.lock" (the flock needs an fd on
+    // an existing-or-created file) and releasing it never unlinks that path (see agent-store-io.ts's
+    // module comment on why unlinking a flocked file is unsafe) — so it persists even on this
+    // malformed-store path, where nothing else was written.
+    expect(await readdir(dir)).toEqual(["agents.json", "agents.json.lock"]);
   });
 });
 
@@ -110,11 +113,19 @@ describe("withAgentStoreLock: single-process read-modify-write", () => {
     if (reloaded.status === "loaded") expect(Object.keys(reloaded.state.agents).sort()).toEqual(["@existing", "@new"]);
   });
 
-  test("no lock file is left behind after a successful mutation", async () => {
+  test("BAKR-20: the lock file PERSISTS after release (never unlinked), and a later acquire reuses it rather than recreating it", async () => {
     const dir = await makeTempDir();
     const path = join(dir, "agents.json");
+    const lockPath = `${path}.lock`;
+    await save(path, emptyAgentStore()); // a real store must already exist for a no-op mutate to leave "agents.json" itself in place (Finding 3: a true no-op now skips the save entirely)
+
     await withAgentStoreLock(path, (current) => ({ state: current, result: undefined }));
-    expect(await readdir(dir)).toEqual(["agents.json"]);
+    expect(await readdir(dir)).toEqual(["agents.json", "agents.json.lock"]);
+    const inodeAfterFirst = (await stat(lockPath)).ino;
+
+    await withAgentStoreLock(path, (current) => ({ state: current, result: undefined }));
+    expect(await readdir(dir)).toEqual(["agents.json", "agents.json.lock"]);
+    expect((await stat(lockPath)).ino).toBe(inodeAfterFirst); // same inode — reopened, never recreated
   });
 
   test("sequential mutations against a missing file each see a fresh, correct state (first sees empty, second sees the first's write)", async () => {
@@ -158,29 +169,66 @@ describe("withAgentStoreLock: mutual exclusion within one process", () => {
   });
 });
 
-describe("stale lock recovery", () => {
-  test("a lock file older than staleLockMs is stolen rather than waited on forever", async () => {
+describe("BAKR-20 Finding 2: an unreadable lock file can no longer wedge the daemon — demonstrated as structurally moot under a kernel lock", () => {
+  // Falsifiers, stated first: under the OLD scheme these two fixtures (an
+  // empty lock file; a truncated-JSON lock file), each given an old mtime,
+  // threw a timeout every time — see the ticket's own measurement. If this
+  // mechanism regressed toward that shape, these tests would time out
+  // (>= acquireTimeoutMs) instead of completing in well under it.
+  const FIXTURE_ACQUIRE_TIMEOUT_MS = 1500;
+
+  test("an EMPTY lock file with an old mtime acquires immediately — content is never consulted, so 'is this readable enough to judge?' cannot arise", async () => {
     const dir = await makeTempDir();
     const path = join(dir, "agents.json");
     await save(path, emptyAgentStore());
-
-    // Simulate a crashed holder: a lock file with an old timestamp.
     const lockPath = `${path}.lock`;
-    await writeFile(lockPath, JSON.stringify({ pid: 999999, acquiredAt: Date.now() - 60_000 }), "utf8");
+    await writeFile(lockPath, "", "utf8");
+    const oldTime = new Date(Date.now() - 60 * 60 * 1000);
+    await utimes(lockPath, oldTime, oldTime);
 
-    const result = await withAgentStoreLock(path, (current) => ({ state: putAgent(current, makeAgent("@a1")), result: "done" }), { staleLockMs: 1000, acquireTimeoutMs: 2000 });
+    const start = Date.now();
+    const result = await withAgentStoreLock(path, (current) => ({ state: putAgent(current, makeAgent("@a1")), result: "done" }), { acquireTimeoutMs: FIXTURE_ACQUIRE_TIMEOUT_MS });
+    expect(result).toEqual({ status: "ok", result: "done" });
+    expect(Date.now() - start).toBeLessThan(500); // nowhere near the timeout — there was never a real holder to wait on
+  });
+
+  test('a PARTIAL-JSON lock file (\'{"pid": 12\') with an old mtime acquires immediately — same reason', async () => {
+    const dir = await makeTempDir();
+    const path = join(dir, "agents.json");
+    await save(path, emptyAgentStore());
+    const lockPath = `${path}.lock`;
+    await writeFile(lockPath, '{"pid": 12', "utf8");
+    const oldTime = new Date(Date.now() - 60 * 60 * 1000);
+    await utimes(lockPath, oldTime, oldTime);
+
+    const start = Date.now();
+    const result = await withAgentStoreLock(path, (current) => ({ state: putAgent(current, makeAgent("@a1")), result: "done" }), { acquireTimeoutMs: FIXTURE_ACQUIRE_TIMEOUT_MS });
+    expect(result).toEqual({ status: "ok", result: "done" });
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  test("CONTROL: no pre-existing lock file at all also acquires immediately (same code path as the two fixtures above)", async () => {
+    const dir = await makeTempDir();
+    const path = join(dir, "agents.json");
+    await save(path, emptyAgentStore());
+    const result = await withAgentStoreLock(path, (current) => ({ state: current, result: "done" }));
     expect(result).toEqual({ status: "ok", result: "done" });
   });
 
-  test("a HEALTHY (fresh) lock is NOT stolen — a genuinely concurrent holder blocks the caller until the timeout, proving staleness alone (not mere presence) triggers the steal", async () => {
+  test("CONTROL: a REAL, genuinely held lock (the same primitive production code uses, via acquireAgentStoreLockForFixture) DOES block a competing acquire until release — proving the three fixtures above are fast because there was truly no holder, not because acquisition is broken and always succeeds", async () => {
     const dir = await makeTempDir();
     const path = join(dir, "agents.json");
     await save(path, emptyAgentStore());
-    const lockPath = `${path}.lock`;
-    await writeFile(lockPath, JSON.stringify({ pid: process.pid, acquiredAt: Date.now() }), "utf8");
 
-    await expect(withAgentStoreLock(path, (current) => ({ state: current, result: undefined }), { staleLockMs: 60_000, acquireTimeoutMs: 200 })).rejects.toThrow(/timed out/);
+    const held = await acquireAgentStoreLockForFixture(path);
+    try {
+      await expect(withAgentStoreLock(path, (current) => ({ state: current, result: undefined }), { acquireTimeoutMs: 200 })).rejects.toThrow(/timed out/);
+    } finally {
+      await held.release();
+    }
 
-    await rm(lockPath, { force: true });
+    // Released — a fresh acquire now succeeds, and reuses (never recreates) the same lock path.
+    const result = await withAgentStoreLock(path, (current) => ({ state: current, result: "done" }));
+    expect(result).toEqual({ status: "ok", result: "done" });
   });
 });
