@@ -316,6 +316,114 @@ describe("on", () => {
   });
 });
 
+// --- BAKR-27 AC4: `on` can now clear a stray FAILED forkFrom-keyed record too ---
+
+describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the agent's current restore target, not only the respawn/fresh-keyed wedge", () => {
+  const OLD_SHORT = "oldshort";
+  const OLD_SESSION = "old-session-uuid";
+  const STALE_CWD_ERROR = `respawn exited 1: Couldn't start a background session (working directory no longer exists or is not accessible: /tmp/old-claimed-dir)`;
+
+  function makeFakeClaudeAlwaysStaleCwd(opts: { forkSucceeds: boolean }) {
+    const calls: string[][] = [];
+    let nextShortId = 0;
+    const runCommand: AgentActionDeps["runCommand"] = async (argv, cmdOpts) => {
+      calls.push(argv);
+      if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
+      if (argv[0] === "claude" && argv[1] === "respawn") return { exitCode: 1, stdout: "", stderr: STALE_CWD_ERROR };
+      if (argv[0] === "systemd-run") {
+        if (!opts.forkSucceeds) return { exitCode: 1, stdout: "", stderr: "systemd-run: simulated failure" };
+        const shortId = `newshort-${nextShortId++}`;
+        return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
+      }
+      throw new Error(`fake runCommand: unexpected argv ${JSON.stringify(argv)} (cwd=${cmdOpts.cwd})`);
+    };
+    return { runCommand, calls };
+  }
+
+  test("BEFORE this fix's shape: a FAILED forkFrom(sessionId) record left by a previously-failed escape is invisible to on()'s wedge check — proven here by seeding ONLY that record (no respawn-keyed wedge at all) and showing on() reaches it anyway", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaudeAlwaysStaleCwd({ forkSucceeds: true });
+    const deps = baseDeps(dir, fake.runCommand);
+
+    const agent = makeAgent({ id: "@a1", state: "on", birthSessionId: OLD_SESSION, restoreTarget: { sessionId: OLD_SESSION, shortId: OLD_SHORT } });
+    let store = putAgent(emptyAgentStore(), agent);
+    // ONLY a failed forkFrom-keyed record — no respawn-keyed failure at all,
+    // so the PRIMARY wedge check (`hasLaunchRecordFor` against
+    // `attemptKey = respawn(OLD_SHORT)`) finds NOTHING to clear. Before this
+    // ticket's fix, `on()` had no other code path that ever looked for a
+    // `forkFrom`-keyed record, so this record would sit forever, and a
+    // SEPARATE, accumulating one would be left behind by every retry.
+    store = { ...store, launches: [{ attemptId: "stale-fork-attempt", agentId: "@a1", key: KEY, attemptKey: { kind: "forkFrom", sessionId: OLD_SESSION }, attemptedAt: 1, launchShortId: undefined, error: "escape launch failed: systemd-run: simulated failure" }] };
+    await saveAgents(deps.agentsPath, store);
+
+    const result = await on(deps, KEY, "@a1");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+
+    // THE FIX: wedgeCleared reports true (the stray forkFrom record was
+    // found and cleared), and it is actually gone from disk — the
+    // respawn/fresh-keyed `clearFailedLaunchRecord` alone could never have
+    // done this, since its computed key is `respawn(OLD_SHORT)`, not
+    // `forkFrom(OLD_SESSION)`.
+    expect(result.wedgeCleared).toBe(true);
+
+    const reloaded = await loadAgents(deps.agentsPath);
+    if (reloaded.status !== "loaded") throw new Error("expected loaded store");
+    const staleRecordStillPresent = reloaded.state.launches.some((l) => l.attemptId === "stale-fork-attempt");
+    expect(staleRecordStillPresent).toBe(false); // cleared
+  });
+
+  test("the retried escape below the clear still runs normally: respawn refused (stale cwd) -> forkFrom dispatched and recorded fresh, no duplicate/stray record left over", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaudeAlwaysStaleCwd({ forkSucceeds: true });
+    const deps = baseDeps(dir, fake.runCommand);
+
+    const agent = makeAgent({ id: "@a1", state: "on", birthSessionId: OLD_SESSION, restoreTarget: { sessionId: OLD_SESSION, shortId: OLD_SHORT } });
+    let store = putAgent(emptyAgentStore(), agent);
+    // BOTH a failed respawn(OLD_SHORT) wedge AND a failed forkFrom(OLD_SESSION)
+    // wedge pre-seeded — the realistic shape after one full failed
+    // stale-cwd-escape round trip (daemon.ts's own dispatch marks the
+    // ORIGINAL respawn failed, then ALSO fails the escape's own launch).
+    store = {
+      ...store,
+      launches: [
+        { attemptId: "old-respawn-attempt", agentId: "@a1", key: KEY, attemptKey: { kind: "respawn", shortId: OLD_SHORT }, attemptedAt: 1, launchShortId: undefined, error: STALE_CWD_ERROR },
+        { attemptId: "stale-fork-attempt", agentId: "@a1", key: KEY, attemptKey: { kind: "forkFrom", sessionId: OLD_SESSION }, attemptedAt: 1, launchShortId: undefined, error: "escape launch failed: systemd-run: simulated failure" },
+      ],
+    };
+    await saveAgents(deps.agentsPath, store);
+
+    const result = await on(deps, KEY, "@a1");
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.wedgeCleared).toBe(true);
+    expect(result.launchIssued).toBe(true);
+    expect(result.recovery?.kind).toBe("moved-directory-escape"); // respawn refused stale-cwd again, escaped again
+
+    const reloaded = await loadAgents(deps.agentsPath);
+    if (reloaded.status !== "loaded") throw new Error("expected loaded store");
+    expect(reloaded.state.launches.some((l) => l.attemptId === "old-respawn-attempt")).toBe(false);
+    expect(reloaded.state.launches.some((l) => l.attemptId === "stale-fork-attempt")).toBe(false);
+    // Exactly ONE forkFrom-kind record remains: the NEW attempt this call
+    // just issued (started, not failed) — no stray left beside it.
+    const forkRecords = reloaded.state.launches.filter((l) => l.attemptKey?.kind === "forkFrom");
+    expect(forkRecords).toHaveLength(1);
+    expect(forkRecords[0]?.error).toBeUndefined();
+  });
+
+  test("NEGATIVE CONTROL: no stray forkFrom record exists for this agent's CURRENT target -> wedgeCleared stays exactly what the respawn/fresh-keyed check alone would report (false), nothing spurious cleared", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaude();
+    fake.listing.push({ id: "d1shortx", sessionId: "d1", cwd: KEY, startedAt: 1, kind: "background", pid: process.pid });
+    const deps = baseDeps(dir, fake.runCommand);
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: "d1shortx" } }));
+
+    const result = await on(deps, KEY, "@a1");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.wedgeCleared).toBe(false);
+  });
+});
+
 // --- off / archive / delete share ONE stop path (DoD item 2) -------------
 
 describe("off, archive and delete all stop a session through the IDENTICAL `stopLiveSession` function", () => {

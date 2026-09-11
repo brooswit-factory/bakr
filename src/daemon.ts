@@ -40,6 +40,7 @@ import {
   mintUniqueAgentId,
   pendingLaunches,
   unresolvedLaunches,
+  isSupersededStaleCwdRespawnFailure,
   hasLaunchRecordFor,
   promoteUnresolvableLaunches,
   restoreAttemptCount,
@@ -543,19 +544,37 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   }
 
   // BAKR-24 review finding: "the daemon must not loop on it" (Q4) was only
-  // half delivered — this loop, unconditional and at error level every
-  // cycle, still fires FOREVER for a launch record left by a version of
-  // this daemon that predates Q4 (an agent that was already orphaned before
-  // the operator upgraded). A record this ticket's own code creates can
-  // never reach this state (Q4 never creates one for an orphaned
-  // directory), but a PRE-EXISTING one on disk can. Suppressed here when
-  // the agent's CURRENT directory classifies as anything but `present` —
-  // the per-claim orphan report below is the single voice for those
-  // agents instead, exactly once per state change rather than every cycle.
-  // A record whose agent no longer exists at all (should not happen; no
-  // delete verb ships yet) still logs unconditionally rather than going
-  // silently missing.
+  // half delivered — this loop, at error level every cycle, otherwise still
+  // fires FOREVER for a launch record left by a version of this daemon that
+  // predates Q4 (an agent that was already orphaned before the operator
+  // upgraded). A record this ticket's own code creates can never reach this
+  // state (Q4 never creates one for an orphaned directory), but a
+  // PRE-EXISTING one on disk can. Suppressed here when the agent's CURRENT
+  // directory classifies as anything but `present` — the per-claim orphan
+  // report below is the single voice for those agents instead, exactly once
+  // per state change rather than every cycle. A record whose agent no
+  // longer exists at all (should not happen; no delete verb ships yet)
+  // still logs unconditionally rather than going silently missing.
+  //
+  // TWO suppressions guard this loop now, checked in this order: B13a
+  // (below, BAKR-27 — a recognised stale-cwd refusal whose escape has since
+  // succeeded) first, then Q4's directory classification above. Order
+  // between them does not matter for correctness (they never overlap: a
+  // B13a-superseded record's owning agent is, by construction, healthy and
+  // its directory `present`), but B13a is checked first since it is the
+  // cheaper, purely in-memory test.
   for (const unresolved of unresolvedLaunches(peekedState)) {
+    // B13a (BAKR-27): a recognised stale-cwd refusal whose escape has since
+    // resolved is not an unresolved launch — it was already reported once,
+    // loudly, by the stale-cwd log line this same loop emits at the point
+    // of refusal (see the `dispatch.kind === "forked"` branch below). This
+    // is a REPORTING classification only — nothing is cleared, written, or
+    // removed here (B13 stays intact); see `isSupersededStaleCwdRespawnFailure`'s
+    // own doc for why this applies identically to a record THIS build just
+    // created and to one a pre-B13a build already left on disk (AC6).
+    if (isSupersededStaleCwdRespawnFailure(peekedState, unresolved, isRecognizedStaleCwdRefusal)) {
+      continue;
+    }
     const owner = peekedState.agents[unresolved.agentId];
     const verdict = owner === undefined ? undefined : await classifyKey(owner.directory);
     if (verdict !== undefined && verdict.status !== "present") {
