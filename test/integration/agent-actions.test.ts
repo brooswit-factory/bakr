@@ -172,14 +172,6 @@ describe("create", () => {
 
 describe("on", () => {
   test("restore: argv is EXACTLY --resume <durableSessionId> — the resume id is never hard-coded inline in agent-actions.ts", async () => {
-    const source = await readFile(join(import.meta.dir, "..", "..", "src", "agent-actions.ts"), "utf8");
-    // PROBE CONTROL: confirm the scan can find a known-present string first.
-    expect(source).toContain("sessionIdToResume");
-    // FALSIFIER: a direct `.durableSessionId` reference here would mean the
-    // resume-id decision has more than one call site (it lives ONLY in
-    // agent-lifecycle.ts's decideOn, which this file calls into).
-    expect(source).not.toContain(".durableSessionId");
-
     const dir = await makeTempDir();
     const deps = baseDeps(dir, makeFakeClaude().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off", durableSessionId: "durable-xyz" }));
@@ -225,6 +217,63 @@ describe("on", () => {
     const result = await on(deps, KEY, "@a1");
     expect(result.ok).toBe(false);
   });
+
+  // Review finding 2 (PR #16, round 1): the previous version of this scan
+  // read `agent-actions.ts`, but the real (and only) call site is
+  // `agent-lifecycle.ts`'s `decideOn` — a file that scan never opened — so
+  // it could not have caught `decideOn` reverting to `agent.durableSessionId`
+  // directly. Fixed to read the file that actually contains the call, and
+  // to make BOTH the false-negative and false-positive directions provable.
+  test("resume-id: 'which session id do I resume' has EXACTLY ONE call site, in agent-lifecycle.ts — not agent-actions.ts, not daemon.ts", async () => {
+    const srcDir = join(import.meta.dir, "..", "..", "src");
+    const [modelSrc, lifecycleSrc, actionsSrc, daemonSrc] = await Promise.all([
+      readFile(join(srcDir, "agent-model.ts"), "utf8"),
+      readFile(join(srcDir, "agent-lifecycle.ts"), "utf8"),
+      readFile(join(srcDir, "agent-actions.ts"), "utf8"),
+      readFile(join(srcDir, "daemon.ts"), "utf8"),
+    ]);
+
+    // Strips `//` and `/* */` comments first (crudely — good enough for
+    // this codebase's own style, and exactly the class of false positive
+    // review finding 2 named: a doc comment MENTIONING the function's name
+    // must never count as a call site). A CALL is then the name immediately
+    // followed by "(" that is NOT part of "function sessionIdToResume("
+    // (the definition itself, in agent-model.ts).
+    function stripComments(source: string): string {
+      return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+    }
+    function callSiteCount(source: string): number {
+      const code = stripComments(source);
+      const all = code.match(/sessionIdToResume\(/g) ?? [];
+      const definitions = code.match(/function sessionIdToResume\(/g) ?? [];
+      return all.length - definitions.length;
+    }
+
+    // PROBE CONTROL, anchored on something genuinely load-bearing (per the
+    // review: not merely "a string is present somewhere"): the definition
+    // line itself must exist in agent-model.ts, AND this scan's own
+    // call-vs-definition arithmetic must correctly exclude it — a scan that
+    // could not tell "function sessionIdToResume(" from a call would report
+    // 1 here instead of 0, silently inflating every other file's count too.
+    expect(modelSrc).toContain("export function sessionIdToResume(agent: AgentRecord)");
+    expect(callSiteCount(modelSrc)).toBe(0);
+
+    // FALSIFIER: this is 0, not 1, if `decideOn` ever reverts to reading
+    // `agent.durableSessionId` inline instead of calling the seam function
+    // — exactly the mutation the review applied and this version catches.
+    expect(callSiteCount(lifecycleSrc)).toBe(1);
+
+    // The effect layer must have NO call site of its own — the decision
+    // routes through agent-lifecycle.ts exclusively, never duplicated.
+    expect(callSiteCount(actionsSrc)).toBe(0);
+    expect(actionsSrc).not.toContain(".durableSessionId");
+
+    // daemon.ts is untouched by this ticket and legitimately still reads
+    // `.durableSessionId` inline (flagged for BAKR-23, not fixed here) — but
+    // it must not have silently grown a SECOND call site of the seam
+    // function, which would leave two places to keep in sync instead of one.
+    expect(callSiteCount(daemonSrc)).toBe(0);
+  });
 });
 
 // --- off / archive / delete share ONE stop path (DoD item 2) -------------
@@ -240,6 +289,46 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
       ["claude", "agents", "--json"],
       ["claude", "stop", "short-9"],
     ]);
+  });
+
+  // Review finding 1 (PR #16, round 1): every prior stop-path test pushed
+  // exactly ONE entry into `fake.listing`, so "exact sessionId match" was
+  // indistinguishable from "take sessions[0]" — a mutation to exactly that
+  // effect passed the full suite. This is THE headline invariant (B9): the
+  // reason candlestix's directory-keyed stop mechanism is forbidden here.
+  // FALSIFIER, stated first: replacing the `sessions.find(s => s.sessionId
+  // === liveSessionId)` in `stopLiveSession` with `sessions[0]` (or
+  // `sessions[sessions.length - 1]`, or any positional pick) must make this
+  // test fail — the target agent's session is deliberately placed neither
+  // first nor last in a 3-entry listing.
+  test("stopLiveSession: selects the SIBLING agent's own session out of a listing containing SEVERAL — never sessions[0], never positional", async () => {
+    const fake = makeFakeClaude();
+    fake.listing.push(
+      { id: "short-other-1", sessionId: "live-OTHER-1", cwd: KEY, startedAt: 1, kind: "background" },
+      { id: "short-target", sessionId: "live-TARGET", cwd: KEY, startedAt: 2, kind: "background" }, // the one we want — in the MIDDLE, not sessions[0]
+      { id: "short-other-2", sessionId: "live-OTHER-2", cwd: KEY, startedAt: 3, kind: "background" }
+    );
+    const deps = baseDeps(await makeTempDir(), fake.runCommand);
+    const outcome = await stopLiveSession(deps, "live-TARGET");
+    expect(outcome.kind).toBe("stopped");
+    if (outcome.kind === "stopped") expect(outcome.shortId).toBe("short-target"); // NOT short-other-1 (sessions[0])
+    expect(fake.calls).toEqual([
+      ["claude", "agents", "--json"],
+      ["claude", "stop", "short-target"],
+    ]); // exactly one stop call, naming the right sibling and nothing else
+  });
+
+  test("stopLiveSession: the target is ABSENT while siblings are present — reports already-gone, and issues NO stop at all (never stops a sibling by mistake)", async () => {
+    const fake = makeFakeClaude();
+    fake.listing.push(
+      { id: "short-other-1", sessionId: "live-OTHER-1", cwd: KEY, startedAt: 1, kind: "background" },
+      { id: "short-other-2", sessionId: "live-OTHER-2", cwd: KEY, startedAt: 2, kind: "background" }
+    );
+    const deps = baseDeps(await makeTempDir(), fake.runCommand);
+    const outcome = await stopLiveSession(deps, "live-TARGET-not-in-listing");
+    expect(outcome.kind).toBe("already-gone");
+    expect(fake.calls).toEqual([["claude", "agents", "--json"]]); // listed, but NEVER called stop on either sibling
+    expect(fake.listing.length).toBe(2); // both siblings still present — nothing was removed
   });
 
   test("off calls stopLiveSession and clears liveSessionId on success", async () => {
