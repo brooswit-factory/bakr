@@ -12,6 +12,19 @@
 // trace in what that suite samples. This file stats the directory's own
 // mtime/ctime in addition to its entries, closing that specific hole for
 // the daemon's own cycle.
+//
+// BAKR-32: the mtime-based `snapshot()`/`expectUnchanged()` pair below is
+// blind to an in-place, same-name, same-size content rewrite (measured, not
+// assumed — see BAKR-29's ticket). `snapshotTree`/`diffTreeSnapshots`
+// (test/integration/fixtures/tree-snapshot.ts, reused rather than
+// duplicated — it already hashes content and already has its own positive
+// controls) is added ADDITIVELY alongside the existing assertions, not in
+// place of them: `snapshot()` is the only one of the two that also catches
+// a subdirectory's own mtime moving (a create-then-delete inside `src/`),
+// which `diffTreeSnapshots` does not report. Keeping both means neither
+// coverage is lost. In each test the old `expectUnchanged` runs FIRST and
+// the new content check SECOND, so a content-only mutation fails on the
+// new assertion alone rather than being obscured by the old one.
 import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -25,6 +38,7 @@ import { beginLaunch, emptySessionSlots, markLaunchStarted, resolveLaunch } from
 import { save as saveSlots } from "../../src/session-slots-store";
 import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
 import type { RunCommandOptions, CommandResult } from "../../src/spawn";
+import { snapshotTree, diffTreeSnapshots } from "./fixtures/tree-snapshot";
 
 const cleanupDirs: string[] = [];
 const pendingChmodRestores: Array<{ path: string; mode: number }> = [];
@@ -135,11 +149,14 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     };
 
     const before = await snapshot(claimedDir);
+    const treeBefore = await snapshotTree(claimedDir);
     const result = await runReconcileCycle(initialDaemonState(), deps);
     expect(result.restored).toHaveLength(1); // confirms a restore genuinely happened, not a vacuous pass
     const after = await snapshot(claimedDir);
+    const treeAfter = await snapshotTree(claimedDir);
 
     expectUnchanged(before, after);
+    expect(diffTreeSnapshots(treeBefore, treeAfter)).toEqual({ changed: false, details: [] });
   });
 
   test("BELT: the identical restore cycle against a chmod 0555 (read-only) claimed directory still succeeds and still leaves it unchanged", async () => {
@@ -167,6 +184,7 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     // ctime, which is not bakr's doing — comparing from here isolates
     // exactly what the reconcile cycle itself does to the directory.
     const before = await snapshot(claimedDir);
+    const treeBefore = await snapshotTree(claimedDir);
 
     const deps: DaemonDeps = {
       runCommand: fakeRunCommand(),
@@ -188,8 +206,10 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     // bakr made. Permissions are restored afterward, purely for the
     // recursive rm in afterEach to succeed.
     const after = await snapshot(claimedDir);
+    const treeAfter = await snapshotTree(claimedDir);
     await chmod(claimedDir, 0o755);
 
     expectUnchanged(before, after);
+    expect(diffTreeSnapshots(treeBefore, treeAfter)).toEqual({ changed: false, details: [] });
   });
 });
