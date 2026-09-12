@@ -219,7 +219,8 @@ describe("on", () => {
     if (result.ok) {
       expect(result.kind).toBe("no-change");
       expect(result.launchIssued).toBe(false);
-      expect(result.wedgeCleared).toBe(false);
+      expect(result.launchWedgeCleared).toBe(false);
+      expect(result.forkWedgeCleared).toBe(false);
     }
     expect(fake.calls).toEqual([["claude", "agents", "--json"]]); // the liveness-gate listing, and NOTHING else — never respawns a verified-alive session
   });
@@ -365,7 +366,8 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
     // respawn/fresh-keyed `clearFailedLaunchRecord` alone could never have
     // done this, since its computed key is `respawn(OLD_SHORT)`, not
     // `forkFrom(OLD_SESSION)`.
-    expect(result.wedgeCleared).toBe(true);
+    expect(result.launchWedgeCleared).toBe(false);
+    expect(result.forkWedgeCleared).toBe(true);
 
     const reloaded = await loadAgents(deps.agentsPath);
     if (reloaded.status !== "loaded") throw new Error("expected loaded store");
@@ -396,7 +398,8 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
     const result = await on(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (!result.ok) return;
-    expect(result.wedgeCleared).toBe(true);
+    expect(result.launchWedgeCleared).toBe(true);
+    expect(result.forkWedgeCleared).toBe(true);
     expect(result.launchIssued).toBe(true);
     expect(result.recovery?.kind).toBe("moved-directory-escape"); // respawn refused stale-cwd again, escaped again
 
@@ -411,7 +414,7 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
     expect(forkRecords[0]?.error).toBeUndefined();
   });
 
-  test("NEGATIVE CONTROL: no stray forkFrom record exists for this agent's CURRENT target -> wedgeCleared stays exactly what the respawn/fresh-keyed check alone would report (false), nothing spurious cleared", async () => {
+  test("NEGATIVE CONTROL: no stray forkFrom record exists for this agent's CURRENT target -> both clearing reports stay false", async () => {
     const dir = await makeTempDir();
     const fake = makeFakeClaude();
     fake.listing.push({ id: "d1shortx", sessionId: "d1", cwd: KEY, startedAt: 1, kind: "background", pid: process.pid });
@@ -420,7 +423,10 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
 
     const result = await on(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.wedgeCleared).toBe(false);
+    if (result.ok) {
+      expect(result.launchWedgeCleared).toBe(false);
+      expect(result.forkWedgeCleared).toBe(false);
+    }
   });
 });
 

@@ -22,18 +22,59 @@ runs in:
 
 That difference — created vs. given — is the whole product.
 
+## CLI usage
+
+Bare `bakr` claims the current directory idempotently and discovers its
+non-archived agents and any explicit adoption offers. It deliberately does
+not create or launch an agent. This differs from candlestix, whose bare
+command creates: a bakr directory already has meaning, so spending a launch
+on first discovery would be surprising.
+
+| Command | Meaning |
+|---|---|
+| `bakr` | Claim and discover the current directory |
+| `bakr list [--archived]` | List this directory's agents |
+| `bakr create [--name <name>]` | Create without auto-attaching |
+| `bakr adopt <@id> [<@id> ...]` | Explicitly adopt offered orphans here |
+| `bakr <id\|name>` | Attach in the current terminal |
+| `bakr <id\|name> on\|off\|archive\|unarchive` | Change lifecycle state |
+| `bakr <id\|name> name\|rename <new>` | Rename |
+| `bakr <id\|name> delete [--yes]` | Delete, with confirmation |
+
+Help is flag-only (`bakr --help`); `help` remains available as an agent
+reference. Attach requires TTY stdin and stdout, inherits all three streams,
+and propagates `claude attach`'s exit status. On Claude Code 2.1.269, live
+PTY measurement showed that attaching an absent stopped job prints “Waking
+session…” and respawns it. Bakr therefore requires the agent's exact full
+job ID in one successful `claude agents --json` listing before handoff and
+points an absent target at `bakr <ref> on`; a listing failure is never read
+as absence. Attaching and detaching without a prompt left `totalCostUSD` at
+0. Delete likewise refuses a
+non-TTY unless `--yes` is supplied.
+
+| Exit | Meaning |
+|---:|---|
+| 0 | Success, including an already-in-state no-change |
+| 1 | Typed domain refusal or declined confirmation |
+| 2 | Usage error |
+| 3 | Store/listing/lock/unexpected service failure |
+
+The CLI imports the lifecycle actions directly; unlike candlestix it does
+not add a daemon API, because bakr's locked stores already support multiple
+writers. It also never opens a new terminal. The `on` result model reports
+current-attempt launch-record clearing separately from stray fork-from-record
+clearing so neither operator-visible recovery is conflated.
+
 **bakr is not a task runner.** Nothing in it discovers work, assigns it, or
 finishes it. The operator gives an agent its purpose by attaching to it and
 talking to it.
 
-This repository now has: a path-keyed **claim store** (BAKR-6), a
+This repository has: a path-keyed **claim store** (BAKR-6), a
 **spawn substrate** (BAKR-7) that launches/lists/stops `claude` background
 sessions, and — as of BAKR-12 (implementing story BAKR-8) — the **daemon**
 itself: a systemd `--user` unit with linger enabled that reads the claim
 store and brings back every claimed directory's on-sessions, silently, on
-a timer. No agent lifecycle (create/attach/on/off/name/archive/delete) yet
-— that is epic BAKR-2, deliberately not absorbed here (see "What bakr does
-NOT do yet" below).
+a timer, an agent lifecycle action set, and the CLI described above.
 
 ## Running the daemon
 
@@ -107,12 +148,10 @@ safe.
 prints `-- No entries --` rather than failing — a silent wrong answer that
 looks like an empty log. Always use `journalctl --user -u bakr.service`.
 
-## Exercising the daemon (provisional demo harness)
+## Exercising the daemon (legacy demo harnesses)
 
-There is no real CLI yet (that is BAKR-3's job). `scripts/demo-claim.ts` and
-`scripts/demo-put-on.ts` are an explicitly provisional, bare-minimum
-operator surface — not a CLI grammar — that exist only so the daemon has
-something real to reconcile against:
+`scripts/demo-claim.ts` and `scripts/demo-put-on.ts` predate the real CLI and
+remain diagnostic harnesses, not an operator interface:
 
 ```
 bun run scripts/demo-claim.ts /path/to/a/directory
@@ -177,12 +216,11 @@ anything to stop an agent; nothing resolves, adopts, or restores a session
 by matching its directory alone. See the PR description for the hazard
 greps and the live cgroup verification specific to this daemon.
 
-## What bakr does NOT do yet
+## What bakr does not do
 
-The agent lifecycle action set (create/attach/on/off/name/archive/delete)
-is epic BAKR-2's scope, deliberately not absorbed here — see
-`session-slots.ts`'s own module comment for exactly where this story drew
-that line. No real CLI grammar (BAKR-3) and no webapp (BAKR-4) either.
+Bakr is not a task runner or webapp. The CLI does not use an HTTP server and
+does not open new terminal windows. Installation onto a target machine's
+PATH remains separate from this command implementation.
 
 ## The one command
 
@@ -267,4 +305,3 @@ The CI workflow's `push` / `workflow_dispatch` triggers alongside
 candlestix: a brand-new GitHub org gates `pull_request`-triggered runs so
 they queue with zero jobs, which applies here since `brooswit-factory/bakr`
 is a new repository.
-

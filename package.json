@@ -13,9 +13,12 @@
   "bugs": {
     "url": "https://github.com/brooswit-factory/bakr/issues"
   },
+  "bin": {
+    "bakr": "src/cli/bin.ts"
+  },
   "scripts": {
     "start": "bun run src/index.ts",
-    "build": "bun build src/index.ts --outdir dist --target bun",
+    "build": "bun build src/index.ts src/cli/bin.ts --outdir dist --target bun",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "bun test",
     "check": "bun run typecheck && bun test && bun run build"
