@@ -51,7 +51,7 @@
 // result, never done silently." `on` below is that operator action here —
 // see its own doc for the exact predicate it clears on (B13 point 2: a
 // FAILED record only, never a genuinely in-flight one) and how it reports
-// the clear (`wedgeCleared` in its typed result). It checks for a wedge
+// the clear (`launchWedgeCleared` in its typed result). It checks for a wedge
 // REGARDLESS of whether the agent was off or already "on" — an already-on
 // agent stuck on a wedged record (e.g. one left by `create`, which performs
 // the identical kind of fresh launch) is exactly the second case B13 and
@@ -258,7 +258,7 @@ export type OnResult =
   | ResolutionRefusal
   | { readonly ok: false; readonly reason: "archived"; readonly message: string; readonly agent: AgentRecord }
   | { readonly ok: false; readonly reason: "listing-failed"; readonly message: string }
-  | { readonly ok: true; readonly kind: "no-change" | "turn-on"; readonly agent: AgentRecord; readonly wedgeCleared: boolean; readonly launchIssued: boolean; readonly recovery?: RespawnOutcome };
+  | { readonly ok: true; readonly kind: "no-change" | "turn-on"; readonly agent: AgentRecord; readonly launchWedgeCleared: boolean; readonly forkWedgeCleared: boolean; readonly launchIssued: boolean; readonly recovery?: RespawnOutcome };
 
 /**
  * BAKR-22: `issue-respawn`/`issue-fresh` replace the old single `issue`
@@ -287,7 +287,7 @@ type OnLaunchPlan =
 type OnLockResult =
   | ResolutionRefusal
   | { readonly ok: false; readonly reason: "archived"; readonly message: string; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "no-change" | "turn-on"; readonly agent: AgentRecord; readonly wedgeCleared: boolean; readonly launch: OnLaunchPlan };
+  | { readonly ok: true; readonly kind: "no-change" | "turn-on"; readonly agent: AgentRecord; readonly launchWedgeCleared: boolean; readonly forkWedgeCleared: boolean; readonly launch: OnLaunchPlan };
 
 /**
  * B6: off -> on, refused while archived. B13 (epic ruling, 2026-09-11) — the
@@ -295,7 +295,7 @@ type OnLockResult =
  * unremovable once a daemon cycle marks it failed — see the module comment)
  * is checked and, if failed, cleared HERE — deliberately and only here, an
  * explicit operator action, never something `daemon.ts` does, and ALWAYS
- * reported in the typed result (`wedgeCleared`), never silently. B13 point 2
+ * reported in the typed result (`launchWedgeCleared`), never silently. B13 point 2
  * (the epic's own sharp question): the predicate this clears on is "a
  * record exists for `(agentId, attemptKey(agent))` AND it is FAILED
  * (`clearFailedLaunchRecord` only ever removes one whose `error` is
@@ -309,7 +309,7 @@ type OnLockResult =
  * case B13/criterion 11 asks `on` to recover, not only the off -> on
  * transition. `kind` still reports the LIFECYCLE diagonal honestly
  * ("no-change" when the agent was already on, "turn-on" when it
- * transitioned) — `wedgeCleared`/`launchIssued` are orthogonal facts about
+ * transitioned) — the two clearing fields and `launchIssued` are orthogonal facts about
  * the launch side effect, reported either way.
  *
  * B8 still binds absolutely: no prompt, ever. The id a restore resumes is
@@ -391,7 +391,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
         const cleared = clearFailedLaunchRecord(next, agentId, attemptKey);
         if (cleared === next) {
           // Genuinely in-flight (not failed) — never duplicate a live launch (AC4).
-          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: { kind: "in-flight" } } };
+          return { state: next, result: { ok: true, kind, agent: decision.agent, launchWedgeCleared: false, forkWedgeCleared, launch: { kind: "in-flight" } } };
         }
         next = cleared;
         const attemptId = deps.generateAttemptId();
@@ -400,7 +400,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
           plan.kind === "fresh"
             ? { kind: "issue-fresh", attemptId }
             : { kind: "issue-respawn", attemptId, shortId: plan.shortId, restoreSessionId: (decision.agent.restoreTarget as { sessionId: string }).sessionId };
-        return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: true, launch: launchPlan } };
+        return { state: next, result: { ok: true, kind, agent: decision.agent, launchWedgeCleared: true, forkWedgeCleared, launch: launchPlan } };
       }
 
       // BAKR-22: the liveness gate applies here too, not only in daemon.ts
@@ -417,10 +417,10 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
         const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
         const verdict = decideLiveness(plan.shortId, entry, pidVerifiedAlive);
         if (verdict.status === "alive") {
-          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: { kind: "alive" } } };
+          return { state: next, result: { ok: true, kind, agent: decision.agent, launchWedgeCleared: false, forkWedgeCleared, launch: { kind: "alive" } } };
         }
         if (verdict.status === "not-verifiable") {
-          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: { kind: "not-verifiable", reason: verdict.reason } } };
+          return { state: next, result: { ok: true, kind, agent: decision.agent, launchWedgeCleared: false, forkWedgeCleared, launch: { kind: "not-verifiable", reason: verdict.reason } } };
         }
       }
 
@@ -433,7 +433,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
         // — should not normally happen, but this is not the place to
         // fabricate a launch for it).
         if (plan.kind !== "respawn") {
-          return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: { kind: "none" } } };
+          return { state: next, result: { ok: true, kind, agent: decision.agent, launchWedgeCleared: false, forkWedgeCleared, launch: { kind: "none" } } };
         }
       }
 
@@ -443,7 +443,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
         plan.kind === "fresh"
           ? { kind: "issue-fresh", attemptId }
           : { kind: "issue-respawn", attemptId, shortId: plan.shortId, restoreSessionId: (decision.agent.restoreTarget as { sessionId: string }).sessionId };
-      return { state: next, result: { ok: true, kind, agent: decision.agent, wedgeCleared: forkWedgeCleared, launch: launchPlan } };
+      return { state: next, result: { ok: true, kind, agent: decision.agent, launchWedgeCleared: false, forkWedgeCleared, launch: launchPlan } };
     },
     lockOpts(deps)
   );
@@ -462,7 +462,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
       }),
       lockOpts(deps)
     );
-    return { ok: true, kind: result.kind, agent: result.agent, wedgeCleared: result.wedgeCleared, launchIssued: true };
+    return { ok: true, kind: result.kind, agent: result.agent, launchWedgeCleared: result.launchWedgeCleared, forkWedgeCleared: result.forkWedgeCleared, launchIssued: true };
   }
   if (result.launch.kind === "issue-respawn") {
     const recovery = await dispatchRespawn(deps, directory, result.agent.id, result.launch.attemptId, result.launch.shortId, result.launch.restoreSessionId);
@@ -471,11 +471,11 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
     // (an escape happened, or the attempt was refused outright), never
     // silently, per B13's own "clearing/escaping must be reported" spirit.
     return recovery.kind === "respawned"
-      ? { ok: true, kind: result.kind, agent: result.agent, wedgeCleared: result.wedgeCleared, launchIssued: true }
-      : { ok: true, kind: result.kind, agent: result.agent, wedgeCleared: result.wedgeCleared, launchIssued: true, recovery };
+      ? { ok: true, kind: result.kind, agent: result.agent, launchWedgeCleared: result.launchWedgeCleared, forkWedgeCleared: result.forkWedgeCleared, launchIssued: true }
+      : { ok: true, kind: result.kind, agent: result.agent, launchWedgeCleared: result.launchWedgeCleared, forkWedgeCleared: result.forkWedgeCleared, launchIssued: true, recovery };
   }
 
-  return { ok: true, kind: result.kind, agent: result.agent, wedgeCleared: result.wedgeCleared, launchIssued: false };
+  return { ok: true, kind: result.kind, agent: result.agent, launchWedgeCleared: result.launchWedgeCleared, forkWedgeCleared: result.forkWedgeCleared, launchIssued: false };
 }
 
 /** What `forkFromCurrentTarget` actually did — three-valued, matching `probeResumableTranscript`'s own discipline (see that module's doc for why a boolean would be dangerous here). */

@@ -151,8 +151,9 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       };
       const result = await on(actionDeps(dir, launchRunCommand), KEY, agent.id);
       expect(result.ok).toBe(true);
-      if (result.ok && "wedgeCleared" in result) {
-        expect(result.wedgeCleared).toBe(true); // REPORTED, not silent (B13 point 1)
+      if (result.ok && "launchWedgeCleared" in result) {
+        expect(result.launchWedgeCleared).toBe(true); // REPORTED, not silent (B13 point 1)
+        expect(result.forkWedgeCleared).toBe(false);
         expect(result.launchIssued).toBe(true);
         expect(result.kind).toBe("no-change"); // lifecycle-wise it was already on — the wedge recovery is an orthogonal fact
       } else {
@@ -200,8 +201,9 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       };
       const result = await on(actionDeps(dir, launchRunCommand), KEY, agent.id);
       expect(result.ok).toBe(true);
-      if (result.ok && "wedgeCleared" in result) {
-        expect(result.wedgeCleared).toBe(true);
+      if (result.ok && "launchWedgeCleared" in result) {
+        expect(result.launchWedgeCleared).toBe(true);
+        expect(result.forkWedgeCleared).toBe(false);
         expect(result.launchIssued).toBe(true);
       } else {
         throw new Error(`expected a wedge-cleared ok result, got ${JSON.stringify(result)}`);
@@ -225,8 +227,9 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       };
       const result = await on(actionDeps(dir, runCommand), KEY, agent.id);
       expect(result.ok).toBe(true);
-      if (result.ok && "wedgeCleared" in result) {
-        expect(result.wedgeCleared).toBe(false);
+      if (result.ok && "launchWedgeCleared" in result) {
+        expect(result.launchWedgeCleared).toBe(false);
+        expect(result.forkWedgeCleared).toBe(false);
         expect(result.launchIssued).toBe(false);
       } else {
         throw new Error(`expected ok, got ${JSON.stringify(result)}`);
