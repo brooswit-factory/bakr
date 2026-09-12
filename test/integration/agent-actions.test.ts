@@ -378,7 +378,17 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
   test("the retried escape below the clear still runs normally: respawn refused (stale cwd) -> forkFrom dispatched and recorded fresh, no duplicate/stray record left over", async () => {
     const dir = await makeTempDir();
     const fake = makeFakeClaudeAlwaysStaleCwd({ forkSucceeds: true });
-    const deps = baseDeps(dir, fake.runCommand);
+    const deps: AgentActionDeps = {
+      ...baseDeps(dir, fake.runCommand),
+      // This test fakes every Claude process edge; make the transcript edge
+      // deterministic too. Falling through to the real ~/.claude/projects
+      // made a clean CI host report could-not-tell while a developer host
+      // with transcript storage happened to take the intended fork path.
+      transcriptProbeDeps: {
+        listProjectDirs: async () => ({ ok: true, dirs: ["fixture-project"] }),
+        transcriptExistsIn: async () => ({ ok: true, exists: true }),
+      },
+    };
 
     const agent = makeAgent({ id: "@a1", state: "on", birthSessionId: OLD_SESSION, restoreTarget: { sessionId: OLD_SESSION, shortId: OLD_SHORT } });
     let store = putAgent(emptyAgentStore(), agent);
