@@ -9,7 +9,7 @@ import * as actions from "../agent-actions";
 import { adopt } from "../adopt";
 import { probeDirectory } from "../orphan-probe";
 import { classifyClaims, buildOffers, applyDestinationHint } from "../orphan-model";
-import { listBackgroundSessions } from "../spawn";
+import { listBackgroundSessions, type BackgroundSessionInfo } from "../spawn";
 import type { AdoptDeps } from "../adopt";
 import type { AgentActionDeps } from "../agent-actions";
 import type { ResolveInputs } from "../claim-key-resolve";
@@ -17,7 +17,7 @@ import type { OrphanProbeDeps } from "../orphan-probe";
 import { parseArgv, type ParsedCommand } from "./grammar";
 import { attachInPlace } from "./attach";
 import { confirmDelete } from "./confirm";
-import { residentRefusal, type ResidentMessenger } from "./send";
+import { residentRefusal, resolveResidentCwd, type ResidentMessenger } from "./send";
 import { EXIT_FAILURE, EXIT_REFUSAL, EXIT_SUCCESS, EXIT_USAGE } from "./exit-codes";
 
 export interface CliDeps {
@@ -41,6 +41,14 @@ const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <n
 const label = (a: AgentRecord) => `${a.id}${a.name === undefined ? "" : ` \"${a.name}\"`}`;
 const refusalCode = (reason: string) => reason === "store-malformed" || reason === "listing-failed" || reason === "store-degraded" ? EXIT_FAILURE : EXIT_REFUSAL;
 export const isAttachJobListed = (restoreSessionId:string, sessions:readonly {sessionId:string}[]):boolean => sessions.some(session => session.sessionId === restoreSessionId);
+
+// Same exact-id + in-directory rule `send` delivers on, so list never reports an agent as reachable that send would refuse.
+function availability(agent: AgentRecord, sessions: readonly BackgroundSessionInfo[]): string {
+  if (!agent.restoreTarget) return "not listed";
+  const r = resolveResidentCwd(agent.directory, agent.restoreTarget.sessionId, sessions);
+  if (r.ok) return r.cwd === agent.directory ? "listed by claude" : `listed by claude in ${r.cwd.slice(agent.directory.length + 1)}`;
+  return r.reason === "not-running" ? "not listed" : `listed by claude, not sendable (${r.reason})`;
+}
 
 function refuse(result: { reason: string; message: string }, d: CliDeps): number {
   d.stderr(`${result.reason}: ${result.message}\n`);
@@ -73,13 +81,13 @@ async function claimDirectory(directory: ClaimKey, d: CliDeps): Promise<boolean>
 async function renderList(directory: ClaimKey, showArchived: boolean, d: CliDeps, emptyDiscovery = false): Promise<number> {
   const result = await actions.list(d.actions, directory);
   if (!result.ok) return refuse(result, d);
-  let listed: readonly AgentRecord[] = [];
+  let sessions: readonly BackgroundSessionInfo[] = [];
   let listingFailed: string | undefined;
-  try { listed = (await listBackgroundSessions({ runCommand: d.actions.runCommand })).map(s => ({ id: s.sessionId } as unknown as AgentRecord)); }
+  try { sessions = await listBackgroundSessions({ runCommand: d.actions.runCommand }); }
   catch (e) { listingFailed = e instanceof Error ? e.message : String(e); }
   const agents = result.agents.filter(a => showArchived || a.state !== "archived");
   if (!agents.length) d.stdout(emptyDiscovery ? "no agents yet — `bakr create` makes one\n" : "no agents\n");
-  else for (const agent of agents) d.stdout(`${label(agent)} — ${agent.state} — ${listingFailed ? "could not list" : listed.some(x => x.id === agent.restoreTarget?.sessionId) ? "listed by claude" : "not listed"}\n`);
+  else for (const agent of agents) d.stdout(`${label(agent)} — ${agent.state} — ${listingFailed ? "could not list" : availability(agent, sessions)}\n`);
   return EXIT_SUCCESS;
 }
 
@@ -134,8 +142,13 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
   }
   if (command.kind === "send") {
     const r = await actions.attachTarget(d.actions, directory, command.ref); if (!r.ok) return refuse(r,d);
+    let sessions;
+    try { sessions = await listBackgroundSessions({ runCommand: d.actions.runCommand }); }
+    catch (e) { return refuse({ reason: "listing-failed", message: `cannot find agent ${r.agent.id}'s session without a successful claude listing: ${e instanceof Error ? e.message : String(e)}` }, d); }
+    const where = resolveResidentCwd(r.agent.directory, r.restoreSessionId, sessions);
+    if (!where.ok) return refuse({ reason: where.reason, message: `agent ${r.agent.id} is on in bakr's store but ${where.message} — nothing was sent${where.reason === "not-running" ? `; the daemon restores it, or run \`bakr ${command.ref} on\`` : ""}` }, d);
     let result;
-    try { result = await d.messenger.message({ provider: "claude", sessionId: r.restoreSessionId, cwd: r.agent.directory }, command.message); }
+    try { result = await d.messenger.message({ provider: "claude", sessionId: r.restoreSessionId, cwd: where.cwd }, command.message); }
     catch (e) {
       const refusal = residentRefusal(e); if (!refusal) throw e;
       d.stderr(`${refusal.reason}: ${refusal.message}\n`);
