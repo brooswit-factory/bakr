@@ -61,8 +61,8 @@ background session (`claude -p --resume` refuses while it runs), so Drovr types
 into `claude attach` and proves delivery from that session's own transcript.
 An off, archived, absent, or mid-turn agent is refused (exit 1). Delivery that
 cannot be proven exits 3. A reply still in progress after Drovr's five-minute
-wait prints the text so far, reports `reply-pending`, and exits 1. Drovr is
-linked locally (`link:@brooswit/drovr`) until a release includes this API.
+wait prints the text so far, reports `reply-pending`, and exits 1. The
+transport ships in Drovr 0.7.0's release asset.
 
 | Exit | Meaning |
 |---:|---|
