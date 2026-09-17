@@ -40,6 +40,7 @@ on first discovery would be surprising.
 | `bakr <id\|name> on\|off\|archive\|unarchive` | Change lifecycle state |
 | `bakr <id\|name> name\|rename <new>` | Rename |
 | `bakr <id\|name> delete [--yes]` | Delete, with confirmation |
+| `bakr <id\|name> send <message>` | Message the running agent and print its reply |
 
 Help is flag-only (`bakr --help`); `help` remains available as an agent
 reference. Attach requires TTY stdin and stdout, inherits all three streams,
@@ -51,6 +52,17 @@ points an absent target at `bakr <ref> on`; a listing failure is never read
 as absence. Attaching and detaching without a prompt left `totalCostUSD` at
 0. Delete likewise refuses a
 non-TTY unless `--yes` is supplied.
+
+`send` needs no TTY. It delivers one quoted message to the agent's current,
+running session and prints the reply. It is provider-neutral: the transport
+comes from Drovr's `createResidentAgentMessenger`, and bakr never resumes,
+forks, or wakes a session to send. Claude has no machine API for a running
+background session (`claude -p --resume` refuses while it runs), so Drovr types
+into `claude attach` and proves delivery from that session's own transcript.
+An off, archived, absent, or mid-turn agent is refused (exit 1). Delivery that
+cannot be proven exits 3. A reply still in progress after Drovr's five-minute
+wait prints the text so far, reports `reply-pending`, and exits 1. Drovr is
+linked locally (`link:@brooswit/drovr`) until a release includes this API.
 
 | Exit | Meaning |
 |---:|---|

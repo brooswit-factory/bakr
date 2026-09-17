@@ -13,6 +13,7 @@ export type ParsedCommand =
   | { kind: "on" | "off" | "archive" | "unarchive"; ref: string }
   | { kind: "delete"; ref: string; yes: boolean }
   | { kind: "rename"; ref: string; newName: string }
+  | { kind: "send"; ref: string; message: string }
   | { kind: "help" };
 
 export type ParseResult = { ok: true; command: ParsedCommand } | { ok: false; message: string };
@@ -88,6 +89,10 @@ export function parseArgv(argv: string[]): ParseResult {
   if (verb === "name" || verb === "rename") {
     if (words.length !== 3) return error(`"${verb}" requires exactly one new name`);
     return { ok: true, command: { kind: "rename", ref: first, newName: words[2]! } };
+  }
+  if (verb === "send") {
+    if (words.length !== 3) return error('"send" requires exactly one message argument; quote it');
+    return { ok: true, command: { kind: "send", ref: first, message: words[2]! } };
   }
   return error(`unknown verb "${verb}"`);
 }

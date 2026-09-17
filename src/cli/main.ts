@@ -17,6 +17,7 @@ import type { OrphanProbeDeps } from "../orphan-probe";
 import { parseArgv, type ParsedCommand } from "./grammar";
 import { attachInPlace } from "./attach";
 import { confirmDelete } from "./confirm";
+import { residentRefusal, type ResidentMessenger } from "./send";
 import { EXIT_FAILURE, EXIT_REFUSAL, EXIT_SUCCESS, EXIT_USAGE } from "./exit-codes";
 
 export interface CliDeps {
@@ -33,9 +34,10 @@ export interface CliDeps {
   stderr(s: string): void;
   prompt(s: string): Promise<string>;
   spawnAttach(id: string): Promise<number>;
+  messenger: ResidentMessenger;
 }
 
-const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n`;
+const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n`;
 const label = (a: AgentRecord) => `${a.id}${a.name === undefined ? "" : ` \"${a.name}\"`}`;
 const refusalCode = (reason: string) => reason === "store-malformed" || reason === "listing-failed" || reason === "store-degraded" ? EXIT_FAILURE : EXIT_REFUSAL;
 export const isAttachJobListed = (restoreSessionId:string, sessions:readonly {sessionId:string}[]):boolean => sessions.some(session => session.sessionId === restoreSessionId);
@@ -123,6 +125,20 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
     }
     const handoff = await attachInPlace(r.agent.restoreTarget!.shortId, { stdinIsTTY:d.stdinIsTTY, stdoutIsTTY:d.stdoutIsTTY, spawn:d.spawnAttach });
     if (!handoff.ok) { d.stderr(`non-tty: ${handoff.message}\n`); return 1; } return handoff.exitCode;
+  }
+  if (command.kind === "send") {
+    const r = await actions.attachTarget(d.actions, directory, command.ref); if (!r.ok) return refuse(r,d);
+    let result;
+    try { result = await d.messenger.message({ provider: "claude", sessionId: r.restoreSessionId, cwd: r.agent.directory }, command.message); }
+    catch (e) {
+      const refusal = residentRefusal(e); if (!refusal) throw e;
+      d.stderr(`${refusal.reason}: ${refusal.message}\n`);
+      return refusal.reason === "delivery-unconfirmed" ? EXIT_FAILURE : EXIT_REFUSAL;
+    }
+    if (result.reply) d.stdout(result.reply.endsWith("\n") ? result.reply : `${result.reply}\n`);
+    if (result.status === "replied") return EXIT_SUCCESS;
+    d.stderr(`reply-pending: delivered to agent ${r.agent.id}, but its turn had not finished; attach with \`bakr ${command.ref}\` to follow\n`);
+    return EXIT_REFUSAL;
   }
   if (command.kind === "adopt") {
     const store = await loadAgents(d.actions.agentsPath); if (store.status === "malformed") return refuse({reason:"store-degraded",message:store.error},d);
