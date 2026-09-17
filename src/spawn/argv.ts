@@ -33,11 +33,21 @@ export interface LaunchInvocation {
  * pinning the flag makes today's behaviour permanent regardless of that
  * future default change.
  *
+ * systemd-run added that option in systemd 254. Older builds reject it as an
+ * unrecognized option before creating a scope, and they never expand
+ * `$something` at all, so launch.ts retries once with
+ * `pinExpandEnvironment: false` when that exact refusal comes back.
+ *
  * The target directory travels as the child process's `cwd` (see
  * `LaunchInvocation.cwd`, consumed by the injected RunCommand), never as an
  * argv element — `claude --bg` takes no directory flag of its own.
  */
-export function buildLaunchInvocation(dir: string, unitName: string, claudeArgs: string[] = []): LaunchInvocation {
+export function buildLaunchInvocation(
+  dir: string,
+  unitName: string,
+  claudeArgs: string[] = [],
+  opts: { pinExpandEnvironment?: boolean } = {},
+): LaunchInvocation {
   return {
     argv: [
       "systemd-run",
@@ -45,7 +55,7 @@ export function buildLaunchInvocation(dir: string, unitName: string, claudeArgs:
       "--scope",
       `--unit=${unitName}`,
       "--collect",
-      "--expand-environment=no",
+      ...(opts.pinExpandEnvironment === false ? [] : ["--expand-environment=no"]),
       "--",
       "claude",
       "--bg",

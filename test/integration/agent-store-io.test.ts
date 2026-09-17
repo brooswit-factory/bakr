@@ -60,7 +60,7 @@ describe("save: atomic write leaves no trace of the temp file, and creates its p
     const dir = await makeTempDir();
     const path = join(dir, "agents.json");
     await save(path, emptyAgentStore());
-    expect(await readdir(dir)).toEqual(["agents.json"]);
+    expect((await readdir(dir)).sort()).toEqual(["agents.json"]);
   });
 
   test("save creates its parent directory when absent", async () => {
@@ -92,7 +92,7 @@ describe("AC6: a malformed store is never overwritten by withAgentStoreLock", ()
     // an existing-or-created file) and releasing it never unlinks that path (see agent-store-io.ts's
     // module comment on why unlinking a flocked file is unsafe) — so it persists even on this
     // malformed-store path, where nothing else was written.
-    expect(await readdir(dir)).toEqual(["agents.json", "agents.json.lock"]);
+    expect((await readdir(dir)).sort()).toEqual(["agents.json", "agents.json.lock"]);
   });
 });
 
@@ -120,11 +120,11 @@ describe("withAgentStoreLock: single-process read-modify-write", () => {
     await save(path, emptyAgentStore()); // a real store must already exist for a no-op mutate to leave "agents.json" itself in place (Finding 3: a true no-op now skips the save entirely)
 
     await withAgentStoreLock(path, (current) => ({ state: current, result: undefined }));
-    expect(await readdir(dir)).toEqual(["agents.json", "agents.json.lock"]);
+    expect((await readdir(dir)).sort()).toEqual(["agents.json", "agents.json.lock"]);
     const inodeAfterFirst = (await stat(lockPath)).ino;
 
     await withAgentStoreLock(path, (current) => ({ state: current, result: undefined }));
-    expect(await readdir(dir)).toEqual(["agents.json", "agents.json.lock"]);
+    expect((await readdir(dir)).sort()).toEqual(["agents.json", "agents.json.lock"]);
     expect((await stat(lockPath)).ino).toBe(inodeAfterFirst); // same inode — reopened, never recreated
   });
 

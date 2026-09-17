@@ -27,6 +27,8 @@ import type { RunCommand } from "./exec";
 import { buildLaunchInvocation } from "./argv";
 import { parseLaunchId } from "./parse";
 
+const EXPAND_ENVIRONMENT_UNSUPPORTED = /unrecognized option '--expand-environment/;
+
 export interface LaunchDeps {
   runCommand: RunCommand;
   /** Generates the `--unit=` suffix for each launch's systemd-run scope. Injectable for deterministic tests; defaults to a fresh random one per call. */
@@ -56,7 +58,13 @@ export async function launch(dir: string, claudeArgs: string[], deps: LaunchDeps
   const invocation = buildLaunchInvocation(dir, unitName, claudeArgs);
 
   try {
-    const result = await deps.runCommand(invocation.argv, { cwd: invocation.cwd, timeoutMs: invocation.timeoutMs });
+    let result = await deps.runCommand(invocation.argv, { cwd: invocation.cwd, timeoutMs: invocation.timeoutMs });
+    if (result.exitCode !== 0 && EXPAND_ENVIRONMENT_UNSUPPORTED.test(result.stderr)) {
+      // systemd < 254 refuses the option during argument parsing, before any
+      // scope exists, and never expands `$something`, so omitting it is safe.
+      const legacy = buildLaunchInvocation(dir, unitName, claudeArgs, { pinExpandEnvironment: false });
+      result = await deps.runCommand(legacy.argv, { cwd: legacy.cwd, timeoutMs: legacy.timeoutMs });
+    }
     if (result.exitCode !== 0) {
       return {
         ok: false,

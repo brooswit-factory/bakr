@@ -74,4 +74,34 @@ describe("launch", () => {
     }
     expect(seen.size).toBe(5);
   });
+  test("systemd < 254 refusing --expand-environment is retried once without it, under the same unit", async () => {
+    const commands: string[][] = [];
+    const result = await launch("/x", ["--append-system-prompt", "p"], {
+      generateUnitSuffix: () => "cafe0001",
+      runCommand: async (argv) => {
+        commands.push(argv);
+        if (argv.includes("--expand-environment=no")) {
+          return { exitCode: 1, stdout: "", stderr: "systemd-run: unrecognized option '--expand-environment=no'\n" };
+        }
+        return { exitCode: 0, stdout: "backgrounded · legacy01 (idle)\n", stderr: "" };
+      },
+    });
+    expect(result).toEqual({ ok: true, id: "legacy01" });
+    expect(commands).toHaveLength(2);
+    expect(commands[1]).not.toContain("--expand-environment=no");
+    expect(commands[1]!.slice(0, 5)).toEqual(["systemd-run", "--user", "--scope", "--unit=bakr-launch-cafe0001", "--collect"]);
+    expect(commands[1]!.slice(commands[1]!.indexOf("--"))).toEqual(["--", "claude", "--bg", "--append-system-prompt", "p"]);
+  });
+
+  test("any other launch failure is not retried", async () => {
+    let calls = 0;
+    const result = await launch("/x", [], {
+      runCommand: async () => {
+        calls += 1;
+        return { exitCode: 1, stdout: "", stderr: "systemd-run: unrecognized option '--bogus'" };
+      },
+    });
+    expect(result.ok).toBe(false);
+    expect(calls).toBe(1);
+  });
 });

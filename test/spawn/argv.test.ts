@@ -16,6 +16,12 @@ describe("buildLaunchInvocation", () => {
     expect(argv).toContain("--bg");
   });
 
+  test("pinExpandEnvironment: false omits only the flag systemd < 254 rejects", () => {
+    const pinned = buildLaunchInvocation("/x", "u", ["--resume", "s"]).argv;
+    const legacy = buildLaunchInvocation("/x", "u", ["--resume", "s"], { pinExpandEnvironment: false }).argv;
+    expect(legacy).toEqual(pinned.filter((a) => a !== "--expand-environment=no"));
+  });
+
   test("the target directory travels as cwd, never as an argv element", () => {
     const invocation = buildLaunchInvocation("/home/op/project", "u", []);
     expect(invocation.cwd).toBe("/home/op/project");
