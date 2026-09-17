@@ -106,6 +106,12 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
   if (command.kind === "discover") return discover(directory, d);
   if (command.kind === "list") return renderList(directory, command.showArchived, d);
   if (command.kind === "create") {
+    // Claim BEFORE the agent record exists, mirroring adopt.ts's Q6 order:
+    // the daemon restores only agents in CLAIMED directories, so an `on`
+    // agent written into an unclaimed one would never come back after a
+    // reboot. The claim is idempotent and saved atomically under its lock,
+    // so a crash in between leaves at worst a harmless empty claim.
+    if (!(await claimDirectory(directory, d))) return EXIT_FAILURE;
     const r = await actions.create(d.actions, directory, command.name); if (!r.ok) return refuse(r,d);
     d.stdout(`created ${label(r.agent)}\nattach with: bakr ${r.agent.id}\n`);
     if (!r.launch.ok) { d.stderr(`launch-failed: ${r.launch.error}\n`); return EXIT_FAILURE; }

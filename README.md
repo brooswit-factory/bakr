@@ -30,12 +30,16 @@ not create or launch an agent. This differs from candlestix, whose bare
 command creates: a bakr directory already has meaning, so spending a launch
 on first discovery would be surprising.
 
+`create` and `adopt` also claim the directory, durably and before the agent
+record is written, because the daemon only restores agents in claimed
+directories — that claim is what brings an agent back after a reboot.
+
 | Command | Meaning |
 |---|---|
 | `bakr` | Claim and discover the current directory |
 | `bakr list [--archived]` | List this directory's agents |
-| `bakr create [--name <name>]` | Create without auto-attaching |
-| `bakr adopt <@id> [<@id> ...]` | Explicitly adopt offered orphans here |
+| `bakr create [--name <name>]` | Claim the current directory, then create without auto-attaching |
+| `bakr adopt <@id> [<@id> ...]` | Claim the current directory, then explicitly adopt offered orphans here |
 | `bakr <id\|name>` | Attach in the current terminal |
 | `bakr <id\|name> on\|off\|archive\|unarchive` | Change lifecycle state |
 | `bakr <id\|name> name\|rename <new>` | Rename |
