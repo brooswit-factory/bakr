@@ -1,11 +1,12 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { lstat, readdir, readlink, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, readlink, stat } from "node:fs/promises";
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 import * as xdg from "./xdg";
 import type { ResolveInputs } from "./claim-key-resolve";
 import type { OrphanProbeDeps } from "./orphan-probe";
 import type { TranscriptProbeDeps } from "./transcript-probe";
+import { parseNotificationServers, type LaunchConfigDeps } from "./launch-config";
 
 // The impure seams for this ticket's two real-filesystem dependencies:
 // XDG resolution and symlink-aware path resolution. Both read real env/os
@@ -88,5 +89,29 @@ export const realTranscriptProbeDeps: TranscriptProbeDeps = {
       }
       return { ok: false, reason: err instanceof Error ? err.message : String(err) };
     }
+  },
+};
+
+/**
+ * The MCP servers this host wants every session it launches to hear from,
+ * read once from the environment (`BAKR_MCP_NOTIFICATION_SERVERS`, e.g.
+ * `yappr`) — unset means none, which is this substrate's own prior behaviour.
+ * Naming a server here never affects a directory whose `.mcp.json` does not
+ * configure it (see launch-config.ts's `resolveLaunchInputs`).
+ */
+export const notificationServersFromEnv = (): string[] =>
+  parseNotificationServers(process.env["BAKR_MCP_NOTIFICATION_SERVERS"]);
+
+/** The real read-only access to a directory's own `.mcp.json`, for `claudeLaunchArgs` (launch-config.ts). Absent or unreadable configuration resolves to `undefined` rather than throwing: configuration this cannot read must never fail a launch. */
+export const realLaunchConfigDeps: LaunchConfigDeps = {
+  readMcpConfig: async (path: string) => {
+    try {
+      return await readFile(path, "utf8");
+    } catch {
+      return undefined;
+    }
+  },
+  get notificationServers(): string[] {
+    return notificationServersFromEnv();
   },
 };

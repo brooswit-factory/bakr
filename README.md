@@ -100,6 +100,38 @@ systemctl --user start bakr.service
 journalctl --user -u bakr.service   # NOT the system-level journalctl — see below
 ```
 
+### Letting launched sessions hear from an MCP server
+
+A directory's `.mcp.json` can configure an MCP server perfectly and the
+session bakr launches there will still never receive a single notification
+from it: a claude session only subscribes to a server's notifications when it
+is launched with that server's development channel. Enabling the server and
+subscribing to it are two separate acts.
+
+Name the servers this host's sessions should hear from:
+
+```
+BAKR_MCP_NOTIFICATION_SERVERS=yappr      # commas or spaces separate several
+```
+
+Unset (the default) means none, and every launch is exactly what it was
+before. A server named here is only ever requested for a directory whose own
+`.mcp.json` actually configures it, so naming one has no effect on sessions
+that do not use it. To set it for the daemon, add an `Environment=` line to
+`systemd/bakr.service` before `./scripts/install.sh`, then
+`systemctl --user daemon-reload && systemctl --user restart bakr.service`.
+
+bakr decides *which servers*; it never spells a `claude` flag. The translation
+from "this session must hear from yappr" into `--mcp-config` and
+`--dangerously-load-development-channels server:yappr` belongs to drovr
+(`buildProviderLaunchArgs`), so the provider's CLI contract lives in one place
+for every substrate that launches one. See `src/launch-config.ts`.
+
+Configuration reaches a session only through `launch()` — a fresh one or a
+fork. `claude respawn`, which is how the daemon ordinarily brings a recorded
+session back, carries no flags at all (BAKR-22), so an already-running session
+picks up a change here at its next fresh launch, not on the next reconcile.
+
 `scripts/install.sh` is a **bash** script (already executable in this repo,
 `chmod 755`) — `bun run scripts/install.sh` does NOT work: `bun run` hands a
 `.sh` file to Bun's own shell, not bash, and this script uses bash-only

@@ -46,6 +46,10 @@ function baseDeps(dir: string, runCommand: DaemonDeps["runCommand"]): DaemonDeps
       return new Uint8Array(n).fill(randomCounter & 0xff);
     },
     probeDeps: alwaysPresentProbeDeps,
+    // Pinned rather than inherited: the default reads this HOST's own
+    // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json` files, which would make
+    // what a reconcile launches depend on the machine running the test.
+    launchConfigDeps: { readMcpConfig: async () => undefined, notificationServers: [] },
   };
 }
 
@@ -272,6 +276,36 @@ describe("AC3: only 'on' is restored — off and archived are NEVER launched, wi
       // NEGATIVE CONTROL: the on-agent DID get launched — proves the run can observe a launch at all.
       expect(final.state.agents["@on-agent"]?.birthSessionId).toBeDefined();
     }
+  });
+});
+
+describe("a reconcile's own fresh launch carries the host's configured MCP subscriptions", () => {
+  test("an agent whose directory configures a requested server is launched subscribed to it", async () => {
+    const dir = await makeTempDir();
+    const key = "/claimed/dir" as ClaimKey;
+    await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
+    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@coordinator", directory: key, state: "on", restoreTarget: undefined })));
+
+    const fake = makeFakeClaude();
+    const seen: string[][] = [];
+    const result = await runReconcileCycle(initialDaemonState(), {
+      ...baseDeps(dir, async (argv, opts) => { seen.push(argv); return fake.runCommand(argv, opts); }),
+      launchConfigDeps: {
+        notificationServers: ["yappr"],
+        readMcpConfig: async (path) => path === `${key}/.mcp.json`
+          ? JSON.stringify({ mcpServers: { yappr: { type: "stdio", command: "bun" } } })
+          : undefined,
+      },
+    });
+    expect(result.restored).toHaveLength(1);
+
+    const systemdCall = seen.find((c) => c[0] === "systemd-run") as string[];
+    // FALSIFIER: the daemon is what keeps these sessions alive, so a launch it
+    // issues without the channel is the reported bug, not a lesser version of it.
+    expect(systemdCall.slice(systemdCall.indexOf("--") + 3)).toEqual([
+      "--mcp-config", `${key}/.mcp.json`,
+      "--dangerously-load-development-channels", "server:yappr",
+    ]);
   });
 });
 

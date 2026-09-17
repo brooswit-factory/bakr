@@ -17,6 +17,13 @@ Type=simple
 # unit's inherited PATH. Spelled out explicitly rather than assumed
 # inherited from a login shell, which a systemd user unit does not have.
 Environment=PATH=%h/.bun/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The MCP servers every session this daemon launches should hear from, as
+# development channels (see README, "Letting launched sessions hear from an
+# MCP server"). Deliberately absent rather than defaulted: which servers a
+# host subscribes its sessions to is that host's configuration, not this
+# repo's. A server named here still only applies to directories whose own
+# `.mcp.json` configures it. Uncomment and set to enable:
+# Environment=BAKR_MCP_NOTIFICATION_SERVERS=yappr
 # ExecStart is a TEMPLATE: scripts/install.sh substitutes both placeholders
 # with the real, resolved paths for the machine and clone it is installing
 # onto (BAKR-13, review of PR #10 defect 3) before ever copying this file to

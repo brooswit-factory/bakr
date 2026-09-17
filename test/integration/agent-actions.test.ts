@@ -95,6 +95,10 @@ function baseDeps(dir: string, runCommand: AgentActionDeps["runCommand"]): Agent
   return {
     agentsPath: join(dir, "agents.json"),
     runCommand,
+    // Pinned rather than inherited: the default reads this HOST's own
+    // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json` files, which would make
+    // every launch-argv assertion below depend on the machine running it.
+    launchConfigDeps: { readMcpConfig: async () => undefined, notificationServers: [] },
     now: () => 1_700_000_000_000,
     generateAttemptId: () => `attempt-${counter++}`,
     randomBytes: (n: number) => {
@@ -130,6 +134,44 @@ describe("create", () => {
     const dashIdx = systemdCall.indexOf("--");
     const claudeArgs = systemdCall.slice(dashIdx + 3); // after "--", "claude", "--bg"
     expect(claudeArgs).toEqual([]); // FALSIFIER: any extra argv element here is a B8 violation
+  });
+
+  test("a session whose directory configures a requested MCP server launches subscribed to it", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaude();
+    const result = await create({
+      ...baseDeps(dir, fake.runCommand),
+      launchConfigDeps: {
+        notificationServers: ["yappr"],
+        readMcpConfig: async (path) => path === `${KEY}/.mcp.json`
+          ? JSON.stringify({ mcpServers: { yappr: { type: "stdio", command: "bun" } } })
+          : undefined,
+      },
+    }, KEY);
+    expect(result.ok).toBe(true);
+
+    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
+    const claudeArgs = systemdCall.slice(systemdCall.indexOf("--") + 3);
+    // FALSIFIER: this is the whole point — MCP configured but never subscribed
+    // to is the bug. The flag spellings come from drovr, never from this repo.
+    expect(claudeArgs).toEqual([
+      "--mcp-config", `${KEY}/.mcp.json`,
+      "--dangerously-load-development-channels", "server:yappr",
+    ]);
+  });
+
+  test("a directory that does not configure the requested server still launches with no args", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaude();
+    await create({
+      ...baseDeps(dir, fake.runCommand),
+      launchConfigDeps: {
+        notificationServers: ["yappr"],
+        readMcpConfig: async () => JSON.stringify({ mcpServers: { atlassian: {} } }),
+      },
+    }, KEY);
+    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
+    expect(systemdCall.slice(systemdCall.indexOf("--") + 3)).toEqual([]);
   });
 
   test("with a name: the agent holds it", async () => {

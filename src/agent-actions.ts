@@ -92,7 +92,8 @@ import {
 } from "./agent-lifecycle";
 import { launch, listBackgroundSessions, decideLiveness, isPidAlive, respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal, stopSession, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
-import { realTranscriptProbeDeps } from "./paths";
+import { realTranscriptProbeDeps, realLaunchConfigDeps } from "./paths";
+import { claudeLaunchArgs, type LaunchConfigDeps } from "./launch-config";
 import type { ClaimKey } from "./claim-key-resolve";
 
 export interface AgentActionDeps {
@@ -104,7 +105,13 @@ export interface AgentActionDeps {
   readonly acquireTimeoutMs?: number;
   /** BAKR-22: read-only access to Claude Code's own `~/.claude/projects/` tree, for the never-spoken-to-then-moved check (`probeResumableTranscript`). Optional — defaults to the real filesystem (`realTranscriptProbeDeps`, paths.ts) — so every existing caller/test that never exercises the moved-directory escape needs no change. */
   readonly transcriptProbeDeps?: TranscriptProbeDeps;
+  /** Which MCP servers a launched session must hear from, and how to read a directory's own `.mcp.json` (launch-config.ts). Optional — defaults to the real filesystem and this host's own environment (`realLaunchConfigDeps`, paths.ts) — so every existing caller and test needs no change, and a host that configures nothing launches exactly as before. */
+  readonly launchConfigDeps?: LaunchConfigDeps;
 }
+
+/** Every `launch()` below carries this; `claude respawn` deliberately carries nothing (see launch-config.ts's module comment). */
+const configuredLaunchArgs = (deps: AgentActionDeps, directory: string): Promise<string[]> =>
+  claudeLaunchArgs(directory, deps.launchConfigDeps ?? realLaunchConfigDeps);
 
 function lockOpts(deps: AgentActionDeps): { acquireTimeoutMs?: number } {
   const opts: { acquireTimeoutMs?: number } = {};
@@ -218,7 +225,7 @@ export async function create(deps: AgentActionDeps, directory: ClaimKey, name?: 
   const result = decided.result;
   if (!result.ok) return result;
 
-  const launchResult = await launch(directory, [], { runCommand: deps.runCommand });
+  const launchResult = await launch(directory, await configuredLaunchArgs(deps, directory), { runCommand: deps.runCommand });
   await withAgentStoreLock(
     deps.agentsPath,
     (current) => ({
@@ -453,7 +460,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
   if (!result.ok) return result;
   if (result.launch.kind === "issue-fresh") {
     const { attemptId } = result.launch;
-    const launchResult = await launch(directory, [], { runCommand: deps.runCommand });
+    const launchResult = await launch(directory, await configuredLaunchArgs(deps, directory), { runCommand: deps.runCommand });
     await withAgentStoreLock(
       deps.agentsPath,
       (current) => ({
@@ -518,7 +525,10 @@ async function forkFromCurrentTarget(deps: AgentActionDeps, directory: ClaimKey,
   }
 
   const canForkFrom = probe.status === "has-transcript";
-  const forkResult = canForkFrom ? await launch(directory, ["--resume", restoreSessionId, "--fork-session"], { runCommand: deps.runCommand }) : await launch(directory, [], { runCommand: deps.runCommand });
+  const configured = await configuredLaunchArgs(deps, directory);
+  const forkResult = canForkFrom
+    ? await launch(directory, ["--resume", restoreSessionId, "--fork-session", ...configured], { runCommand: deps.runCommand })
+    : await launch(directory, configured, { runCommand: deps.runCommand });
   await withAgentStoreLock(
     deps.agentsPath,
     (current) => {
