@@ -172,7 +172,8 @@ describe("create", () => {
     // to is the bug. The flag spellings come from drovr, never from this repo.
     expect(claudeArgs).toEqual([
       "--mcp-config", `${KEY}/.mcp.json`,
-      "--dangerously-load-development-channels", "server:yappr",
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["yappr"] }),
+      "--dangerously-load-development-channels=server:yappr",
     ]);
   });
 
@@ -203,7 +204,8 @@ describe("create", () => {
     const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
     expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([
       "--mcp-config", `${KEY}/.mcp.json`,
-      "--dangerously-load-development-channels", "server:rocketr",
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["rocketr", "yappr"] }),
+      "--dangerously-load-development-channels=server:rocketr",
     ]);
     expect(approvalIn(settingsIo, KEY)).toEqual(["rocketr", "yappr"]);
     const stored = await loadAgents(join(dir, "agents.json"));

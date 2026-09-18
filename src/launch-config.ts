@@ -136,12 +136,19 @@ export async function resolveMcpAccess(directory: string, deps: LaunchConfigDeps
   };
 }
 
-/** The neutral launch inputs drovr turns into flags; `{}` when nothing is subscribed to. */
+/**
+ * The neutral launch inputs drovr turns into flags; `{}` when nothing is
+ * declared. Approval travels on the launch too (`mcpServersApproved`), not
+ * only in the workspace's `settings.local.json`: measured, Claude ignores that
+ * file in an untrusted directory, and a probe session there stopped at the
+ * approval prompt despite it.
+ */
 export function launchInputsFor(access: ResolvedMcpAccess): ProviderLaunchInputs {
   const subscribed = access.servers.filter((server) => server.notifications).map((server) => server.name);
   if (access.servers.length === 0) return {};
   return {
     mcpConfigPath: access.mcpConfigPath,
+    mcpServersApproved: access.servers.map((server) => server.name),
     ...(subscribed.length === 0 ? {} : { mcpNotificationServers: subscribed }),
   };
 }

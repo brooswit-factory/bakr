@@ -61,8 +61,12 @@ describe("an agent with no declaration of its own uses the host default", () => 
     }));
     expect(args).toEqual([
       "--mcp-config", "/home/op/code/brooswit/.mcp.json",
-      "--dangerously-load-development-channels", "server:yappr",
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["yappr"] }),
+      "--dangerously-load-development-channels=server:yappr",
     ]);
+    // FALSIFIER: a channel value standing alone in argv is what `claude --bg`
+    // took as the session's first prompt ("server:rocketr"), never registering it.
+    expect(args.filter((value) => value.startsWith("server:"))).toEqual([]);
     // FALSIFIER: without this the session sits `blocked` on an approval prompt.
     expect(approvalIn(io, "/home/op/code/brooswit")).toEqual(["yappr"]);
   });
@@ -132,14 +136,15 @@ describe("an agent's own declaration", () => {
     const args = await claudeLaunchArgs(DIR, deps({ notificationServers: ["yappr"], settingsIo: io, files }), declared);
     expect(args).toEqual([
       "--mcp-config", `${DIR}/.mcp.json`,
-      "--dangerously-load-development-channels", "server:rocketr",
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["rocketr", "yappr"] }),
+      "--dangerously-load-development-channels=server:rocketr",
     ]);
     expect(approvalIn(io, DIR)).toEqual(["rocketr", "yappr"]);
   });
 
   test("the directory's MCP config is still passed when nothing is subscribed to", async () => {
     const args = await claudeLaunchArgs(DIR, deps({ files }), [{ name: "yappr", notifications: false }]);
-    expect(args).toEqual(["--mcp-config", `${DIR}/.mcp.json`]);
+    expect(args).toEqual(["--mcp-config", `${DIR}/.mcp.json`, "--settings", JSON.stringify({ enabledMcpjsonServers: ["yappr"] })]);
   });
 
   test("an empty declaration is an agent with no MCP at all, not the host default", async () => {
@@ -166,7 +171,7 @@ describe("an agent's own declaration", () => {
     const io = memorySettings({ [path]: "{ not json" });
     const warnings: string[] = [];
     const args = await claudeLaunchArgs(DIR, deps({ settingsIo: io, files, warn: (m) => warnings.push(m) }), [{ name: "rocketr", notifications: true }]);
-    expect(args).toContain("server:rocketr");
+    expect(args).toContain("--dangerously-load-development-channels=server:rocketr");
     expect(io.files[path]).toBe("{ not json");
     expect(warnings.join("\n")).toContain("could not write MCP approval");
   });

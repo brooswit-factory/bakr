@@ -322,7 +322,8 @@ describe("a reconcile's own fresh launch carries the host's configured MCP subsc
     // issues without the channel is the reported bug, not a lesser version of it.
     expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([
       "--mcp-config", `${key}/.mcp.json`,
-      "--dangerously-load-development-channels", "server:yappr",
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["yappr"] }),
+      "--dangerously-load-development-channels=server:yappr",
     ]);
   });
 });
