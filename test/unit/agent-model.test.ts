@@ -1,11 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   AGENT_ID_BODY_LENGTH,
-  RESERVED_NAMES,
   type AgentRecord,
   agentsInDirectory,
   beginLaunch,
-  checkNameAvailability,
   emptyAgentStore,
   hasLaunchRecordFor,
   isIdTakenOrRetired,
@@ -24,7 +22,6 @@ import {
   restoreAttemptCount,
   serializeAgentStoreState,
   unresolvedLaunches,
-  validateNameSyntax,
   type AgentStoreState,
 } from "../../src/agent-model";
 import type { ClaimKey } from "../../src/claim-key-resolve";
@@ -121,80 +118,6 @@ describe("mintUniqueAgentId / isIdTakenOrRetired", () => {
   });
 });
 
-// --- Name syntax (B3, B5, AC5) ---------------------------------------------
-
-describe("validateNameSyntax", () => {
-  test("a plain, non-reserved name is valid — the control that must pass for the refusal tests below to mean anything", () => {
-    expect(validateNameSyntax("build")).toEqual({ ok: true });
-  });
-
-  test("empty is refused", () => {
-    const result = validateNameSyntax("");
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.reason).toBe("empty");
-  });
-
-  test('"@" is refused at every position, not just leading', () => {
-    for (const name of ["@build", "bu@ild", "build@", "@"]) {
-      const result = validateNameSyntax(name);
-      expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.reason).toBe("contains-at");
-    }
-  });
-
-  test("EVERY reserved word is refused", () => {
-    for (const word of RESERVED_NAMES) {
-      const result = validateNameSyntax(word);
-      expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.reason).toBe("reserved");
-    }
-  });
-
-  test("a reserved word is refused for an exact, case-sensitive match only — not a substring or different-case match (documents current behaviour precisely)", () => {
-    expect(validateNameSyntax("onward").ok).toBe(true);
-    expect(validateNameSyntax("ON").ok).toBe(true);
-  });
-
-  test("every refusal carries a non-empty, verbatim-showable message (B11)", () => {
-    for (const name of ["", "@x", "on"]) {
-      const result = validateNameSyntax(name);
-      expect(result.ok).toBe(false);
-      if (!result.ok) expect(result.message.length).toBeGreaterThan(0);
-    }
-  });
-});
-
-describe("checkNameAvailability (B4)", () => {
-  test("available when nobody in the directory holds the name", () => {
-    expect(checkNameAvailability(emptyAgentStore(), DIR_A, "build")).toEqual({ ok: true });
-  });
-
-  test("the SAME name in TWO DIRECTORIES is allowed — names are unique per directory, not globally", () => {
-    let state = emptyAgentStore();
-    state = putAgent(state, makeAgent({ id: "@agent-a", directory: DIR_A, name: "build" }));
-    expect(checkNameAvailability(state, DIR_A, "build").ok).toBe(false);
-    expect(checkNameAvailability(state, DIR_B, "build").ok).toBe(true); // different directory — no conflict
-  });
-
-  test("the same name TWICE in one directory is refused, WITH THE HOLDER ARCHIVED — archived agents keep their name", () => {
-    let state = emptyAgentStore();
-    state = putAgent(state, makeAgent({ id: "@agent-a", directory: DIR_A, name: "build", state: "archived" }));
-    const result = checkNameAvailability(state, DIR_A, "build");
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.heldBy.id).toBe("@agent-a");
-      expect(result.message).toMatch(/archived/);
-    }
-  });
-
-  test("excludingAgentId lets an agent's own current name pass as 'available' (for a future rename check)", () => {
-    let state = emptyAgentStore();
-    state = putAgent(state, makeAgent({ id: "@agent-a", directory: DIR_A, name: "build" }));
-    expect(checkNameAvailability(state, DIR_A, "build", "@agent-a").ok).toBe(true);
-    expect(checkNameAvailability(state, DIR_A, "build", "@some-other-agent").ok).toBe(false);
-  });
-});
-
 // --- Membership (B9, R-D) --------------------------------------------------
 
 describe("agentsInDirectory: membership is a derived query, never a stored second copy", () => {
@@ -215,48 +138,79 @@ describe("agentsInDirectory: membership is a derived query, never a stored secon
 
 // --- The resolver (B4, R-E, AC5) -------------------------------------------
 
-describe("resolveAgent (R-E)", () => {
-  test("cannot be called without a scope — TypeScript enforces this at compile time; there is no default and no overload with fewer arguments", () => {
-    // Never actually invoked (would throw at runtime with `ref` undefined) —
-    // the assertion under test is a COMPILE-time property. `tsc` still
-    // typechecks this function body whether or not it runs, so the
-    // `@ts-expect-error` below is load-bearing: delete it and
-    // `bun run typecheck` must then fail, proving resolveAgent still has no
-    // default/optional `scope` parameter.
-    function neverCalled(): void {
-      // @ts-expect-error - `scope` has no default; this line intentionally fails to compile if resolveAgent ever grows one.
-      resolveAgent(emptyAgentStore(), "ref");
-    }
-    void neverCalled;
-    expect(true).toBe(true);
-  });
-
-  test("an id resolves globally: found in-scope", () => {
-    let state = emptyAgentStore();
-    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A }));
-    expect(resolveAgent(state, DIR_A, "@a1")).toEqual({ outcome: "found", agent: state.agents["@a1"] as AgentRecord });
-  });
-
-  test("an id belonging to ANOTHER directory resolves as 'found-elsewhere', carrying that directory — never a false hit, never a bare miss", () => {
+describe("resolveAgent (BAKR-34/BAKR-42 R2/R4/R6/R8)", () => {
+  test("an id resolves globally — no directory/scope input exists to call this with", () => {
     let state = emptyAgentStore();
     state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_B }));
-    const result = resolveAgent(state, DIR_A, "@a1");
-    expect(result).toEqual({ outcome: "found-elsewhere", agent: state.agents["@a1"] as AgentRecord, directory: DIR_B });
+    expect(resolveAgent(state, { kind: "id", ref: "@a1" })).toEqual({ outcome: "found", agent: state.agents["@a1"] as AgentRecord });
   });
 
   test("an unknown id is not-found", () => {
-    expect(resolveAgent(emptyAgentStore(), DIR_A, "@does-not-exist")).toEqual({ outcome: "not-found" });
+    expect(resolveAgent(emptyAgentStore(), { kind: "id", ref: "@does-not-exist" })).toEqual({ outcome: "not-found" });
   });
 
-  test("a name resolves ONLY within scope — the same name in a different directory is not-found, never a cross-directory suggestion", () => {
+  test("a name resolves via the current derived name (agent-name.ts) — DIR_A's derived name is 'alice/project'", () => {
     let state = emptyAgentStore();
-    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_B, name: "build" }));
-    expect(resolveAgent(state, DIR_A, "build")).toEqual({ outcome: "not-found" });
-    expect(resolveAgent(state, DIR_B, "build")).toEqual({ outcome: "found", agent: state.agents["@a1"] as AgentRecord });
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A }));
+    expect(resolveAgent(state, { kind: "name", ref: "alice/project" })).toEqual({ outcome: "found", agent: state.agents["@a1"] as AgentRecord });
   });
 
-  test("an unknown name in-scope is not-found", () => {
-    expect(resolveAgent(emptyAgentStore(), DIR_A, "nope")).toEqual({ outcome: "not-found" });
+  test("an unknown name is not-found", () => {
+    expect(resolveAgent(emptyAgentStore(), { kind: "name", ref: "nope" })).toEqual({ outcome: "not-found" });
+  });
+
+  test("a directory ref (an already-resolved real path) resolves the one non-archived agent there", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A }));
+    expect(resolveAgent(state, { kind: "directory", directory: DIR_A })).toEqual({ outcome: "found", agent: state.agents["@a1"] as AgentRecord });
+  });
+
+  test("a directory ref with no agent there is not-found", () => {
+    expect(resolveAgent(emptyAgentStore(), { kind: "directory", directory: DIR_A })).toEqual({ outcome: "not-found" });
+  });
+
+  test("R6: two non-archived agents sharing a directory resolve AMBIGUOUS by name, naming both agents — a legacy store violating one-per-directory still loads and resolves, never bricks", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A }));
+    state = putAgent(state, makeAgent({ id: "@a2", directory: DIR_A }));
+    const byName = resolveAgent(state, { kind: "name", ref: "alice/project" });
+    expect(byName.outcome).toBe("ambiguous");
+    if (byName.outcome === "ambiguous") expect(byName.agents.map((a) => a.id).sort()).toEqual(["@a1", "@a2"]);
+    const byDirectory = resolveAgent(state, { kind: "directory", directory: DIR_A });
+    expect(byDirectory.outcome).toBe("ambiguous");
+  });
+
+  test("R6: an archived agent never blocks or joins the ambiguity — only non-archived agents count", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A, state: "on" }));
+    state = putAgent(state, makeAgent({ id: "@a2", directory: DIR_A, state: "archived" }));
+    expect(resolveAgent(state, { kind: "name", ref: "alice/project" })).toEqual({ outcome: "found", agent: state.agents["@a1"] as AgentRecord });
+  });
+
+  test("R8: a ref matching a stale legacy `name` (not an id, not a derived name) refuses with 'renamed', carrying the agent's CURRENT derived name", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A, name: "old-custom-name" }));
+    const result = resolveAgent(state, { kind: "name", ref: "old-custom-name" });
+    expect(result.outcome).toBe("renamed");
+    if (result.outcome === "renamed") {
+      expect(result.agent.id).toBe("@a1");
+      expect(result.derivedName).toBe("alice/project");
+    }
+  });
+
+  test("R8: the rename hint carries NO derivedName when the legacy holder's own directory is itself ambiguous — nothing to suggest", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A, name: "old-custom-name" }));
+    state = putAgent(state, makeAgent({ id: "@a2", directory: DIR_A }));
+    const result = resolveAgent(state, { kind: "name", ref: "old-custom-name" });
+    expect(result.outcome).toBe("renamed");
+    if (result.outcome === "renamed") expect(result.derivedName).toBeUndefined();
+  });
+
+  test("R8: an archived agent's legacy name is never hinted — an archived agent has no derived name to suggest", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A, name: "old-custom-name", state: "archived" }));
+    expect(resolveAgent(state, { kind: "name", ref: "old-custom-name" })).toEqual({ outcome: "not-found" });
   });
 });
 

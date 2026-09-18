@@ -90,7 +90,7 @@ describe("relaunch", () => {
     const worktree = `${KEY}/.claude/worktrees/first-slice`;
     const r = await relaunch(deps(dir, host, {
       resumeCwdDeps: { lastRecordedCwd: async (id) => id === OLD.sessionId ? worktree : undefined, isDirectory: async (p) => p === worktree },
-    }), KEY, "rocketr");
+    }), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(true);
     const created = host.calls.find((c) => c[0] === "herdr" && c[2] === "create")!;
     expect(created[created.indexOf("--cwd") + 1]).toBe(worktree);
@@ -103,7 +103,7 @@ describe("relaunch", () => {
     legacyOld(host);
     const d = deps(dir, host);
 
-    const r = await relaunch(d, KEY, "rocketr");
+    const r = await relaunch(d, { kind: "id", ref: "@rocketr" });
     if (!r.ok) throw new Error(`${r.reason}: ${r.message}`);
     expect(r.resumed).toBe(true);
     expect(r.previous).toEqual(OLD);
@@ -134,9 +134,9 @@ describe("relaunch", () => {
     const host = makeFakeHost();
     legacyOld(host);
 
-    const first = await relaunch(deps(dir, host), KEY, "rocketr");
+    const first = await relaunch(deps(dir, host), { kind: "id", ref: "@rocketr" });
     if (!first.ok) throw new Error(`${first.reason}: ${first.message}`);
-    const second = await relaunch(deps(dir, host), KEY, "rocketr");
+    const second = await relaunch(deps(dir, host), { kind: "id", ref: "@rocketr" });
     if (!second.ok) throw new Error(`${second.reason}: ${second.message}`);
 
     // FALSIFIER: a fork would have minted a new session id each time; the session id never changes, only the pane.
@@ -152,7 +152,7 @@ describe("relaunch", () => {
   test("an agent whose session was never prompted gets a fresh launch, reported as not resumed", async () => {
     const dir = await setup({});
     const host = makeFakeHost();
-    const r = await relaunch(deps(dir, host, { transcriptProbeDeps: transcripts(false) }), KEY, "rocketr");
+    const r = await relaunch(deps(dir, host, { transcriptProbeDeps: transcripts(false) }), { kind: "id", ref: "@rocketr" });
     if (!r.ok) throw new Error(r.message);
     expect(r.resumed).toBe(false);
     const args = host.starts()[0]!;
@@ -171,7 +171,7 @@ describe("relaunch", () => {
     const dir = await setup(agent);
     const host = makeFakeHost();
     const before = await stored(dir);
-    const r = await relaunch(deps(dir, host), KEY, "rocketr");
+    const r = await relaunch(deps(dir, host), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason as string).toBe(reason);
     expect(await stored(dir)).toEqual(before);
@@ -182,7 +182,7 @@ describe("relaunch", () => {
     const dir = await setup({});
     const host = makeFakeHost();
     host.addPane({ cwd: KEY, sessionId: OLD.sessionId });
-    const r = await relaunch(deps(dir, host), KEY, "rocketr", { selfSessionId: OLD.sessionId });
+    const r = await relaunch(deps(dir, host), { kind: "id", ref: "@rocketr" }, { selfSessionId: OLD.sessionId });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("self");
     expect(host.stops()).toEqual([]);
@@ -192,7 +192,7 @@ describe("relaunch", () => {
     const dir = await setup({});
     const host = makeFakeHost();
     host.addPane({ cwd: KEY, sessionId: OLD.sessionId, status: "working" });
-    const r = await relaunch(deps(dir, host), KEY, "rocketr");
+    const r = await relaunch(deps(dir, host), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("busy");
     expect(host.panes).toHaveLength(1);
@@ -210,7 +210,7 @@ describe("relaunch", () => {
     const dir = await setup({});
     const host = makeFakeHost();
     legacyOld(host, "working");
-    const r = await relaunch(deps(dir, host, { readTranscript: async (id) => id === OLD.sessionId ? closedTurn : undefined }), KEY, "rocketr");
+    const r = await relaunch(deps(dir, host, { readTranscript: async (id) => id === OLD.sessionId ? closedTurn : undefined }), { kind: "id", ref: "@rocketr" });
     // FALSIFIER: the old gate refused every working session as busy.
     if (!r.ok) throw new Error(`${r.reason}: ${r.message}`);
     expect(stopsAndStarts(host)).toEqual([`stop ${OLD.shortId}`, "start"]);
@@ -223,7 +223,7 @@ describe("relaunch", () => {
     const dir = await setup({});
     const host = makeFakeHost();
     legacyOld(host, "working");
-    const r = await relaunch(deps(dir, host, { readTranscript: async () => transcript }), KEY, "rocketr");
+    const r = await relaunch(deps(dir, host, { readTranscript: async () => transcript }), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("busy");
     expect(stopsAndStarts(host)).toEqual([]);
@@ -233,7 +233,7 @@ describe("relaunch", () => {
     const dir = await setup({});
     const host = makeFakeHost();
     host.addPane({ cwd: KEY, sessionId: OLD.sessionId, status: "working" });
-    const r = await relaunch(deps(dir, host, { readTranscript: async () => closedTurn }), KEY, "rocketr");
+    const r = await relaunch(deps(dir, host, { readTranscript: async () => closedTurn }), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("busy");
     expect(stopsAndStarts(host)).toEqual([]);
@@ -242,7 +242,7 @@ describe("relaunch", () => {
   test("refuses while another launch for the agent is in flight", async () => {
     const dir = await setup({}, (s) => beginLaunch(s, "@rocketr", KEY, undefined, "inflight", 1));
     const host = makeFakeHost();
-    const r = await relaunch(deps(dir, host), KEY, "rocketr");
+    const r = await relaunch(deps(dir, host), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("launch-in-flight");
     expect((await stored(dir)).agents["@rocketr"]!.state).toBe("on");
@@ -252,7 +252,7 @@ describe("relaunch", () => {
     const dir = await setup({});
     const host = makeFakeHost({ failStop: true });
     host.addPane({ cwd: KEY, sessionId: OLD.sessionId });
-    const r = await relaunch(deps(dir, host), KEY, "rocketr");
+    const r = await relaunch(deps(dir, host), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("stop-failed");
     const state = await stored(dir);
@@ -265,7 +265,7 @@ describe("relaunch", () => {
   test("a resume that fails leaves the agent off, its old target intact, no half-started pane, and says how to recover", async () => {
     const dir = await setup({});
     const host = makeFakeHost({ failStart: "launch refused" });
-    const r = await relaunch(deps(dir, host), KEY, "rocketr");
+    const r = await relaunch(deps(dir, host), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("launch-failed");
@@ -290,7 +290,7 @@ describe("relaunch", () => {
       if (isStop || isStart) seen.push((await stored(dir)).agents["@rocketr"]!.state);
       return host.runCommand(argv, o);
     } };
-    const r = await relaunch(deps(dir, watching), KEY, "rocketr");
+    const r = await relaunch(deps(dir, watching), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(true);
     expect(seen).toEqual(["off", "off"]);
     expect((await stored(dir)).agents["@rocketr"]!.state).toBe("on");
@@ -304,7 +304,7 @@ describe("delete of an agent whose launch never resolved a session", () => {
     const dir = await setup({ restoreTarget: undefined, birthSessionId: undefined, state: "archived" }, crashed("1635836c"));
     const host = makeFakeHost();
     host.ended.push({ id: "1635836c", sessionId: "1635836c-session", cwd: KEY, startedAt: 1, kind: "background", state: "failed" });
-    const r = await deleteAgent(deps(dir, host), KEY, "rocketr");
+    const r = await deleteAgent(deps(dir, host), { kind: "id", ref: "@rocketr" });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.kind).toBe("deleted");
@@ -318,7 +318,7 @@ describe("delete of an agent whose launch never resolved a session", () => {
     const dir = await setup({ restoreTarget: undefined, birthSessionId: undefined }, crashed("1635836c"));
     const host = makeFakeHost();
     host.legacy.push({ id: "1635836c", sessionId: "1635836c-session", cwd: KEY, startedAt: 1, kind: "background", pid: 5, state: "blocked" });
-    const r = await deleteAgent(deps(dir, host), KEY, "rocketr");
+    const r = await deleteAgent(deps(dir, host), { kind: "id", ref: "@rocketr" });
     expect(r.ok && r.kind).toBe("deleted");
     expect(host.calls.filter((c) => c[0] === "claude" && c[1] === "stop")).toEqual([["claude", "stop", "1635836c"]]);
   });
@@ -327,7 +327,7 @@ describe("delete of an agent whose launch never resolved a session", () => {
     const host = makeFakeHost();
     const pane = host.addPane({ cwd: KEY, sessionId: "crashed-session" });
     const dir = await setup({ restoreTarget: undefined, birthSessionId: undefined }, crashed(pane.paneId));
-    const r = await deleteAgent(deps(dir, host), KEY, "rocketr");
+    const r = await deleteAgent(deps(dir, host), { kind: "id", ref: "@rocketr" });
     expect(r.ok && r.kind).toBe("deleted");
     expect(host.stops()).toEqual([pane.workspaceId]);
     expect(host.panes).toEqual([]);
@@ -336,7 +336,7 @@ describe("delete of an agent whose launch never resolved a session", () => {
   test("a pane launch whose pane is gone has ended — herdr lists only live panes — so the agent is deleted, not parked forever", async () => {
     const dir = await setup({ restoreTarget: undefined, birthSessionId: undefined, state: "archived" }, crashed("w7:p1"));
     const host = makeFakeHost();
-    const r = await deleteAgent(deps(dir, host), KEY, "rocketr");
+    const r = await deleteAgent(deps(dir, host), { kind: "id", ref: "@rocketr" });
     expect(r.ok && r.kind).toBe("deleted");
     if (r.ok) expect(r.stop).toEqual({ kind: "launches-ended", shortIds: ["w7:p1"] });
     expect(host.stops()).toEqual([]);
@@ -344,20 +344,20 @@ describe("delete of an agent whose launch never resolved a session", () => {
 
   test("a legacy launch no listing accounts for still parks rather than guessing", async () => {
     const dir = await setup({ restoreTarget: undefined, birthSessionId: undefined }, crashed("1635836c"));
-    const r = await deleteAgent(deps(dir, makeFakeHost()), KEY, "rocketr");
+    const r = await deleteAgent(deps(dir, makeFakeHost()), { kind: "id", ref: "@rocketr" });
     expect(r.ok && r.kind).toBe("parked");
     expect((await stored(dir)).agents["@rocketr"]!.state).toBe("archived");
   });
 
   test("a launch in flight with no id yet still parks", async () => {
     const dir = await setup({ restoreTarget: undefined, birthSessionId: undefined }, (s) => beginLaunch(s, "@rocketr", KEY, undefined, "a1", 1));
-    const r = await deleteAgent(deps(dir, makeFakeHost()), KEY, "rocketr");
+    const r = await deleteAgent(deps(dir, makeFakeHost()), { kind: "id", ref: "@rocketr" });
     expect(r.ok && r.kind).toBe("parked");
   });
 
   test("an agent that never launched at all is deleted", async () => {
     const dir = await setup({ restoreTarget: undefined, birthSessionId: undefined });
-    const r = await deleteAgent(deps(dir, makeFakeHost()), KEY, "rocketr");
+    const r = await deleteAgent(deps(dir, makeFakeHost()), { kind: "id", ref: "@rocketr" });
     expect(r.ok && r.kind).toBe("deleted");
   });
 });
