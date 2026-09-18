@@ -23,6 +23,20 @@ export interface RunCommand {
 }
 
 /**
+ * The caller's environment without FORCE_COLOR. Everything run here is read
+ * back by a parser, and `claude` colours even piped output when FORCE_COLOR
+ * is set — which Claude Code sets in every session, so any `bakr` verb run
+ * from inside one inherited it. Only the override is dropped (colour then
+ * follows whether output is a terminal, which here it never is); NO_COLOR is
+ * deliberately not set, since a launched session could inherit it and lose
+ * colour in its own TUI.
+ */
+export function plainOutputEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const { FORCE_COLOR: _forced, ...rest } = env;
+  return rest;
+}
+
+/**
  * Runs `argv[0]` with `argv.slice(1)` as arguments. On timeout, SIGKILLs
  * `proc` — the invoked process itself (e.g. the `systemd-run` wrapper, or
  * `claude agents`/`claude stop`) — and rejects. This is NOT the mechanism
@@ -40,6 +54,7 @@ export async function runCommand(argv: string[], options: RunCommandOptions): Pr
 
   const proc = Bun.spawn([cmd, ...args], {
     ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
+    env: plainOutputEnv(process.env),
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
