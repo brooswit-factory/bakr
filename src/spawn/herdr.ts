@@ -25,6 +25,7 @@ const HERDR_TIMEOUT_MS = 15_000;
 const AGENT_START_TIMEOUT_MS = 60_000;
 const READY_TIMEOUT_MS = 90_000;
 const READY_POLL_MS = 1_000;
+const READY_CONFIRM_POLLS = 3;
 const SHELL_READY_TIMEOUT_MS = 15_000;
 
 /** The label every bakr-hosted workspace carries, so a listing can tell bakr's panes from anyone else's. */
@@ -192,17 +193,29 @@ export async function herdrLaunch(dir: string, claudeArgs: readonly string[], la
   }
   if (!started.ok && started.code !== "agent_not_ready") return abandon(`claude did not start in pane ${paneId}: ${started.message}`);
 
+  // The screen is read before herdr's status is trusted: measured 2026-09-18 (lead-dynamic-atmosphere),
+  // herdr called a resumed pane ready and idle before claude drew the development-channels warning,
+  // with no session known yet, and the launch was reported up while the pane sat on the dialog.
+  // Ready therefore also needs herdr to know the session, or — for a session herdr cannot name —
+  // a clean screen on READY_CONFIRM_POLLS polls in a row.
   const readyBy = now() + READY_TIMEOUT_MS;
+  let cleanPolls = 0;
   for (;;) {
-    const got = await herdr(deps, ["herdr", "agent", "get", paneId]);
-    const agent = got.ok ? got.result["agent"] as HerdrAgent | undefined : undefined;
-    if (agent?.interactive_ready && (agent.agent_status === "idle" || agent.agent_status === "done")) {
-      const listed = agent.agent_session?.value;
-      return { ok: true, id: paneId, sessionId: typeof listed === "string" ? listed : sessionId };
-    }
     const prompt = classifyStartupPrompt(await readScreen(deps, paneId));
     if (prompt?.kind === "unknown-blocking") return abandon(`claude in pane ${paneId} is blocked on a prompt bakr does not answer:\n${prompt.excerpt}`);
-    if (prompt !== undefined) await herdr(deps, ["herdr", "agent", "send-keys", paneId, ...prompt.keys]);
+    if (prompt !== undefined) {
+      cleanPolls = 0;
+      await herdr(deps, ["herdr", "agent", "send-keys", paneId, ...prompt.keys]);
+    } else {
+      const got = await herdr(deps, ["herdr", "agent", "get", paneId]);
+      const agent = got.ok ? got.result["agent"] as HerdrAgent | undefined : undefined;
+      const ready = agent?.interactive_ready === true && (agent.agent_status === "idle" || agent.agent_status === "done");
+      cleanPolls = ready ? cleanPolls + 1 : 0;
+      const listed = agent?.agent_session?.value;
+      if (ready && (typeof listed === "string" || cleanPolls >= READY_CONFIRM_POLLS)) {
+        return { ok: true, id: paneId, sessionId: typeof listed === "string" ? listed : sessionId };
+      }
+    }
     if (now() >= readyBy) return abandon(`claude in pane ${paneId} never reached its idle input box`);
     await sleep(READY_POLL_MS);
   }
