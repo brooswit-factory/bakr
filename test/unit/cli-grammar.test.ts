@@ -28,7 +28,7 @@ describe("bakr CLI grammar", () => {
     [["x","name"],"requires"], [["x","send"],"exactly one message"], [["x","send","a","b"],"quote it"], [["--help","list"],"used alone"],
   ] as const)("usage edge %#", (argv,message) => { const r=parseArgv([...argv]); if(message===undefined){expect(r).toEqual({ok:true,command:{kind:"attach",ref:"help"}});}else{expect(r.ok).toBe(false);if(!r.ok)expect(r.message).toContain(message);} });
   test("MCP declarations: --mcp on create, and the mcp verb", () => {
-    expect(ok(["create","--mcp","yappr+notify","--mcp","rocketr"])).toEqual({kind:"create",mcp:["yappr+notify","rocketr"]});
+    expect(ok(["create","--mcp","yappr:no-notify","--mcp","rocketr"])).toEqual({kind:"create",mcp:["yappr:no-notify","rocketr"]});
     expect(ok(["create","--name","rocketr","--mcp","rocketr+notify"])).toEqual({kind:"create",name:"rocketr",mcp:["rocketr+notify"]});
     expect(ok(["alice","mcp"])).toEqual({kind:"mcp",ref:"alice"});
     expect(ok(["alice","mcp","yappr+notify","rocketr"])).toEqual({kind:"mcp",ref:"alice",specs:["yappr+notify","rocketr"]});
@@ -44,6 +44,22 @@ describe("bakr CLI grammar", () => {
       if (!r.ok) expect(r.message).toContain(message);
     }
   });
+  test("relaunch: one agent, or every agent on this host", () => {
+    expect(ok(["rocketr","relaunch"])).toEqual({kind:"relaunch",ref:"rocketr"});
+    expect(ok(["relaunch","--all"])).toEqual({kind:"relaunch-all"});
+    for (const [argv, message] of [
+      [["relaunch"], "takes only --all"],
+      [["relaunch","rocketr"], "takes only --all"],
+      [["rocketr","relaunch","now"], "takes no further arguments"],
+      [["rocketr","on","--all"], "--all is not valid"],
+      [["list","--all"], "--all is not valid"],
+    ] as const) {
+      const r = parseArgv([...argv]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain(message);
+    }
+  });
+
   test("C3: every top-level dispatch word is reserved by the model", () => {
     for (const word of TOP_LEVEL_WORDS) expect(RESERVED_NAMES).toContain(word);
   });

@@ -36,9 +36,11 @@ export interface CliDeps {
   prompt(s: string): Promise<string>;
   spawnAttach(id: string): Promise<number>;
   messenger: ResidentMessenger;
+  /** The Claude session running this command, if any (CLAUDE_CODE_SESSION_ID): `relaunch` never kills its own caller. */
+  selfSessionId?: string;
 }
 
-const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[+notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> mcp [<server>[+notify] ... | default]\n`;
+const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|name> relaunch\n  bakr relaunch --all\n`;
 
 /** Parses every spec, or returns the first refusal; duplicates keep their last spelling. */
 function parseMcpSpecs(specs: readonly string[]): McpServerDeclaration[] | string {
@@ -64,6 +66,15 @@ function availability(agent: AgentRecord, sessions: readonly BackgroundSessionIn
   return r.reason === "not-running" ? "not listed" : `listed by claude, not sendable (${r.reason})`;
 }
 
+/** Prints one relaunch outcome; true when the agent now runs a new session. */
+function renderRelaunch(r: actions.RelaunchResult, d: CliDeps): boolean {
+  if (!r.ok) { d.stderr(`${r.reason}: ${r.message}\n`); return false; }
+  const channels = r.args.filter((arg) => arg.startsWith("--dangerously-load-development-channels=")).map((arg) => arg.slice(arg.indexOf("=") + 1));
+  d.stdout(`relaunched ${label(r.agent)}: ${r.previous.shortId} -> ${r.next.shortId} (session ${r.next.sessionId}), ${r.forked ? "forked with its conversation" : "fresh (the old session had no transcript)"}\n`);
+  d.stdout(`channels: ${channels.length ? channels.join(" ") : "none"}\n`);
+  return true;
+}
+
 function refuse(result: { reason: string; message: string }, d: CliDeps): number {
   d.stderr(`${result.reason}: ${result.message}\n`);
   return refusalCode(result.reason);
@@ -73,6 +84,7 @@ function renderStop(stop: actions.StopOutcome, d: CliDeps): boolean {
     d.stderr(`${stop.kind}: ${stop.error}\n`); return false;
   }
   if (stop.kind === "stopped") d.stdout(`stopped claude session ${stop.shortId}\n`);
+  else if (stop.kind === "launches-ended") d.stdout(stop.shortIds.length ? `its launches had already ended: ${stop.shortIds.join(" ")}\n` : "it never started a session\n");
   else d.stdout(`${stop.kind.replaceAll("-", " ")}\n`);
   return true;
 }
@@ -196,12 +208,31 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
     if (typeof declaration === "string") { d.stderr(`bakr: usage error: ${declaration}\n`); return EXIT_USAGE; }
     const r = await actions.mcp(d.actions, directory, command.ref, declaration); if (!r.ok) return refuse(r, d);
     const own = r.agent.mcp;
-    d.stdout(own === undefined ? `${label(r.agent)} mcp: host default (${describeMcp(r.hostDefault)})\n` : `${label(r.agent)} mcp: ${describeMcp(own)}\n`);
+    d.stdout(`${label(r.agent)} mcp: ${own === undefined ? "default (every server in its .mcp.json)" : describeMcp(own)}\n`);
+    d.stdout(`next start carries: ${describeMcp(r.effective)}\n`);
+    if (r.missing.length > 0) d.stderr(`not configured in its .mcp.json, so dropped: ${r.missing.join(" ")}\n`);
     if (r.changed) {
       d.stdout("approval written; a running session picks it up at its next start.\n");
-      d.stdout("a changed +notify reaches a running session only through a fresh launch: claude respawn reuses the channels the session was first launched with.\n");
+      d.stdout(`a changed subscription reaches a running session only through a fork: run "bakr ${r.agent.name ?? r.agent.id} relaunch" (off/on respawns it with the channels it was first launched with).\n`);
     }
     return 0;
+  }
+  if (command.kind === "relaunch") {
+    const r = await actions.relaunch(d.actions, directory, command.ref, d.selfSessionId === undefined ? {} : { selfSessionId: d.selfSessionId });
+    return renderRelaunch(r, d) ? 0 : r.ok === false && (r.reason === "launch-failed" || r.reason === "unlisted") ? EXIT_FAILURE : refusalCode(r.ok ? "" : r.reason);
+  }
+  if (command.kind === "relaunch-all") {
+    const agents = await actions.relaunchCandidates(d.actions);
+    if (!Array.isArray(agents)) return refuse(agents as { reason: string; message: string }, d);
+    let failed = 0;
+    for (const agent of agents as readonly AgentRecord[]) {
+      d.stdout(`${label(agent)} in ${agent.directory}:\n`);
+      const r = await actions.relaunch(d.actions, agent.directory, agent.id, d.selfSessionId === undefined ? {} : { selfSessionId: d.selfSessionId });
+      const skipped = !r.ok && (r.reason === "self" || r.reason === "busy");
+      if (!renderRelaunch(r, d) && !skipped) failed += 1;
+    }
+    d.stdout(`relaunched ${agents.length - failed} of ${agents.length} candidate agent(s)${failed ? `; ${failed} failed` : ""}\n`);
+    return failed ? EXIT_FAILURE : 0;
   }
   if (command.kind === "rename") { const r=await actions.rename(d.actions,directory,command.ref,command.newName);if(!r.ok)return refuse(r,d);d.stdout(`renamed ${label(r.agent)}\n`);return 0; }
   if (command.kind === "on") {

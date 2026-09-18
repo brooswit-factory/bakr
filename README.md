@@ -100,47 +100,55 @@ systemctl --user start bakr.service
 journalctl --user -u bakr.service   # NOT the system-level journalctl — see below
 ```
 
-### Which MCP servers an agent gets
+### Which MCP servers an agent gets, and hears from
 
-An agent's MCP access used to be spread over three places, and each gap
-failed silently in its own way: `.mcp.json` defines a server, but without
-Claude's `enabledMcpjsonServers` approval a fresh session sits `blocked` on an
-approval prompt nobody can answer, and without the server's development
-channel at launch it never hears a notification. bakr now owns one
-declaration per agent, stored in its own agent store, and drovr renders it
-for the vendor: the approval is written before every start (respawns
-included), and the channel flags go on every fresh launch or fork.
+Channels are on. Every MCP server an agent has is approved for it and
+subscribed to: its session is launched with each server's development
+channel, so a server can push messages (a yappr message, a Rocket.Chat DM)
+straight into the conversation. No opt-in is needed.
 
-```
-bakr create --name rocketr --mcp rocketr+notify --mcp yappr
-bakr rocketr mcp                         # show it
-bakr rocketr mcp rocketr+notify yappr    # replace it (writes the approval now)
-bakr rocketr mcp default                 # back to the host default
-```
-
-`<server>` allows the agent to use a server; `<server>+notify` also launches
-it subscribed to that server's notifications. The servers themselves are
-still defined in the directory's `.mcp.json`; a declared server it does not
-configure is dropped from the start and reported.
-
-An agent with no declaration uses the host default, each server allowed and
-subscribed to:
+An agent with no declaration of its own has every server its directory's
+`.mcp.json` configures. A declaration narrows that, or opts one server out
+of notifications:
 
 ```
-BAKR_MCP_NOTIFICATION_SERVERS=yappr      # commas or spaces separate several
+bakr create --name rocketr --mcp rocketr --mcp yappr
+bakr rocketr mcp                           # show it, and what the next start carries
+bakr rocketr mcp rocketr yappr:no-notify   # replace it (writes the approval now)
+bakr rocketr mcp default                   # back to every server in .mcp.json
 ```
 
-Set it with an `Environment=` line in `systemd/bakr.service` before
-`./scripts/install.sh`, then
-`systemctl --user daemon-reload && systemctl --user restart bakr.service`. It
-is read from each process's own environment — the unit's for the daemon, the
-caller's shell for the CLI — so an agent that must get the same access
-whichever of them starts it should declare its own.
+The servers themselves are still defined in the directory's `.mcp.json`; a
+declared server it does not configure is dropped from the start and
+reported. `BAKR_MCP_NOTIFICATION_SERVERS` is no longer read (the daemon warns
+if it is still set).
 
-When a change reaches a running session: the approval, at its next start. A
-changed `+notify`, only at a fresh launch: `claude respawn` takes no flags
-from bakr (BAKR-22) and reuses the channels the session was first launched
-with.
+bakr writes the approval (Claude's `enabledMcpjsonServers`, and the same on
+the launch as `--settings`) before every start, respawns included, so a
+fresh session never sits `blocked` on an approval prompt nobody can answer.
+
+### Relaunching an agent to pick up its channels
+
+A running session keeps the flags it was launched with: `bakr <agent> off`
+then `on` respawns the same session, channels and all, as they were. To
+carry changed channels into a running agent without losing its
+conversation:
+
+```
+bakr rocketr relaunch      # one agent
+bakr relaunch --all        # every `on` agent on this host
+```
+
+`relaunch` stops the session and forks it (`--resume <session>
+--fork-session`) with the current channel flags; the fork becomes the
+agent's restore target. It refuses, changing nothing, an agent that is off,
+has no session yet, is mid-turn, or is the session running the command. If
+the fork does not come up, the agent is left `off` and the output says how
+to bring the old session back (`bakr <agent> on`).
+
+`delete` of an agent whose launch crashed before it ever held a session
+(claude lists that launch as failed) now deletes it, instead of parking it
+as archived with "nothing to stop".
 
 bakr decides *which servers*; it never spells a vendor flag or settings key.
 drovr's `applyMcpAccess` and `buildProviderLaunchArgs` do, so the provider

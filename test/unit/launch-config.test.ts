@@ -6,7 +6,6 @@ import {
   mcpConfigPathFor,
   parseMcpServerNames,
   parseMcpSpec,
-  parseNotificationServers,
   provisionMcpFor,
   resolveMcpAccess,
   type LaunchConfigDeps,
@@ -41,7 +40,6 @@ function deps(overrides: Partial<LaunchConfigDeps> & { files?: Record<string, st
   const files = overrides.files ?? {};
   return {
     readConfigFile: overrides.readConfigFile ?? (async (path: string) => files[path]),
-    notificationServers: overrides.notificationServers ?? ["yappr"],
     settingsIo: overrides.settingsIo ?? memorySettings(),
     ...(overrides.warn === undefined ? {} : { warn: overrides.warn }),
   };
@@ -52,8 +50,8 @@ const approvalIn = (io: { files: Record<string, string> }, dir: string): unknown
   return raw === undefined ? undefined : (JSON.parse(raw) as { enabledMcpjsonServers?: unknown }).enabledMcpjsonServers;
 };
 
-describe("an agent with no declaration of its own uses the host default", () => {
-  test("a coordinator whose .mcp.json configures yappr launches subscribed to it, and approved for it", async () => {
+describe("an agent with no declaration of its own: channels on for every server its .mcp.json configures", () => {
+  test("every server is approved and subscribed, with no opt-in", async () => {
     const io = memorySettings();
     const args = await claudeLaunchArgs("/home/op/code/brooswit", deps({
       settingsIo: io,
@@ -61,39 +59,35 @@ describe("an agent with no declaration of its own uses the host default", () => 
     }));
     expect(args).toEqual([
       "--mcp-config", "/home/op/code/brooswit/.mcp.json",
-      "--settings", JSON.stringify({ enabledMcpjsonServers: ["yappr"] }),
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["atlassian", "yappr"] }),
+      "--dangerously-load-development-channels=server:atlassian",
       "--dangerously-load-development-channels=server:yappr",
     ]);
     // FALSIFIER: a channel value standing alone in argv is what `claude --bg`
     // took as the session's first prompt ("server:rocketr"), never registering it.
     expect(args.filter((value) => value.startsWith("server:"))).toEqual([]);
     // FALSIFIER: without this the session sits `blocked` on an approval prompt.
-    expect(approvalIn(io, "/home/op/code/brooswit")).toEqual(["yappr"]);
+    expect(approvalIn(io, "/home/op/code/brooswit")).toEqual(["atlassian", "yappr"]);
   });
 
-  test("a host default server the directory never mentions leaves the launch untouched, and is reported", async () => {
+  test("BAKR_MCP_NOTIFICATION_SERVERS no longer narrows it", async () => {
+    const previous = process.env["BAKR_MCP_NOTIFICATION_SERVERS"];
+    process.env["BAKR_MCP_NOTIFICATION_SERVERS"] = "yappr";
+    try {
+      const args = await claudeLaunchArgs("/home/op/code/brooswit", deps({ files: { "/home/op/code/brooswit/.mcp.json": MINECRAFT_MCP } }));
+      expect(args).toContain("--dangerously-load-development-channels=server:atlassian");
+    } finally {
+      if (previous === undefined) delete process.env["BAKR_MCP_NOTIFICATION_SERVERS"]; else process.env["BAKR_MCP_NOTIFICATION_SERVERS"] = previous;
+    }
+  });
+
+  test("a directory with no MCP servers launches with no flags and writes nothing", async () => {
     const io = memorySettings();
-    const warnings: string[] = [];
     const args = await claudeLaunchArgs("/home/op/code/other", deps({
       settingsIo: io,
-      warn: (m) => warnings.push(m),
-      files: { "/home/op/code/other/.mcp.json": JSON.stringify({ mcpServers: { atlassian: {} } }) },
+      files: { "/home/op/code/other/.mcp.json": JSON.stringify({ mcpServers: {} }) },
     }));
     expect(args).toEqual([]);
-    expect(io.files).toEqual({});
-    expect(warnings.join("\n")).toContain("yappr");
-  });
-
-  test("a host that configures nothing launches exactly as it did before, and reads and writes nothing", async () => {
-    const read: string[] = [];
-    const io = memorySettings();
-    const args = await claudeLaunchArgs("/home/op/code/brooswit", deps({
-      notificationServers: [],
-      settingsIo: io,
-      readConfigFile: async (path) => { read.push(path); return MINECRAFT_MCP; },
-    }));
-    expect(args).toEqual([]);
-    expect(read).toEqual([]);
     expect(io.files).toEqual({});
   });
 
@@ -112,28 +106,16 @@ describe("an agent with no declaration of its own uses the host default", () => 
   test("the MCP configuration read is the one the session itself would read", () => {
     expect(mcpConfigPathFor("/home/op/code/brooswit")).toBe("/home/op/code/brooswit/.mcp.json");
   });
-
-  test.each([
-    [undefined, []],
-    ["", []],
-    ["   ", []],
-    ["yappr", ["yappr"]],
-    ["yappr,other", ["yappr", "other"]],
-    ["yappr other", ["yappr", "other"]],
-    ["yappr, other ", ["yappr", "other"]],
-  ])("a configured host list of %p reads as %p", (raw, expected) => {
-    expect(parseNotificationServers(raw as string | undefined)).toEqual(expected as string[]);
-  });
 });
 
 describe("an agent's own declaration", () => {
   const DIR = "/home/op/code/rocketr";
   const files = { [`${DIR}/.mcp.json`]: ROCKETR_MCP };
 
-  test("replaces the host default: its servers are approved, and only +notify ones subscribed", async () => {
+  test("its servers are approved, and all but an opted-out one subscribed", async () => {
     const io = memorySettings();
     const declared: McpServerDeclaration[] = [{ name: "rocketr", notifications: true }, { name: "yappr", notifications: false }];
-    const args = await claudeLaunchArgs(DIR, deps({ notificationServers: ["yappr"], settingsIo: io, files }), declared);
+    const args = await claudeLaunchArgs(DIR, deps({ settingsIo: io, files }), declared);
     expect(args).toEqual([
       "--mcp-config", `${DIR}/.mcp.json`,
       "--settings", JSON.stringify({ enabledMcpjsonServers: ["rocketr", "yappr"] }),
@@ -147,9 +129,9 @@ describe("an agent's own declaration", () => {
     expect(args).toEqual(["--mcp-config", `${DIR}/.mcp.json`, "--settings", JSON.stringify({ enabledMcpjsonServers: ["yappr"] })]);
   });
 
-  test("an empty declaration is an agent with no MCP at all, not the host default", async () => {
+  test("an empty declaration is an agent with no MCP at all, not the default", async () => {
     const io = memorySettings();
-    expect(await claudeLaunchArgs(DIR, deps({ notificationServers: ["yappr"], settingsIo: io, files }), [])).toEqual([]);
+    expect(await claudeLaunchArgs(DIR, deps({ settingsIo: io, files }), [])).toEqual([]);
     expect(io.files).toEqual({});
   });
 
@@ -185,15 +167,20 @@ describe("an agent's own declaration", () => {
 
 describe("server specs on the command line", () => {
   test.each([
-    ["yappr", { name: "yappr", notifications: false }],
-    ["yappr+notify", { name: "yappr", notifications: true }],
-    ["my_server-2+notify", { name: "my_server-2", notifications: true }],
-  ])("%p parses", (spec, expected) => {
+    ["yappr", { name: "yappr", notifications: true }],
+    ["yappr:no-notify", { name: "yappr", notifications: false }],
+    ["my_server-2:no-notify", { name: "my_server-2", notifications: false }],
+    ["notify-bridge", { name: "notify-bridge", notifications: true }],
+  ])("%p parses, and prints back the same", (spec, expected) => {
     expect(parseMcpSpec(spec)).toEqual(expected);
     expect(formatMcpSpec(expected)).toBe(spec);
   });
 
-  test.each(["", "+notify", "yappr+other", "a/b", "yappr notify", "../x"])("%p is refused", (spec) => {
+  test("the older +notify spelling still parses, as the default it now is", () => {
+    expect(parseMcpSpec("yappr+notify")).toEqual({ name: "yappr", notifications: true });
+  });
+
+  test.each(["", "+notify", ":no-notify", "yappr+other", "a/b", "yappr notify", "../x", "yappr:quiet"])("%p is refused", (spec) => {
     expect(typeof parseMcpSpec(spec)).toBe("string");
   });
 });

@@ -14,11 +14,12 @@
 // the approval and the subscription together, read by the CLI and the daemon
 // alike — so it no longer matters which of them starts the session.
 //
-// An agent with no declaration of its own uses this host's default:
-// `BAKR_MCP_NOTIFICATION_SERVERS`, each server allowed and subscribed to.
-// Either way the result is intersected with the directory's `.mcp.json`: a
-// server the session does not itself configure is neither approved nor
-// subscribed to, and is reported instead of failing silently.
+// Channels are on by default: every server an agent has is subscribed to,
+// unless its declaration opts that one server out (`<server>:no-notify`). An
+// agent with no declaration of its own has every server its directory's
+// `.mcp.json` configures. Either way the result is intersected with that
+// `.mcp.json`: a server the session does not itself configure is neither
+// approved nor subscribed to, and is reported instead of failing silently.
 //
 // Approval is re-applied before EVERY start, respawns included, because Claude
 // reads it at process start. Launch flags go only to a fresh launch or a fork:
@@ -39,19 +40,13 @@ import { join } from "node:path";
 /** One server an agent may use, as bakr stores it. */
 export interface McpServerDeclaration {
   readonly name: string;
-  /** Whether the agent must be launched subscribed to this server's notifications. */
+  /** Whether the agent is launched subscribed to this server's notifications — true unless opted out. */
   readonly notifications: boolean;
 }
 
 export interface LaunchConfigDeps {
   /** Reads a directory's `.mcp.json`, or resolves `undefined` when it is absent or unreadable — never throws. */
   readonly readConfigFile: (path: string) => Promise<string | undefined>;
-  /**
-   * This host's default declaration, for an agent that has none of its own:
-   * each server named here is allowed and subscribed to (see
-   * `notificationServersFromEnv`).
-   */
-  readonly notificationServers: readonly string[];
   /** Where the vendor's approval settings are read and written. Defaults to the real filesystem. */
   readonly settingsIo?: McpSettingsIo;
   /** Where a problem that must not fail the start is reported. Defaults to nowhere. */
@@ -80,36 +75,27 @@ export function parseMcpServerNames(contents: string | undefined): string[] {
   return Object.keys(servers as Record<string, unknown>);
 }
 
-/**
- * Splits a configured list on commas and whitespace, dropping empties — so
- * `"yappr"`, `"yappr,other"` and `"yappr other"` all mean the same thing, and
- * an unset or blank value means "configure nothing".
- */
-export function parseNotificationServers(raw: string | undefined): string[] {
-  if (raw === undefined) return [];
-  return raw.split(/[\s,]+/).filter((value) => value.length > 0);
-}
-
 const SERVER_NAME = /^[A-Za-z0-9_-]+$/;
 
+const OPT_OUT = ":no-notify";
+
 /**
- * One command-line server spec: `yappr` (allowed) or `yappr+notify` (allowed
- * and subscribed to). Returns an error message for anything else, so the CLI
- * can refuse it before anything is stored.
+ * One command-line server spec: `yappr` (allowed and subscribed to — channels
+ * are on by default) or `yappr:no-notify` (allowed, not subscribed). The
+ * older `yappr+notify` still parses, as the default it now is. `:` cannot
+ * occur in a server name, so no name is ever mistaken for an opt-out. Returns
+ * an error message for anything else, so the CLI refuses it before anything
+ * is stored.
  */
 export function parseMcpSpec(spec: string): McpServerDeclaration | string {
-  const notify = spec.endsWith("+notify");
-  const name = notify ? spec.slice(0, -"+notify".length) : spec;
-  if (!SERVER_NAME.test(name)) return `"${spec}" is not a server spec: expected <server> or <server>+notify, with a server name of letters, digits, "-" or "_"`;
-  return { name, notifications: notify };
+  const quiet = spec.endsWith(OPT_OUT);
+  const name = quiet ? spec.slice(0, -OPT_OUT.length) : spec.endsWith("+notify") ? spec.slice(0, -"+notify".length) : spec;
+  if (!SERVER_NAME.test(name)) return `"${spec}" is not a server spec: expected <server> or <server>${OPT_OUT}, with a server name of letters, digits, "-" or "_"`;
+  return { name, notifications: !quiet };
 }
 
 /** A declaration as the CLI prints it and accepts it back. */
-export const formatMcpSpec = (server: McpServerDeclaration): string => server.notifications ? `${server.name}+notify` : server.name;
-
-/** The host default, as a declaration: each server allowed and subscribed to. */
-export const hostDefaultDeclaration = (deps: LaunchConfigDeps): readonly McpServerDeclaration[] =>
-  deps.notificationServers.map((name) => ({ name, notifications: true }));
+export const formatMcpSpec = (server: McpServerDeclaration): string => server.notifications ? server.name : `${server.name}${OPT_OUT}`;
 
 export interface ResolvedMcpAccess {
   /** The declared servers the directory's `.mcp.json` actually configures. */
@@ -120,15 +106,17 @@ export interface ResolvedMcpAccess {
 }
 
 /**
- * The access one start carries: the agent's own declaration, or this host's
- * default when it has none, kept to the servers the directory's `.mcp.json`
- * configures. Reads nothing when nothing is declared.
+ * The access one start carries: the agent's own declaration, or — when it has
+ * none — every server the directory's `.mcp.json` configures, each subscribed
+ * to; kept to the servers that `.mcp.json` configures. An empty declaration
+ * is an agent with no MCP at all, and reads nothing.
  */
 export async function resolveMcpAccess(directory: string, deps: LaunchConfigDeps, declared?: readonly McpServerDeclaration[]): Promise<ResolvedMcpAccess> {
   const mcpConfigPath = mcpConfigPathFor(directory);
-  const wanted = declared ?? hostDefaultDeclaration(deps);
-  if (wanted.length === 0) return { servers: [], missing: [], mcpConfigPath };
-  const configured = new Set(parseMcpServerNames(await deps.readConfigFile(mcpConfigPath)));
+  if (declared !== undefined && declared.length === 0) return { servers: [], missing: [], mcpConfigPath };
+  const configuredNames = parseMcpServerNames(await deps.readConfigFile(mcpConfigPath));
+  const wanted = declared ?? configuredNames.map((name) => ({ name, notifications: true }));
+  const configured = new Set(configuredNames);
   return {
     servers: wanted.filter((server) => configured.has(server.name)),
     missing: wanted.filter((server) => !configured.has(server.name)).map((server) => server.name),

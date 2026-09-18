@@ -2,7 +2,7 @@
 // at 13a520aa90464ec1b79ba2324864c074b0f51a3c. Bakr deliberately diverges:
 // bare invocation discovers instead of creating, verbs come second, adopt
 // is top-level, and agents have no --job option.
-export const TOP_LEVEL_WORDS = ["list", "create", "adopt"] as const;
+export const TOP_LEVEL_WORDS = ["list", "create", "adopt", "relaunch"] as const;
 
 export type ParsedCommand =
   | { kind: "discover" }
@@ -14,17 +14,19 @@ export type ParsedCommand =
   | { kind: "delete"; ref: string; yes: boolean }
   | { kind: "rename"; ref: string; newName: string }
   | { kind: "send"; ref: string; message: string }
-  /** `specs` omitted shows the declaration; `["default"]` returns it to the host default; otherwise it replaces it. */
+  /** `specs` omitted shows the declaration; `["default"]` returns it to the default (every server in its .mcp.json); otherwise it replaces it. */
   | { kind: "mcp"; ref: string; specs?: string[] }
+  | { kind: "relaunch"; ref: string }
+  | { kind: "relaunch-all" }
   | { kind: "help" };
 
 export type ParseResult = { ok: true; command: ParsedCommand } | { ok: false; message: string };
 
-type Flags = { name?: string; mcp: string[]; yes: boolean; archived: boolean; help: boolean };
+type Flags = { name?: string; mcp: string[]; yes: boolean; archived: boolean; all: boolean; help: boolean };
 
 function scan(argv: string[]): { ok: true; words: string[]; flags: Flags } | { ok: false; message: string } {
   const words: string[] = [];
-  const flags: Flags = { mcp: [], yes: false, archived: false, help: false };
+  const flags: Flags = { mcp: [], yes: false, archived: false, all: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!;
     if (token === "--name") {
@@ -37,6 +39,7 @@ function scan(argv: string[]): { ok: true; words: string[]; flags: Flags } | { o
       flags.mcp.push(value);
     } else if (token === "--yes" || token === "-y") flags.yes = true;
     else if (token === "--archived") flags.archived = true;
+    else if (token === "--all") flags.all = true;
     else if (token === "--help" || token === "-h") flags.help = true;
     else if (token.startsWith("-")) return { ok: false, message: `unrecognized flag "${token}"` };
     else words.push(token);
@@ -50,6 +53,7 @@ function disallowed(f: Flags, allowed: Partial<Record<keyof Flags, boolean>>, la
   if (f.mcp.length > 0 && !allowed.mcp) return `--mcp is not valid with "${label}"`;
   if (f.yes && !allowed.yes) return `--yes/-y is not valid with "${label}"`;
   if (f.archived && !allowed.archived) return `--archived is not valid with "${label}"`;
+  if (f.all && !allowed.all) return `--all is not valid with "${label}"`;
   return undefined;
 }
 
@@ -57,7 +61,7 @@ export function parseArgv(argv: string[]): ParseResult {
   const s = scan(argv); if (!s.ok) return s;
   const { words, flags } = s;
   if (flags.help) {
-    if (words.length || flags.name !== undefined || flags.mcp.length > 0 || flags.yes || flags.archived) return error("--help/-h must be used alone");
+    if (words.length || flags.name !== undefined || flags.mcp.length > 0 || flags.yes || flags.archived || flags.all) return error("--help/-h must be used alone");
     return { ok: true, command: { kind: "help" } };
   }
   if (!words.length) {
@@ -74,6 +78,12 @@ export function parseArgv(argv: string[]): ParseResult {
     if (words.length !== 1) return error('"create" takes no positional arguments');
     const bad = disallowed(flags, { name: true, mcp: true }, "create");
     return bad ? error(bad) : { ok: true, command: { kind: "create", ...(flags.name === undefined ? {} : { name: flags.name }), ...(flags.mcp.length === 0 ? {} : { mcp: flags.mcp }) } };
+  }
+  if (first === "relaunch") {
+    const bad = disallowed(flags, { all: true }, "relaunch");
+    if (bad) return error(bad);
+    if (words.length !== 1 || !flags.all) return error('"relaunch" at the top level takes only --all; relaunch one agent with "bakr <id|name> relaunch"');
+    return { ok: true, command: { kind: "relaunch-all" } };
   }
   if (first === "adopt") {
     const bad = disallowed(flags, {}, "adopt");
@@ -96,6 +106,10 @@ export function parseArgv(argv: string[]): ParseResult {
   if (verb === "name" || verb === "rename") {
     if (words.length !== 3) return error(`"${verb}" requires exactly one new name`);
     return { ok: true, command: { kind: "rename", ref: first, newName: words[2]! } };
+  }
+  if (verb === "relaunch") {
+    if (words.length !== 2) return error('"relaunch" takes no further arguments');
+    return { ok: true, command: { kind: "relaunch", ref: first } };
   }
   if (verb === "mcp") {
     const specs = words.slice(2);

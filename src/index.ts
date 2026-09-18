@@ -48,6 +48,9 @@ function realDeps(): DaemonDeps {
 }
 
 async function main(): Promise<void> {
+  if (process.env["BAKR_MCP_NOTIFICATION_SERVERS"] !== undefined) {
+    log("warn", "BAKR_MCP_NOTIFICATION_SERVERS is no longer read: channels are on for every MCP server an agent has (opt one out with `bakr <agent> mcp <server>:no-notify`). Remove it from the unit.");
+  }
   await runDaemonLoop(realDeps(), { intervalMs: reconcileIntervalMs() });
 }
 
