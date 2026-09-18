@@ -25,6 +25,7 @@
 // using `validateNameSyntax`/`checkNameAvailability` below).
 
 import type { ClaimKey } from "./claim-key-resolve";
+import { stripAnsi } from "./spawn/parse";
 
 export type AgentLifecycleState = "on" | "off" | "archived";
 
@@ -1035,6 +1036,18 @@ function migrateV1LaunchRecord(v1: PersistedLaunchRecordV1): PersistedLaunchReco
  * store that fails validation even after recognizing its version, is
  * malformed — never silently coerced.
  */
+/**
+ * A launch short id as recorded, with any terminal escapes removed. Builds
+ * before the FORCE_COLOR fix (spawn/parse.ts's `stripAnsi`) recorded ids
+ * such as `\x1b[36m52155a5f\x1b[39m\x1b[2m`, which no listing ever matches,
+ * leaving the launch pending and its agent "on — not listed" forever.
+ * Repairing on load resolves such a record against the listing like any
+ * other, with no migration step; a clean id is returned unchanged.
+ */
+function repairStoredShortId<T extends string | undefined>(id: T): T {
+  return (id === undefined ? id : stripAnsi(id)) as T;
+}
+
 export function parseAgentStoreState(source: string): ParseResult {
   let parsed: unknown;
   try {
@@ -1111,7 +1124,7 @@ export function parseAgentStoreState(source: string): ParseResult {
         key: value.key as ClaimKey,
         attemptKey: reviveAttemptKey(value.attemptKey),
         attemptedAt: value.attemptedAt,
-        launchShortId: value.launchShortId ?? undefined,
+        launchShortId: repairStoredShortId(value.launchShortId ?? undefined),
         error: value.error ?? undefined,
       });
       continue;
@@ -1125,7 +1138,7 @@ export function parseAgentStoreState(source: string): ParseResult {
       key: rawValue.key as ClaimKey,
       attemptKey: reviveAttemptKey(rawValue.attemptKey),
       attemptedAt: rawValue.attemptedAt,
-      launchShortId: rawValue.launchShortId ?? undefined,
+      launchShortId: repairStoredShortId(rawValue.launchShortId ?? undefined),
       error: rawValue.error ?? undefined,
     });
   }
@@ -1135,7 +1148,7 @@ export function parseAgentStoreState(source: string): ParseResult {
     if (!isValidPersistedPendingCreationRecord(value)) {
       return { ok: false, error: `a pendingCreations entry in the agent store does not have the expected shape: ${JSON.stringify(value)}` };
     }
-    pendingCreations.push({ attemptId: value.attemptId, key: value.key as ClaimKey, launchShortId: value.launchShortId, attemptedAt: value.attemptedAt });
+    pendingCreations.push({ attemptId: value.attemptId, key: value.key as ClaimKey, launchShortId: repairStoredShortId(value.launchShortId), attemptedAt: value.attemptedAt });
   }
 
   return {

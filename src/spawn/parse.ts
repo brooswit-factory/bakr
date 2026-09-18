@@ -139,11 +139,29 @@ export function filterExactCwd(sessions: BackgroundSessionInfo[], cwd: string): 
  * silently elsewhere.
  */
 export function parseLaunchId(stdout: string): string {
-  const match = stdout.match(/^backgrounded · (\S+)/m);
-  if (!match || !match[1]) {
+  const match = stripAnsi(stdout).match(/^backgrounded · (\S+)/m);
+  if (!match || !match[1] || !SHORT_ID.test(match[1])) {
     throw new Error(`could not find a launched session id in \`claude --bg\` output: ${JSON.stringify(stdout)}`);
   }
   return match[1];
+}
+
+/** What a short id is made of — never escape bytes or punctuation. */
+const SHORT_ID = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Removes terminal escape sequences (CSI such as colour `\x1b[36m`, and OSC
+ * such as hyperlinks). `claude` colours its output whenever FORCE_COLOR is
+ * set — which Claude Code itself sets in every session's environment, so a
+ * `bakr create` run from inside a Claude session printed
+ * `backgrounded · \x1b[36m52155a5f\x1b[39m\x1b[2m (idle…`. `\S+` swallowed
+ * the escapes into the id, the recorded id never matched any listing, and
+ * the agent sat "on — not listed" forever. exec.ts also drops FORCE_COLOR
+ * before running `claude`; this is the parser's own guard for when that is
+ * not enough.
+ */
+export function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-?]*[ -\/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "");
 }
 
 /**
