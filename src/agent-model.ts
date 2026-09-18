@@ -241,7 +241,7 @@ export function mintUniqueAgentId(state: AgentStoreState, randomBytes: (byteLeng
 // --- Name rules (B4, B5, B11) -------------------------------------------
 
 /** B5: a deliberate superset. If you add a word, say so in the PR — do not widen this list quietly. */
-export const RESERVED_NAMES: readonly string[] = ["create", "attach", "on", "off", "name", "rename", "archive", "unarchive", "delete", "list", "adopt", "relaunch"];
+export const RESERVED_NAMES: readonly string[] = ["create", "attach", "on", "off", "name", "rename", "archive", "unarchive", "delete", "list", "adopt", "relaunch", "status"];
 
 /** B11: every refusal is typed and carries a message a surface can show verbatim. */
 export type NameSyntaxResult =

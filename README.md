@@ -46,6 +46,7 @@ directories — that claim is what brings an agent back after a reboot.
 | `bakr <id\|name> delete [--yes]` | Delete, with confirmation |
 | `bakr <id\|name> send <message>` | Message the running agent and print its reply |
 | `bakr <id\|name> permissions` | List the tool-permission prompts waiting on that agent's pane |
+| `bakr status [--json]` | A read-only health report of every agent on this host |
 
 Help is flag-only (`bakr --help`); `help` remains available as an agent
 reference. Attach requires TTY stdin and stdout, inherits all three streams,
@@ -94,6 +95,102 @@ not add a daemon API, because bakr's locked stores already support multiple
 writers. It also never opens a new terminal. The `on` result model reports
 current-attempt launch-record clearing separately from stray fork-from-record
 clearing so neither operator-visible recovery is conflated.
+
+The table above covers every verb but `status`, which is a health report
+rather than an action and carries its own three codes — see its section below.
+
+### `bakr status`: the read-only health report (BAKR-48)
+
+`bakr status --json` prints one JSON document describing every agent bakr
+knows about, what herdr is actually running, and every way the two disagree.
+It exists because that comparison was being done by hand: on 2026-09-18 a
+check of "bakr's store vs `herdr agent list`" after a service restart and a
+power loss found one agent running in **two** panes on one session, and
+another never restored because of a stale launch record (BAKR-33).
+factory-dashboard polls this command every ~10 seconds instead.
+
+It is **strictly read-only**. It never starts, wakes, restores, relaunches or
+stops anything, it runs no herdr command other than `agent list` and
+`agent read`, and it does not write the store (it does not even lock it — the
+store is written atomically by temp-file-and-rename, so a plain read sees
+either the whole old file or the whole new one). A test asserts exactly that,
+including that the store file's bytes are unchanged. It resolves no claim key
+and claims no directory, so it is valid from any cwd.
+
+```
+{ "version": 1, "checkedAt": "<iso>",
+  "herdr": {"ok": true} | {"ok": false, "reason": "…"},
+  "store": {"ok": true} | {"ok": false, "reason": "…"},
+  "agents": [ { "id", "name", "state", "directory", "pane", "sessionId", "herdrStatus",
+                "blockedOn": "startup"|"permission"|"unknown"|null,
+                "ok": true|false|null, "problem": null | {"code", "text"} } ],
+  "duplicates": [ {"sessionId", "panes": [...]} ],
+  "orphanPanes": [ {"pane", "sessionId"} ],
+  "unresolvedLaunches": [ {"agentId", "attemptId", "attemptedAt", "error"} ],
+  "blockedPrompts": [ {"pane", "agentId"|null, "kind", "name", "excerpt"} ] }
+```
+
+`version` is `1` and the schema is stable: every key above is always present,
+and an absent value is `null` rather than a missing key. Both timestamps
+(`checkedAt` and each `attemptedAt`) are ISO 8601 strings, never epoch
+milliseconds, so the whole document reads one way.
+
+The check for each `on` agent is: exactly one herdr pane runs its
+`restoreTarget.sessionId`, and that pane is its `restoreTarget.shortId`.
+
+| `problem.code` | What was seen |
+|---|---|
+| `not-in-herdr` | No pane runs its session, and nothing explains why (it is down) |
+| `wrong-session` | Its recorded pane exists but runs a different session, and its own session runs nowhere |
+| `wrong-pane` | Its session runs, in a pane other than the recorded one |
+| `duplicate-session` | More than one pane runs its session |
+| `restore-refused` | Not running, and an unresolved launch record explains it (the BAKR-33 case) |
+| `blocked` | Alive, in its own pane, and waiting on a dialog (`blockedOn` says which kind) |
+
+`off` and `archived` agents are listed with `ok: null` and no problem — bakr
+does not keep them running, so nothing herdr shows can make one unhealthy —
+though their observed pane and `herdrStatus` are still reported.
+`orphanPanes` are herdr Claude panes whose session belongs to no `on` agent;
+on a shared host that includes every Claude pane bakr does not own, so they
+are context rather than a verdict. A `restore-refused` record that a later
+launch has already superseded (`isSupersededStaleCwdRespawnFailure`, B13a) is
+neither reported in `unresolvedLaunches` nor held against the agent.
+
+**"Couldn't check" is never "down."** If herdr cannot be read, the reason
+lands on `herdr` and every agent comes out `ok: null` with `problem: null` —
+never `not-in-herdr`. If the store cannot be read, the reason lands on
+`store` and `agents` is empty: bakr has no second source of truth for which
+agents exist, and inventing one from a listing is precisely what this product
+forbids. A *missing* store is not a failed read — it is an empty herd.
+
+| Exit | Meaning |
+|---:|---|
+| 0 | Healthy |
+| 1 | Problems found — at least one agent has `ok: false` |
+| 2 | Something could not be checked (`herdr.ok` or `store.ok` is false) |
+
+The JSON is printed in every case, including both failures, so a consumer
+always has a document to read the reason out of. Exit 2 wins over exit 1: a
+report that could not see everything must never be read as a clean bill of
+health. Duplicates, orphan panes and blocked prompts belonging to no bakr
+agent do not on their own set exit 1 — anything that does belong to a bakr
+agent always also lands on that agent as a `problem`.
+
+One definition of each term across bakr, drovr and the dashboard:
+`blockedOn` / `blockedPrompts` come from Drovr's `listBlockingPrompts`, and
+duplicates are grouped by `agent_session.value`, the same as DROVR-13. Panes
+come from bakr's own herdr listing rather than Drovr's `listResidents`, which
+lists only drovr-hosted workspaces; after BAKR-35's `hostResident` swap,
+`listPanes` (src/status.ts) is the one function to switch over.
+
+Speed: one `herdr agent list` — shared between the pane inventory and Drovr's
+scan, so the poll pays for exactly one — plus one `herdr agent read` per
+Claude pane, in parallel. A test measures 11 agents against the fake host at
+well under the 2s budget.
+
+A plain `bakr status` (no `--json`) prints a short human summary of the same
+data and returns the same exit codes.
+
 
 **bakr is not a task runner.** Nothing in it discovers work, assigns it, or
 finishes it. The operator gives an agent its purpose by attaching to it and
