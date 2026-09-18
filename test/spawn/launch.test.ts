@@ -1,107 +1,55 @@
 import { describe, expect, test } from "bun:test";
 import { launch } from "../../src/spawn/launch";
+import { makeFakeHost } from "../support/fake-host";
 
-describe("launch", () => {
-  test("launches via a per-launch systemd-run --user --scope wrapping claude --bg, under the given directory, and returns the printed id", async () => {
-    const commands: Array<{ argv: string[]; opts: { cwd?: string; timeoutMs: number } }> = [];
+const DIR = "/home/op/code/rocketr";
+const instant = () => {
+  let clock = 0;
+  return { sleep: async (ms: number) => { clock += ms; }, now: () => clock };
+};
 
-    const result = await launch("/home/op/project", ["--append-system-prompt", "watch this repo"], {
-      generateUnitSuffix: () => "deadbeef",
-      runCommand: async (argv, opts) => {
-        commands.push({ argv, opts });
-        return { exitCode: 0, stdout: "backgrounded · abc12345 (idle — send a prompt to start)\n", stderr: "" };
-      },
-    });
-
-    expect(result).toEqual({ ok: true, id: "abc12345" });
-    expect(commands).toHaveLength(1);
-    const call = commands[0]!;
-    expect(call.argv[0]).toBe("systemd-run");
-    expect(call.argv).toContain("--unit=bakr-launch-deadbeef");
-    expect(call.argv).toContain("claude");
-    expect(call.argv).toContain("--bg");
-    expect(call.argv).toContain("--append-system-prompt");
-    expect(call.argv).toContain("watch this repo");
-    expect(call.opts.cwd).toBe("/home/op/project");
+describe("launch (herdr)", () => {
+  test("starts claude interactively in a new workspace pane in the directory, never `claude --bg`", async () => {
+    const host = makeFakeHost();
+    const r = await launch(DIR, ["--mcp-config", `${DIR}/.mcp.json`], { runCommand: host.runCommand, label: "@rocketr", mintSessionId: () => "fixed-session", ...instant() });
+    expect(r).toEqual({ ok: true, id: "w1:p1", sessionId: "fixed-session" });
+    expect(host.calls[0]).toEqual(["herdr", "workspace", "create", "--cwd", DIR, "--label", "bakr @rocketr", "--no-focus"]);
+    // FALSIFIER: a fresh launch names its own session, so its id is known before claude prints anything.
+    expect(host.starts()).toEqual([["--session-id", "fixed-session", "--mcp-config", `${DIR}/.mcp.json`]]);
+    expect(host.calls.some((c) => c.includes("--bg") || c[0] === "systemd-run")).toBe(false);
   });
 
-  test("a value containing shell metacharacters is passed through unchanged, as its own argv element", async () => {
-    const weird = 'line one\nline two with $HOME and `backtick` and "quotes"';
-    const commands: string[][] = [];
-    await launch("/x", ["--append-system-prompt", weird], {
-      runCommand: async (argv) => {
-        commands.push(argv);
-        return { exitCode: 0, stdout: "backgrounded · id1 (idle)\n", stderr: "" };
-      },
-    });
-    expect(commands[0]).toContain(weird);
+  test("a resume keeps the session id it names and adds no --session-id", async () => {
+    const host = makeFakeHost();
+    const r = await launch(DIR, ["--resume", "abc-session"], { runCommand: host.runCommand, ...instant() });
+    expect(r.ok && r.sessionId).toBe("abc-session");
+    expect(host.starts()).toEqual([["--resume", "abc-session"]]);
   });
 
-  test("a non-zero exit from the launcher is a launch failure, with the real stderr surfaced", async () => {
-    const result = await launch("/x", [], {
-      runCommand: async () => ({ exitCode: 1, stdout: "", stderr: "systemd-run: command not found" }),
-    });
-    expect(result).toEqual({ ok: false, error: expect.stringContaining("systemd-run: command not found") });
+  test("a start that fails closes its workspace, leaving no half-started pane", async () => {
+    const host = makeFakeHost({ failStart: "no claude on PATH" });
+    const r = await launch(DIR, [], { runCommand: host.runCommand, ...instant() });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("no claude on PATH");
+    expect(host.stops()).toEqual(["w1"]);
+    expect(host.panes).toEqual([]);
   });
 
-  test("a thrown launch (e.g. a timeout) is a launch failure, not an unhandled rejection", async () => {
-    const result = await launch("/x", [], {
-      runCommand: async () => {
-        throw new Error("command timed out after 20000ms");
-      },
-    });
-    expect(result).toEqual({ ok: false, error: expect.stringContaining("timed out") });
+  test("an unknown blocking prompt is reported with its screen, never guessed at, and the workspace is closed", async () => {
+    const host = makeFakeHost({ blockedScreen: "Some new question?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel" });
+    const r = await launch(DIR, [], { runCommand: host.runCommand, ...instant() });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("Some new question?");
+    expect(host.calls.some((c) => c[2] === "send-keys")).toBe(false);
+    expect(host.panes).toEqual([]);
   });
 
-  test("a zero exit with unparseable stdout is a launch failure, never a fabricated id", async () => {
-    const result = await launch("/x", [], {
-      runCommand: async () => ({ exitCode: 0, stdout: "unexpected output\n", stderr: "" }),
+  test("a start herdr cannot even create a workspace for fails without starting anything", async () => {
+    const r = await launch(DIR, [], {
+      runCommand: async () => ({ exitCode: 1, stdout: JSON.stringify({ error: { code: "server_unavailable", message: "herdr server is not running" } }), stderr: "" }),
+      ...instant(),
     });
-    expect(result.ok).toBe(false);
-  });
-
-  test("each call gets a fresh, independently generated unit suffix by default", async () => {
-    const seen = new Set<string>();
-    for (let i = 0; i < 5; i++) {
-      const result = await launch("/x", [], {
-        runCommand: async (argv) => {
-          const unitArg = argv.find((a) => a.startsWith("--unit="));
-          seen.add(unitArg ?? "");
-          return { exitCode: 0, stdout: "backgrounded · id (idle)\n", stderr: "" };
-        },
-      });
-      expect(result.ok).toBe(true);
-    }
-    expect(seen.size).toBe(5);
-  });
-  test("systemd < 254 refusing --expand-environment is retried once without it, under the same unit", async () => {
-    const commands: string[][] = [];
-    const result = await launch("/x", ["--append-system-prompt", "p"], {
-      generateUnitSuffix: () => "cafe0001",
-      runCommand: async (argv) => {
-        commands.push(argv);
-        if (argv.includes("--expand-environment=no")) {
-          return { exitCode: 1, stdout: "", stderr: "systemd-run: unrecognized option '--expand-environment=no'\n" };
-        }
-        return { exitCode: 0, stdout: "backgrounded · legacy01 (idle)\n", stderr: "" };
-      },
-    });
-    expect(result).toEqual({ ok: true, id: "legacy01" });
-    expect(commands).toHaveLength(2);
-    expect(commands[1]).not.toContain("--expand-environment=no");
-    expect(commands[1]!.slice(0, 5)).toEqual(["systemd-run", "--user", "--scope", "--unit=bakr-launch-cafe0001", "--collect"]);
-    expect(commands[1]!.slice(commands[1]!.indexOf("--"))).toEqual(["--", "claude", "--append-system-prompt", "p", "--bg"]);
-  });
-
-  test("any other launch failure is not retried", async () => {
-    let calls = 0;
-    const result = await launch("/x", [], {
-      runCommand: async () => {
-        calls += 1;
-        return { exitCode: 1, stdout: "", stderr: "systemd-run: unrecognized option '--bogus'" };
-      },
-    });
-    expect(result.ok).toBe(false);
-    expect(calls).toBe(1);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("herdr server is not running");
   });
 });

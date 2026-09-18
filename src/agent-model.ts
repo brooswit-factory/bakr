@@ -706,10 +706,14 @@ export function resolveLaunch(state: AgentStoreState, launchShortId: string, res
  * measured that `respawn` does not rotate it). Total, like every other
  * mutator here: a no-op if no pending record matches.
  */
-export function resolveRespawnAttempt(state: AgentStoreState, attemptId: string): AgentStoreState {
+export function resolveRespawnAttempt(state: AgentStoreState, attemptId: string, newShortId?: string): AgentStoreState {
   const record = state.launches.find((l) => l.attemptId === attemptId && l.error === undefined);
   if (record === undefined) return state;
-  return { ...state, launches: state.launches.filter((l) => l.attemptId !== record.attemptId) };
+  const launches = state.launches.filter((l) => l.attemptId !== record.attemptId);
+  const agent = state.agents[record.agentId];
+  // Under herdr a restore resumes the SAME session in a NEW pane: the session id stays, the handle moves.
+  if (newShortId === undefined || agent?.restoreTarget === undefined) return { ...state, launches };
+  return { ...state, launches, agents: { ...state.agents, [agent.id]: { ...agent, restoreTarget: { ...agent.restoreTarget, shortId: newShortId } } } };
 }
 
 /**

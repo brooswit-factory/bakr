@@ -338,7 +338,9 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
       // it. Do not read "the gate" as a death-verification gate — it is a
       // never-alive, never-uncertain gate, which is the honest strength
       // this design actually has.
-      const entry = sessions.find((s) => s.id === shortId);
+      // Matched by SESSION id: under herdr a restore resumes the same session in a new pane, so the
+      // short id (the pane) changes while the session id does not. A session alive in any pane is alive.
+      const entry = sessions.find((s) => s.sessionId === agent.restoreTarget?.sessionId) ?? sessions.find((s) => s.id === shortId);
       const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
       const verdict = decideLiveness(shortId, entry, pidVerifiedAlive);
 
@@ -436,7 +438,7 @@ async function dispatchRespawnForDaemon(deps: DaemonDeps, agentId: string, key: 
   // restore case B7 forbids, caused by a transient CLI hiccup rather than
   // any fact about the session. `absent` is the ONLY verdict that proceeds
   // — `alive`, `not-verifiable`, AND `listing-failed` all refuse.
-  const recheck = await checkLiveness(shortId, { runCommand: deps.runCommand });
+  const recheck = await checkLiveness(shortId, { runCommand: deps.runCommand }, restoreSessionId);
   if (recheck.status !== "absent") {
     const reason = recheck.status === "alive" ? `verified alive with pid ${recheck.pid}` : recheck.reason;
     const error = `respawn refused: TOCTOU re-check reported "${recheck.status}" for session ${shortId} (${reason}) — only "absent" (a listing that succeeded and genuinely did not find it) proceeds; an operator likely attached since the decision was made, or the re-check listing itself failed, so this is not killed`;
@@ -444,11 +446,11 @@ async function dispatchRespawnForDaemon(deps: DaemonDeps, agentId: string, key: 
     return { kind: "refused", error };
   }
 
-  // A respawn takes no flags, but still needs the agent's MCP approval in place before its process starts.
-  await provisionMcpFor(key, deps.launchConfigDeps ?? realLaunchConfigDeps, await declaredMcp(deps, agentId));
-  const result = await respawnSession(shortId, { runCommand: deps.runCommand });
+  // A restore resumes the same session in a new pane, with the agent's CURRENT flags and approval.
+  const args = await configuredLaunchArgs(deps, key, agentId);
+  const result = await respawnSession({ sessionId: restoreSessionId, directory: key, args }, { runCommand: deps.runCommand, label: agentId });
   if (result.ok) {
-    await withAgentStoreLock(deps.agentsPath, (current) => ({ state: resolveRespawnAttempt(current, attemptId), result: undefined }), lockOpts(deps));
+    await withAgentStoreLock(deps.agentsPath, (current) => ({ state: resolveRespawnAttempt(current, attemptId, result.id), result: undefined }), lockOpts(deps));
     return { kind: "respawned" };
   }
 
@@ -470,8 +472,8 @@ async function dispatchRespawnForDaemon(deps: DaemonDeps, agentId: string, key: 
     const canForkFrom = probe.status === "has-transcript";
     const configured = await configuredLaunchArgs(deps, key, agentId);
     const forkResult = canForkFrom
-      ? await launch(key, ["--resume", restoreSessionId, "--fork-session", ...configured], { runCommand: deps.runCommand })
-      : await launch(key, configured, { runCommand: deps.runCommand });
+      ? await launch(key, ["--resume", restoreSessionId, "--fork-session", ...configured], { runCommand: deps.runCommand, label: agentId })
+      : await launch(key, configured, { runCommand: deps.runCommand, label: agentId });
     await withAgentStoreLock(
       deps.agentsPath,
       (current) => {
@@ -494,11 +496,13 @@ async function dispatchRespawnForDaemon(deps: DaemonDeps, agentId: string, key: 
 
 /**
  * One reconcile cycle. See the module comment for the R-F.3 discipline this
- * function's per-agent helper enforces. Exactly ONE `claude agents --json`
- * listing per cycle. A listing failure makes the WHOLE cycle a no-op with a
- * loud log (BAKR-8 Constraint 1). Only `on` agents are ever considered for
- * launch (B7) — an `off` or `archived` agent is never touched, and there is
- * no code path in this file that stops anything.
+ * function's per-agent helper enforces. Exactly ONE session listing per
+ * cycle (herdr panes plus legacy background sessions). A listing failure
+ * makes the WHOLE cycle a no-op with a loud log (BAKR-8 Constraint 1). Only
+ * `on` agents are ever considered for launch (B7) — an `off` or `archived`
+ * agent is never touched, and no code path in this file stops a running
+ * session. (A launch that fails closes the herdr workspace it itself just
+ * created — see spawn/herdr.ts — never one it found running.)
  */
 export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): Promise<ReconcileResult> {
   if (prior.claimDegraded || prior.agentsDegraded) {
@@ -525,7 +529,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   } catch (err) {
     log(
       "error",
-      `reconcile skipped this cycle: \`claude agents --json\` listing failed: ${err instanceof Error ? err.message : String(err)} — never treated as "nothing running"; no restore is issued this cycle (BAKR-8 Constraint 1)`
+      `reconcile skipped this cycle: the session listing failed: ${err instanceof Error ? err.message : String(err)} — never treated as "nothing running"; no restore is issued this cycle (BAKR-8 Constraint 1)`
     );
     return { claimDegraded: false, agentsDegraded: false, restored: [], skippedListingFailed: true, orphanReportSignatures: prior.orphanReportSignatures };
   }
@@ -669,7 +673,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
         // runs UNLOCKED (R-F: never hold the lock across a spawn).
         const dispatch = await dispatchRespawnForDaemon(deps, agent.id, key, decision.attemptId, decision.shortId, decision.restoreSessionId);
         if (dispatch.kind === "respawned") {
-          log("info", `agent ${agent.id} in "${key}": respawned short id ${decision.shortId} — same session, no fork, per BAKR-22's own measurement`);
+          log("info", `agent ${agent.id} in "${key}": restored session ${decision.restoreSessionId} into a new herdr pane (was ${decision.shortId}) — same session, no fork`);
           restored.push({ agentId: agent.id, key, sessionId: decision.restoreSessionId });
         } else if (dispatch.kind === "forked") {
           if (dispatch.abandonedSessionId !== undefined) {
@@ -697,7 +701,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       }
 
       // begin-fresh-launch only from here on.
-      const launchResult = await launch(key, await configuredLaunchArgs(deps, key, agent.id), { runCommand: deps.runCommand });
+      const launchResult = await launch(key, await configuredLaunchArgs(deps, key, agent.id), { runCommand: deps.runCommand, label: agent.id });
       if (launchResult.ok) {
         await recordLaunchOutcome(deps, decision.attemptId, launchResult);
         log("info", `agent ${agent.id} in "${key}": fresh launch issued -> short id ${launchResult.id}; awaiting a future listing to learn its session id`);

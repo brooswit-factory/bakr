@@ -33,6 +33,7 @@ import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../sr
 import { on, type AgentActionDeps } from "../../src/agent-actions";
 import type { ClaimKey } from "../../src/claim-key-resolve";
 import type { RunCommandOptions, CommandResult } from "../../src/spawn";
+import { makeFakeHost } from "../support/fake-host";
 import { realOrphanProbeDeps } from "../../src/paths";
 
 const KEY = "/claimed/dir" as ClaimKey;
@@ -44,20 +45,25 @@ async function makeTempDir(): Promise<string> {
   return dir;
 }
 
-/** Armed to THROW on any `claude stop` (B7/B13's loop-never-stops-or-clears falsifier) — a daemon cycle that ever tried would fail this test loudly rather than silently passing. */
+const isListing = (argv: string[]): boolean =>
+  (argv[0] === "herdr" && argv[1] === "agent" && argv[2] === "list") || (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "process-info") || (argv[0] === "claude" && argv[1] === "agents");
+const isStop = (argv: string[]): boolean => (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "close") || (argv[0] === "claude" && argv[1] === "stop");
+
+/** An empty fake host that only answers listings. Armed to THROW on any stop — a workspace close or `claude stop` (B7/B13's loop-never-stops-or-clears falsifier) — so a daemon cycle that ever tried would fail this test loudly rather than silently passing; any launch (a workspace create or agent start) throws too. */
 function makeDaemonStub() {
-  let agentsListingCalls = 0;
-  async function runCommand(argv: string[], _opts: RunCommandOptions): Promise<CommandResult> {
-    if (argv[0] === "claude" && argv[1] === "agents") {
-      agentsListingCalls += 1;
-      return { exitCode: 0, stdout: "[]", stderr: "" };
+  const host = makeFakeHost();
+  let listingCalls = 0;
+  async function runCommand(argv: string[], opts: RunCommandOptions): Promise<CommandResult> {
+    if (isListing(argv)) {
+      listingCalls += 1;
+      return host.runCommand(argv, opts);
     }
-    if (argv[0] === "claude" && argv[1] === "stop") {
+    if (isStop(argv)) {
       throw new Error(`FALSIFIER TRIPPED: the reconcile loop must never stop or otherwise act on this agent — got: ${JSON.stringify(argv)}`);
     }
     throw new Error(`daemon stub: unexpected argv ${JSON.stringify(argv)} (the daemon must not launch an off/archived agent, and must not need to launch this already-on agent without a fresh decision)`);
   }
-  return { runCommand, getAgentsListingCalls: () => agentsListingCalls };
+  return { runCommand, getListingCalls: () => listingCalls };
 }
 
 function daemonDeps(dir: string, runCommand: DaemonDeps["runCommand"]): DaemonDeps {
@@ -144,12 +150,8 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       // BAKR-22: `on()` always fetches a listing first, even for a `fresh`
       // plan that has nothing to check liveness against — see this file's
       // own note on the concurrency fixture for the same behavior.
-      const launchRunCommand = async (argv: string[], opts: RunCommandOptions): Promise<CommandResult> => {
-        if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
-        if (argv[0] === "systemd-run") return { exitCode: 0, stdout: "backgrounded · recovered-short-0 (idle — send a prompt to start)\n", stderr: "" };
-        throw new Error(`unexpected argv ${JSON.stringify(argv)}`);
-      };
-      const result = await on(actionDeps(dir, launchRunCommand), KEY, agent.id);
+      const host = makeFakeHost();
+      const result = await on(actionDeps(dir, host.runCommand), KEY, agent.id);
       expect(result.ok).toBe(true);
       if (result.ok && "launchWedgeCleared" in result) {
         expect(result.launchWedgeCleared).toBe(true); // REPORTED, not silent (B13 point 1)
@@ -165,7 +167,9 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       const recordsForAgent = finalStore.state.launches.filter((l) => l.agentId === agent.id);
       expect(recordsForAgent.length).toBe(1); // the old failed record is GONE, replaced by exactly one fresh, pending one
       expect(recordsForAgent[0]?.error).toBeUndefined();
-      expect(recordsForAgent[0]?.launchShortId).toBe("recovered-short-0");
+      expect(recordsForAgent[0]?.launchShortId).toBe("w1:p1"); // the pane the recovery launch started in
+      expect(host.starts().length).toBe(1); // exactly one fresh start
+      expect(host.starts()[0]).not.toContain("--resume");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -177,7 +181,7 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       const agentsPath = join(dir, "agents.json");
       await seedClaim(dir);
       // Mid-flight shape: `on`'s lock-1 already committed state:"on" before the crash — see agent-actions.ts's `on`, lock-1 transitions before launch() runs.
-      // BAKR-22: a real restore target is a `{sessionId, shortId}` pair now, and the restore attempt it wedged on keys on the SHORT id (what `respawn` takes).
+      // BAKR-22: a real restore target is a `{sessionId, shortId}` pair now, and the restore attempt it wedged on keys on the SHORT id.
       const agent: AgentRecord = { id: "@wedge-restore000000", name: undefined, directory: KEY, state: "on", createdAt: 1, birthSessionId: "durable-1", restoreTarget: { sessionId: "durable-1", shortId: "durable-1" } };
       await wedgeAgent(agentsPath, agent, { kind: "respawn", shortId: "durable-1" });
 
@@ -190,16 +194,11 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
 
       expect(await unhandledOnAttempt(agentsPath, agent.id, { kind: "respawn", shortId: "durable-1" })).toBe("blocked");
 
-      // BAKR-22: the recovery restore now goes through `claude respawn <shortId>`, not `--bg --resume`.
-      const launchRunCommand = async (argv: string[], opts: RunCommandOptions): Promise<CommandResult> => {
-        if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
-        if (argv[0] === "claude" && argv[1] === "respawn") {
-          expect(argv).toEqual(["claude", "respawn", "durable-1"]); // EXACTLY this and nothing else (B8/argv-exactness)
-          return { exitCode: 0, stdout: "respawned durable-1\n", stderr: "" };
-        }
-        throw new Error(`unexpected argv ${JSON.stringify(argv)}`);
-      };
-      const result = await on(actionDeps(dir, launchRunCommand), KEY, agent.id);
+      // The recovery restore resumes the agent's own session (`--resume <sessionId>`, never a fork) in a new herdr pane.
+      const host = makeFakeHost();
+      const result = await on(actionDeps(dir, host.runCommand), KEY, agent.id);
+      // EXACTLY one start, and exactly this argv (B8/argv-exactness): no MCP is configured for this directory, so no flags follow.
+      expect(host.starts()).toEqual([["--resume", "durable-1"]]);
       expect(result.ok).toBe(true);
       if (result.ok && "launchWedgeCleared" in result) {
         expect(result.launchWedgeCleared).toBe(true);
@@ -221,8 +220,9 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       const agent: AgentRecord = { id: "@in-flight00000000", name: undefined, directory: KEY, state: "off", birthSessionId: undefined, restoreTarget: undefined, createdAt: 1 };
       await wedgeAgent(agentsPath, agent, undefined); // NOTE: no reconcile cycle run — the record is still pending, never promoted to failed.
 
-      const runCommand = async (argv: string[]): Promise<CommandResult> => {
-        if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" }; // BAKR-22: on() always lists first
+      const host = makeFakeHost();
+      const runCommand = async (argv: string[], opts: RunCommandOptions): Promise<CommandResult> => {
+        if (isListing(argv)) return host.runCommand(argv, opts); // BAKR-22: on() always lists first
         throw new Error(`FALSIFIER TRIPPED: must never call launch for an in-flight record — got ${JSON.stringify(argv)}`);
       };
       const result = await on(actionDeps(dir, runCommand), KEY, agent.id);

@@ -70,7 +70,7 @@ function availability(agent: AgentRecord, sessions: readonly BackgroundSessionIn
 function renderRelaunch(r: actions.RelaunchResult, d: CliDeps): boolean {
   if (!r.ok) { d.stderr(`${r.reason}: ${r.message}\n`); return false; }
   const channels = r.args.filter((arg) => arg.startsWith("--dangerously-load-development-channels=")).map((arg) => arg.slice(arg.indexOf("=") + 1));
-  d.stdout(`relaunched ${label(r.agent)}: ${r.previous.shortId} -> ${r.next.shortId} (session ${r.next.sessionId}), ${r.forked ? "forked with its conversation" : "fresh (the old session had no transcript)"}\n`);
+  d.stdout(`relaunched ${label(r.agent)}: ${r.previous.shortId} -> ${r.next.shortId} (session ${r.next.sessionId}), ${r.resumed ? "resumed with its conversation" : "fresh (the old session had no transcript)"}\n`);
   d.stdout(`channels: ${channels.length ? channels.join(" ") : "none"}\n`);
   return true;
 }

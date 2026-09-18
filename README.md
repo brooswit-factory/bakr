@@ -48,21 +48,20 @@ directories — that claim is what brings an agent back after a reboot.
 
 Help is flag-only (`bakr --help`); `help` remains available as an agent
 reference. Attach requires TTY stdin and stdout, inherits all three streams,
-and propagates `claude attach`'s exit status. On Claude Code 2.1.269, live
-PTY measurement showed that attaching an absent stopped job prints “Waking
-session…” and respawns it. Bakr therefore requires the agent's exact full
-job ID in one successful `claude agents --json` listing before handoff and
-points an absent target at `bakr <ref> on`; a listing failure is never read
-as absence. Attaching and detaching without a prompt left `totalCostUSD` at
-0. Delete likewise refuses a
-non-TTY unless `--yes` is supplied.
+and propagates the attach client's exit status: `herdr agent attach <pane>`
+for a session hosted in herdr, `claude attach <id>` for a legacy background
+session. Bakr requires the agent's exact session in one successful listing
+before handoff and points an absent target at `bakr <ref> on`; a listing
+failure is never read as absence. Delete likewise refuses a non-TTY unless
+`--yes` is supplied.
 
 `send` needs no TTY. It delivers one quoted message to the agent's current,
 running session and prints the reply. It is provider-neutral: the transport
 comes from Drovr's `createResidentAgentMessenger`, and bakr never resumes,
-forks, or wakes a session to send. Claude has no machine API for a running
-background session (`claude -p --resume` refuses while it runs), so Drovr types
-into `claude attach` and proves delivery from that session's own transcript.
+forks, or wakes a session to send. Drovr proves delivery from the session's
+own transcript; bakr supplies how to type into it: `herdr pane send-text` for
+a session in a herdr pane (src/cli/herdr-transport.ts), `claude attach` for a
+legacy background session.
 An off, archived, absent, or mid-turn agent is refused (exit 1). Delivery that
 cannot be proven exits 3. A reply still in progress after Drovr's five-minute
 wait prints the text so far, reports `reply-pending`, and exits 1. The
@@ -139,12 +138,29 @@ bakr rocketr relaunch      # one agent
 bakr relaunch --all        # every `on` agent on this host
 ```
 
-`relaunch` stops the session and forks it (`--resume <session>
---fork-session`) with the current channel flags; the fork becomes the
-agent's restore target. It refuses, changing nothing, an agent that is off,
-has no session yet, is mid-turn, or is the session running the command. If
-the fork does not come up, the agent is left `off` and the output says how
-to bring the old session back (`bakr <agent> on`).
+`relaunch` stops the session and resumes it (`--resume <session>`) in a new
+herdr pane with the current channel flags: the same session id and
+conversation, never a fork (a fork that is never prompted writes no
+transcript, so relaunching a relaunch could lose the conversation). It is
+also how a session still running under legacy `claude --bg` moves into
+herdr. It refuses, changing nothing, an agent that is off, has no session
+yet, is mid-turn, or is the session running the command. If the new session
+does not come up, the agent is left `off` and the output says how to bring
+the old one back (`bakr <agent> on`).
+
+### Where sessions run: herdr panes
+
+Every session bakr starts runs interactively in its own herdr workspace pane
+(`bakr <agent-id>`), never as `claude --bg`: measured on claude 2.1.276, a
+background session never delivers a channel frame as a turn, while the same
+session in a terminal pane does. bakr answers the two startup prompts a
+resident cannot (folder trust, and the development-channels warning for the
+channels bakr itself asked for) and reports any other blocking prompt rather
+than guessing. A restore resumes the same session in a new pane with the
+agent's current flags. Requirements: `herdr` on the PATH bakr runs with, and
+the herdr server running as its own user service (`herdr.service`), so that
+restarting bakr never takes a pane down. The prompt answering is interim: it
+moves to drovr's host when that ships (src/spawn/herdr.ts keeps its shape).
 
 `delete` of an agent whose launch crashed before it ever held a session
 (claude lists that launch as failed) now deletes it, instead of parking it
@@ -229,11 +245,11 @@ bun run scripts/demo-claim.ts /path/to/a/directory
 bun run scripts/demo-put-on.ts /path/to/a/directory
 ```
 
-The second command launches a real `claude --bg` session (via the spawn
-substrate's own scope-wrapped launch) and records its session id as "on"
-for that directory. Stop the daemon (or the session, via `claude stop
-<id>`) and restart the daemon to see it come back silently — no turn is
-ever submitted on restore.
+The second command launches a real session in a herdr pane (via the spawn
+substrate) and records its session id as "on" for that directory. Stop the
+daemon (or close the pane's workspace) and restart the daemon to see it
+come back — the same session resumed in a new pane; no turn is ever
+submitted on restore.
 
 ## bakr's own thin store: session-slots
 
@@ -280,11 +296,13 @@ module comment for the live trace that found this.
 
 ## The hazard this story inherits from BAKR-7
 
-Every launch goes through its own `systemd-run --user --scope` (never a
-bare `claude --bg`); nothing stops a session any way but `claude stop
-<id>`; nothing kills a scope, a cgroup, or `systemctl --user stop`s
-anything to stop an agent; nothing resolves, adopts, or restores a session
-by matching its directory alone. See the PR description for the hazard
+Every launch runs in its own herdr workspace pane, under the herdr server
+rather than bakr.service; nothing stops a session any way but closing that
+pane's workspace (or `claude stop <id>` for a legacy background session),
+always found by its exact session id in a fresh listing; nothing kills a
+scope, a cgroup, or `systemctl --user stop`s anything to stop an agent;
+nothing resolves, adopts, or restores a session by matching its directory
+alone. See the PR description for the hazard
 greps and the live cgroup verification specific to this daemon.
 
 ## What bakr does not do

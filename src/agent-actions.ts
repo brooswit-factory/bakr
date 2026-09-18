@@ -22,8 +22,9 @@
 // same here would stop every agent sharing the directory, which is bakr's
 // headline configuration. Never a cgroup, a scope, `systemctl --user stop`,
 // or the shared `claude daemon run` singleton — `stopSession` (src/spawn/stop.ts)
-// issues `claude stop <shortId>` and nothing else, and this file never
-// constructs a stop invocation of its own.
+// closes that session's own herdr workspace (or `claude stop`s a legacy
+// background session) and nothing else, and this file never constructs a
+// stop invocation of its own.
 //
 // THE WRITE DISCIPLINE (B12, inherited from BAKR-16, stressed for the first
 // time by this story): every mutation goes through `withAgentStoreLock`,
@@ -94,7 +95,7 @@ import {
   resolveOrRefuse,
   type ResolutionRefusal,
 } from "./agent-lifecycle";
-import { launch, listBackgroundSessions, decideLiveness, isPidAlive, respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal, stopSession, type RunCommand, type BackgroundSessionInfo } from "./spawn";
+import { launch, listBackgroundSessions, isHerdrPaneId, decideLiveness, isPidAlive, respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal, stopSession, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
 import { realTranscriptProbeDeps, realLaunchConfigDeps } from "./paths";
 import { claudeLaunchArgs, provisionMcpFor, resolveMcpAccess, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
@@ -127,9 +128,6 @@ async function declaredMcp(deps: AgentActionDeps, agentId: string): Promise<read
 const configuredLaunchArgs = async (deps: AgentActionDeps, directory: string, agentId: string): Promise<string[]> =>
   claudeLaunchArgs(directory, deps.launchConfigDeps ?? realLaunchConfigDeps, await declaredMcp(deps, agentId));
 
-/** A respawn takes no flags, but still needs the agent's MCP approval in place before its process starts. */
-const prepareRespawnFor = async (deps: AgentActionDeps, directory: string, agentId: string): Promise<void> =>
-  provisionMcpFor(directory, deps.launchConfigDeps ?? realLaunchConfigDeps, await declaredMcp(deps, agentId));
 
 function lockOpts(deps: AgentActionDeps): { acquireTimeoutMs?: number } {
   const opts: { acquireTimeoutMs?: number } = {};
@@ -176,7 +174,12 @@ async function settleUnresolvedLaunches(deps: AgentActionDeps, launches: readonl
   }
   for (const id of ids) {
     const entry = sessions.find((s) => s.id === id);
-    if (entry === undefined) return { kind: "nothing-to-stop" };
+    // A herdr pane that no longer lists has ended: herdr lists only live panes, never a dead one's state.
+    // A legacy short id no listing (not even `--all`) accounts for stays unknown, and parks.
+    if (entry === undefined) {
+      if (isHerdrPaneId(id)) continue;
+      return { kind: "nothing-to-stop" };
+    }
     if (entry.state !== undefined && ENDED_STATES.has(entry.state)) continue;
     const stopped = await stopSession(id, { runCommand: deps.runCommand });
     if (!stopped.ok) return { kind: "stop-failed", shortId: id, error: stopped.error };
@@ -250,11 +253,10 @@ type CreateLockResult =
  * steer: "the verb launches", so the daemon's `hasLaunchRecordFor` guard
  * sees the record on its very next cycle and skips this agent rather than
  * double-launching it). B8: `claudeArgs` is empty — create passes no prompt
- * at all. Q3's answer: `sessionId` is NEVER known at return time —
- * `launch()` only ever returns a short id; the full session id comes only
- * from a later listing (see `list`, or the daemon's own next cycle
- * resolving it). The returned `launch.launchShortId` is honest about
- * exactly that much and no more.
+ * at all. The launch names its own session (`--session-id`), but the agent
+ * is still resolved the one way every launch is: by a later listing (see
+ * `list`, or the daemon's own next cycle). The returned
+ * `launch.launchShortId` is the session's herdr pane id.
  */
 export async function create(deps: AgentActionDeps, directory: ClaimKey, name?: string, mcp?: readonly McpServerDeclaration[]): Promise<CreateResult> {
   const decided = await withAgentStoreLock<CreateLockResult>(
@@ -278,7 +280,7 @@ export async function create(deps: AgentActionDeps, directory: ClaimKey, name?: 
   const result = decided.result;
   if (!result.ok) return result;
 
-  const launchResult = await launch(directory, await configuredLaunchArgs(deps, directory, result.agent.id), { runCommand: deps.runCommand });
+  const launchResult = await launch(directory, await configuredLaunchArgs(deps, directory, result.agent.id), { runCommand: deps.runCommand, label: result.agent.id });
   await withAgentStoreLock(
     deps.agentsPath,
     (current) => ({
@@ -473,7 +475,8 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
       // `fresh` plan has no session to check liveness against at all
       // (there is nothing to be alive yet).
       if (plan.kind === "respawn") {
-        const entry = sessions.find((s) => s.id === plan.shortId);
+        // By session id first: under herdr the same session moves to a new pane on every restore.
+        const entry = sessions.find((s) => s.sessionId === decision.agent.restoreTarget?.sessionId) ?? sessions.find((s) => s.id === plan.shortId);
         const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
         const verdict = decideLiveness(plan.shortId, entry, pidVerifiedAlive);
         if (verdict.status === "alive") {
@@ -513,7 +516,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
   if (!result.ok) return result;
   if (result.launch.kind === "issue-fresh") {
     const { attemptId } = result.launch;
-    const launchResult = await launch(directory, await configuredLaunchArgs(deps, directory, result.agent.id), { runCommand: deps.runCommand });
+    const launchResult = await launch(directory, await configuredLaunchArgs(deps, directory, result.agent.id), { runCommand: deps.runCommand, label: result.agent.id });
     await withAgentStoreLock(
       deps.agentsPath,
       (current) => ({
@@ -580,8 +583,8 @@ async function forkFromCurrentTarget(deps: AgentActionDeps, directory: ClaimKey,
   const canForkFrom = probe.status === "has-transcript";
   const configured = await configuredLaunchArgs(deps, directory, agentId);
   const forkResult = canForkFrom
-    ? await launch(directory, ["--resume", restoreSessionId, "--fork-session", ...configured], { runCommand: deps.runCommand })
-    : await launch(directory, configured, { runCommand: deps.runCommand });
+    ? await launch(directory, ["--resume", restoreSessionId, "--fork-session", ...configured], { runCommand: deps.runCommand, label: agentId })
+    : await launch(directory, configured, { runCommand: deps.runCommand, label: agentId });
   await withAgentStoreLock(
     deps.agentsPath,
     (current) => {
@@ -629,11 +632,11 @@ async function forkFromCurrentTarget(deps: AgentActionDeps, directory: ClaimKey,
  * anything, and forking on a guess would abandon a live conversation and
  * mint a new one.
  */
-async function dispatchRespawn(deps: AgentActionDeps, directory: ClaimKey, agentId: string, attemptId: string, shortId: string, restoreSessionId: string): Promise<RespawnOutcome> {
-  await prepareRespawnFor(deps, directory, agentId);
-  const result = await respawnSession(shortId, { runCommand: deps.runCommand });
+async function dispatchRespawn(deps: AgentActionDeps, directory: ClaimKey, agentId: string, attemptId: string, _shortId: string, restoreSessionId: string): Promise<RespawnOutcome> {
+  const args = await configuredLaunchArgs(deps, directory, agentId);
+  const result = await respawnSession({ sessionId: restoreSessionId, directory, args }, { runCommand: deps.runCommand, label: agentId });
   if (result.ok) {
-    await withAgentStoreLock(deps.agentsPath, (current) => ({ state: resolveRespawnAttempt(current, attemptId), result: undefined }), lockOpts(deps));
+    await withAgentStoreLock(deps.agentsPath, (current) => ({ state: resolveRespawnAttempt(current, attemptId, result.id), result: undefined }), lockOpts(deps));
     return { kind: "respawned" };
   }
 
@@ -928,8 +931,8 @@ export type RelaunchResult =
       readonly agent: AgentRecord;
       readonly previous: { readonly shortId: string; readonly sessionId: string };
       readonly next: { readonly shortId: string; readonly sessionId: string };
-      /** True when the conversation was carried over by forking; false when the old session had no transcript to carry (it was never prompted), so a fresh launch replaced it. */
-      readonly forked: boolean;
+      /** True when the session was resumed with its conversation; false when it had no transcript to carry (it was never prompted), so a fresh launch replaced it. */
+      readonly resumed: boolean;
       readonly args: readonly string[];
     };
 
@@ -938,20 +941,24 @@ const RELAUNCH_LIST_TIMEOUT_MS = 45_000;
 const RELAUNCH_POLL_MS = 500;
 
 /**
- * Stops an `on` agent's session and FORKS it (`--resume <session>
- * --fork-session`) with the MCP access it has now — so a changed channel or
- * approval reaches a running agent without losing its conversation, which
- * `off`/`on` cannot do: a respawn comes back with the flags its session was
- * first launched with. The fork becomes the agent's restore target.
+ * Stops an `on` agent's session and resumes it (`--resume <session>`) in a
+ * new herdr pane with the MCP access it has now — the same session id and
+ * conversation, with the current channel flags. It is also how a session
+ * still running under legacy `claude --bg` moves into herdr: the listing
+ * includes those, and `stopSession` ends one by its short id.
+ *
+ * Never a fork: in a pane `--resume` keeps the session id and transcript,
+ * while a fork that is never prompted writes no transcript, so relaunching a
+ * relaunch could find no conversation left to carry.
  *
  * The agent is `off` for the duration. Every daemon build skips `off`
- * agents, so none can respawn the old session in the window between stopping
- * it and the fork being listed — the pending forkFrom record alone would not
+ * agents, so none can restore the old session in the window between stopping
+ * it and the new pane being recorded — the pending record alone would not
  * stop a daemon, whose guard keys on the respawn attempt. The old session's
- * process is waited out before the fork starts, because a single-holder MCP
- * identity (yappr) still held by it would leave the fork without that
- * server. If the fork fails or never lists, the agent stays `off` and the
- * result says how to recover; nothing is guessed.
+ * process is waited out before the new one starts, because a single-holder
+ * MCP identity (yappr) still held by it would leave the new one without that
+ * server. If the launch fails, the agent stays `off` and the result says how
+ * to recover; nothing is guessed.
  *
  * Refuses, changing nothing, when the agent is not `on`, has no session yet,
  * has a launch in flight, is mid-turn (`working` — typed input would be cut
@@ -985,7 +992,7 @@ export async function relaunch(deps: AgentActionDeps, directory: ClaimKey, ref: 
 
   const probe = await probeResumableTranscript(target.sessionId, deps.transcriptProbeDeps ?? realTranscriptProbeDeps);
   if (probe.status === "could-not-tell") return { ok: false, reason: "could-not-tell", message: `could not tell whether session ${target.sessionId} has a transcript to fork (${probe.reason}); nothing was changed`, agent };
-  const forked = probe.status === "has-transcript";
+  const resumed = probe.status === "has-transcript";
 
   const attemptId = deps.generateAttemptId();
   const attemptKey: AttemptKey = { kind: "forkFrom", sessionId: target.sessionId };
@@ -1036,15 +1043,17 @@ export async function relaunch(deps: AgentActionDeps, directory: ClaimKey, ref: 
   }
 
   const configured = await configuredLaunchArgs(deps, directory, agent.id);
-  const args = forked ? ["--resume", target.sessionId, "--fork-session", ...configured] : configured;
-  const launched = await launch(directory, args, { runCommand: deps.runCommand });
+  // Resume the SAME session, not a fork: in a pane it keeps its id and transcript with the new flags, and a fork that
+  // is never prompted writes no transcript, so relaunching a relaunch could otherwise find no conversation to carry.
+  const args = resumed ? ["--resume", target.sessionId, ...configured] : configured;
+  const launched = await launch(directory, args, { runCommand: deps.runCommand, label: agent.id });
   if (!launched.ok) {
     await withAgentStoreLock(deps.agentsPath, (current) => ({ state: markLaunchFailed(current, attemptId, launched.error), result: undefined }), lockOpts(deps));
     return fail("launch-failed", recover(`the replacement launch failed (${launched.error})`));
   }
   await withAgentStoreLock(deps.agentsPath, (current) => ({ state: markLaunchStarted(current, attemptId, launched.id), result: undefined }), lockOpts(deps));
 
-  let sessionId: string | undefined;
+  let sessionId: string | undefined = launched.sessionId;
   const listedBy = deps.now() + RELAUNCH_LIST_TIMEOUT_MS;
   while (sessionId === undefined) {
     try {
@@ -1067,7 +1076,7 @@ export async function relaunch(deps: AgentActionDeps, directory: ClaimKey, ref: 
     return { state: next, result: next.agents[agent.id] };
   }, lockOpts(deps));
   const finalAgent = done.status === "malformed" ? agent : done.result ?? agent;
-  return { ok: true, agent: finalAgent, previous: { shortId: target.shortId, sessionId: target.sessionId }, next: { shortId: launched.id, sessionId: resolvedId }, forked, args };
+  return { ok: true, agent: finalAgent, previous: { shortId: target.shortId, sessionId: target.sessionId }, next: { shortId: launched.id, sessionId: resolvedId }, resumed, args };
 }
 
 /** Every `on` agent on this host with a session, for `relaunch --all`: `[directory, name-or-id]` pairs in store order. */

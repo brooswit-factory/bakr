@@ -26,7 +26,7 @@ import { join } from "node:path";
 import { snapshotDirectory } from "../../scripts/dir-snapshot";
 import { archive, create, deleteAgent, off, on, unarchive, type AgentActionDeps } from "../../src/agent-actions";
 import type { ClaimKey } from "../../src/claim-key-resolve";
-import type { CommandResult, RunCommandOptions } from "../../src/spawn";
+import { makeFakeHost } from "../support/fake-host";
 
 const cleanupDirs: string[] = [];
 afterEach(async () => {
@@ -40,27 +40,6 @@ async function makeDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "bakr-dir-safety-"));
   cleanupDirs.push(dir);
   return dir;
-}
-
-function makeFakeClaude() {
-  const listing: { id: string; sessionId: string; cwd: string; startedAt: number; kind: string; pid?: number }[] = [];
-  let n = 0;
-  async function runCommand(argv: string[], opts: RunCommandOptions): Promise<CommandResult> {
-    if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: JSON.stringify(listing), stderr: "" };
-    if (argv[0] === "claude" && argv[1] === "stop") {
-      const id = argv[2] as string;
-      const idx = listing.findIndex((s) => s.id === id);
-      if (idx !== -1) listing.splice(idx, 1);
-      return { exitCode: 0, stdout: "", stderr: "" };
-    }
-    if (argv[0] === "systemd-run") {
-      const shortId = `short-${n++}`;
-      listing.push({ id: shortId, sessionId: `session-${shortId}`, cwd: opts.cwd ?? "", startedAt: 1, kind: "background", pid: 100 + n });
-      return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
-    }
-    throw new Error(`unexpected argv ${JSON.stringify(argv)}`);
-  }
-  return { runCommand };
 }
 
 function makeDeps(agentsPath: string, runCommand: AgentActionDeps["runCommand"]): AgentActionDeps {
@@ -88,7 +67,7 @@ describe("criterion 7 (corrected): nothing is written into the claimed directory
 
     const key = claimedDir as ClaimKey;
     const agentsPath = join(stateDir, "agents.json");
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     const deps = makeDeps(agentsPath, fake.runCommand);
 
     const snapshots: { step: string; hash: string }[] = [];
@@ -129,6 +108,10 @@ describe("criterion 7 (corrected): nothing is written into the claimed directory
     }
     expect(mismatches.length).toBe(0);
     expect(snapshots.length).toBe(7); // sanity: every step actually ran and was snapshotted
+    // sanity: the sequence really launched a session in the claimed directory and really stopped it.
+    expect(fake.calls.filter((c) => c[0] === "herdr" && c[1] === "workspace" && c[2] === "create").map((c) => c[c.indexOf("--cwd") + 1])).toEqual([claimedDir]);
+    expect(fake.starts().length).toBe(1);
+    expect(fake.stops()).toEqual(["w1"]);
   });
 
   test("SANITY CHECK on this exact fixture shape: if something DID rewrite a pre-existing file in the claimed directory in place, this harness's own snapshot WOULD catch it", async () => {

@@ -117,7 +117,7 @@ export function decideLiveness(id: string, entry: BackgroundSessionInfo | undefi
  * into `absent`, never an exception the caller must separately handle, and
  * never a silent "safe to act on".
  */
-export async function checkLiveness(id: string, deps: ListDeps): Promise<LivenessVerdict> {
+export async function checkLiveness(id: string, deps: ListDeps, sessionId?: string): Promise<LivenessVerdict> {
   let sessions: BackgroundSessionInfo[];
   try {
     sessions = await listBackgroundSessions(deps);
@@ -125,7 +125,8 @@ export async function checkLiveness(id: string, deps: ListDeps): Promise<Livenes
     return { status: "listing-failed", reason: `listing failed: ${err instanceof Error ? err.message : String(err)}` };
   }
 
-  const entry = sessions.find((s) => s.id === id);
+  // A session id, when given, wins: under herdr the same session is restored into a new pane with a new id.
+  const entry = (sessionId === undefined ? undefined : sessions.find((s) => s.sessionId === sessionId)) ?? sessions.find((s) => s.id === id);
   const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
   return decideLiveness(id, entry, pidVerifiedAlive);
 }
