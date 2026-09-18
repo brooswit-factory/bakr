@@ -117,4 +117,45 @@ describe("herdrLaunch answers the startup prompts a resident cannot", () => {
     expect(r).toEqual({ ok: true, id: "w1:p1", sessionId: "s1" });
     expect(sent).toEqual([["down", "enter"], ["enter"]]);
   });
+
+  /** A pane scripted poll by poll: what `agent read` shows and what `agent get` reports, advancing on each read. */
+  function scripted(polls: { screen: string; ready: boolean; session?: string }[]) {
+    const sent: string[][] = [];
+    let at = 0;
+    const current = () => polls[Math.min(at, polls.length - 1)]!;
+    const runCommand = async (argv: string[], _o: RunCommandOptions): Promise<CommandResult> => {
+      const ok = (result: unknown) => ({ exitCode: 0, stdout: JSON.stringify({ result }), stderr: "" });
+      if (argv[1] === "workspace" && argv[2] === "create") return ok({ workspace: { workspace_id: "w1" }, root_pane: { pane_id: "w1:p1" } });
+      if (argv[1] === "agent" && argv[2] === "start") return ok({ type: "ok" });
+      if (argv[1] === "agent" && argv[2] === "read") return { exitCode: 0, stdout: polls[Math.min(at++, polls.length - 1)]!.screen, stderr: "" };
+      if (argv[1] === "agent" && argv[2] === "get") {
+        const p = polls[Math.min(at - 1, polls.length - 1)]!;
+        return ok({ agent: { agent_status: p.ready ? "idle" : "blocked", interactive_ready: p.ready, agent_session: p.session === undefined ? null : { value: p.session } } });
+      }
+      if (argv[1] === "agent" && argv[2] === "send-keys") { sent.push(argv.slice(4)); return ok({ type: "ok" }); }
+      throw new Error(`unexpected ${JSON.stringify(argv)}`);
+    };
+    let clock = 0;
+    return { sent, current, deps: { runCommand, sleep: async (ms: number) => { clock += ms; }, now: () => clock } };
+  }
+
+  test("herdr calling the pane ready before claude draws its dialog is not ready: the dialog that follows is answered", async () => {
+    // Measured 2026-09-18, lead-dynamic-atmosphere: ready and idle with no session, then the development-channels warning.
+    const pane = scripted([
+      { screen: "brooswit@host ~/d> claude --resume s1", ready: true },
+      { screen: CHANNELS, ready: false },
+      { screen: IDLE, ready: true, session: "s1" },
+    ]);
+    const r = await herdrLaunch("/d", ["--resume", "s1"], "@a", pane.deps);
+    // FALSIFIER: accepting herdr's first "ready" reported the launch up and never answered the warning.
+    expect(pane.sent).toEqual([["enter"]]);
+    expect(r).toEqual({ ok: true, id: "w1:p1", sessionId: "s1" });
+  });
+
+  test("a session herdr never names is still accepted once its screen stays clean and ready", async () => {
+    const pane = scripted([{ screen: IDLE, ready: true }]);
+    const r = await herdrLaunch("/d", ["--resume", "s1"], "@a", pane.deps);
+    expect(r).toEqual({ ok: true, id: "w1:p1", sessionId: "s1" });
+    expect(pane.sent).toEqual([]);
+  });
 });
