@@ -95,6 +95,20 @@ export const realTranscriptProbeDeps: TranscriptProbeDeps = {
 };
 
 /** The real access behind `claudeLaunchArgs` (launch-config.ts): reads a directory's own `.mcp.json` (absent or unreadable resolves to `undefined` — configuration this cannot read must never fail a launch), writes approvals through drovr's own settings IO, and reports what it could not do on stderr. */
+/** A session's transcript text from `~/.claude/projects/*`, or `undefined` when none is found. Never throws. */
+export async function realReadTranscript(sessionId: string): Promise<string | undefined> {
+  try {
+    const root = join(homedir(), ".claude", "projects");
+    for (const dir of await readdir(root)) {
+      const text = await readFile(join(root, dir, `${sessionId}.jsonl`), "utf8").catch(() => undefined);
+      if (text !== undefined) return text;
+    }
+  } catch {
+    // No projects root, or unreadable: no transcript.
+  }
+  return undefined;
+}
+
 /** The real reader behind `resumeCwdFor` (resume-cwd.ts): finds a session's transcript under `~/.claude/projects/*` and reads its last recorded cwd. Never throws. */
 export const realResumeCwdDeps: ResumeCwdDeps = {
   lastRecordedCwd: async (sessionId: string) => {

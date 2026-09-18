@@ -97,7 +97,8 @@ import {
 } from "./agent-lifecycle";
 import { launch, listBackgroundSessions, isHerdrPaneId, decideLiveness, isPidAlive, respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal, stopSession, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
-import { realTranscriptProbeDeps, realLaunchConfigDeps, realResumeCwdDeps } from "./paths";
+import { realTranscriptProbeDeps, realLaunchConfigDeps, realResumeCwdDeps, realReadTranscript } from "./paths";
+import { claudeResidentActivity } from "@brooswit/drovr";
 import { claudeLaunchArgs, provisionMcpFor, resolveMcpAccess, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
 import { resumeCwdFor, type ResumeCwdDeps } from "./resume-cwd";
 import type { ClaimKey } from "./claim-key-resolve";
@@ -119,6 +120,24 @@ export interface AgentActionDeps {
   readonly isPidAlive?: (pid: number) => boolean;
   /** Where a session last ran, so a resume happens there (resume-cwd.ts). Defaults to reading its real transcript. */
   readonly resumeCwdDeps?: ResumeCwdDeps;
+  /** A session's transcript text, or `undefined` when none is found (relaunch's busy check). Defaults to the real `~/.claude/projects` tree. */
+  readonly readTranscript?: (sessionId: string) => Promise<string | undefined>;
+}
+
+/**
+ * Whether a session listed `working` is only keeping background workers (a
+ * Monitor, a background shell) while it waits at its prompt. Measured:
+ * `claude agents` lists a `--bg` session busy for as long as any Monitor runs,
+ * so every agent with a Rocket.Chat watcher looked mid-turn forever. drovr's
+ * `claudeResidentActivity` reads the transcript: `background` only when the
+ * last main-thread record closed a turn. A herdr pane's `working` is herdr's
+ * own screen judgement (it reports `done` for the watcher-only case), so it
+ * is never overridden; nor is a session whose transcript cannot be read.
+ */
+async function busyOnlyWithBackgroundWorkers(deps: AgentActionDeps, live: BackgroundSessionInfo, sessionId: string): Promise<boolean> {
+  if (isHerdrPaneId(live.id)) return false;
+  const transcript = await (deps.readTranscript ?? realReadTranscript)(sessionId).catch(() => undefined);
+  return transcript !== undefined && claudeResidentActivity("busy", transcript) === "background";
 }
 
 /** The agent's own MCP declaration, read fresh so a change made since the caller's lock hold still applies; `undefined` (the default: every server its `.mcp.json` configures) when it has none or the store cannot be read. */
@@ -992,7 +1011,9 @@ export async function relaunch(deps: AgentActionDeps, directory: ClaimKey, ref: 
     return { ok: false, reason: "listing-failed", message: err instanceof Error ? err.message : String(err), agent };
   }
   const live = sessions.find((session) => session.sessionId === target.sessionId);
-  if (live?.state === "working") return { ok: false, reason: "busy", message: `agent ${agent.id}'s session ${live.id} is mid-turn; relaunch when it is idle`, agent };
+  if (live?.state === "working" && !(await busyOnlyWithBackgroundWorkers(deps, live, target.sessionId))) {
+    return { ok: false, reason: "busy", message: `agent ${agent.id}'s session ${live.id} is mid-turn; relaunch when it is idle`, agent };
+  }
 
   const probe = await probeResumableTranscript(target.sessionId, deps.transcriptProbeDeps ?? realTranscriptProbeDeps);
   if (probe.status === "could-not-tell") return { ok: false, reason: "could-not-tell", message: `could not tell whether session ${target.sessionId} has a transcript to fork (${probe.reason}); nothing was changed`, agent };

@@ -199,6 +199,46 @@ describe("relaunch", () => {
     expect(stopsAndStarts(host)).toEqual([]);
   });
 
+  // Measured 2026-09-18: `claude agents` lists a `--bg` session with a Monitor as
+  // working/busy forever; lead-dynamic-atmosphere's last record was the
+  // turn_duration closing its turn, yet relaunch refused it as mid-turn.
+  const record = (r: object) => JSON.stringify(r);
+  const closedTurn = [record({ type: "user", message: { content: "hi" } }), record({ type: "assistant", message: { content: [] } }), record({ type: "system", subtype: "turn_duration" })].join("\n");
+  const openTurn = [record({ type: "system", subtype: "turn_duration" }), record({ type: "user", message: { content: "next" } }), record({ type: "assistant", message: { content: [] } })].join("\n");
+
+  test("relaunches a --bg session listed working only because of background workers (its last turn is closed)", async () => {
+    const dir = await setup({});
+    const host = makeFakeHost();
+    legacyOld(host, "working");
+    const r = await relaunch(deps(dir, host, { readTranscript: async (id) => id === OLD.sessionId ? closedTurn : undefined }), KEY, "rocketr");
+    // FALSIFIER: the old gate refused every working session as busy.
+    if (!r.ok) throw new Error(`${r.reason}: ${r.message}`);
+    expect(stopsAndStarts(host)).toEqual([`stop ${OLD.shortId}`, "start"]);
+  });
+
+  test.each([
+    ["its turn is open", openTurn],
+    ["its transcript cannot be read", undefined],
+  ])("still refuses a working --bg session when %s", async (_label, transcript) => {
+    const dir = await setup({});
+    const host = makeFakeHost();
+    legacyOld(host, "working");
+    const r = await relaunch(deps(dir, host, { readTranscript: async () => transcript }), KEY, "rocketr");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("busy");
+    expect(stopsAndStarts(host)).toEqual([]);
+  });
+
+  test("a herdr pane's working is herdr's own judgement and is never overridden by the transcript", async () => {
+    const dir = await setup({});
+    const host = makeFakeHost();
+    host.addPane({ cwd: KEY, sessionId: OLD.sessionId, status: "working" });
+    const r = await relaunch(deps(dir, host, { readTranscript: async () => closedTurn }), KEY, "rocketr");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("busy");
+    expect(stopsAndStarts(host)).toEqual([]);
+  });
+
   test("refuses while another launch for the agent is in flight", async () => {
     const dir = await setup({}, (s) => beginLaunch(s, "@rocketr", KEY, undefined, "inflight", 1));
     const host = makeFakeHost();
