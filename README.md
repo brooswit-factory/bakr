@@ -100,51 +100,52 @@ systemctl --user start bakr.service
 journalctl --user -u bakr.service   # NOT the system-level journalctl — see below
 ```
 
-### Letting launched sessions hear from an MCP server
+### Which MCP servers an agent gets
 
-A directory's `.mcp.json` can configure an MCP server perfectly and the
-session bakr launches there will still never receive a single notification
-from it: a claude session only subscribes to a server's notifications when it
-is launched with that server's development channel. Enabling the server and
-subscribing to it are two separate acts.
+An agent's MCP access used to be spread over three places, and each gap
+failed silently in its own way: `.mcp.json` defines a server, but without
+Claude's `enabledMcpjsonServers` approval a fresh session sits `blocked` on an
+approval prompt nobody can answer, and without the server's development
+channel at launch it never hears a notification. bakr now owns one
+declaration per agent, stored in its own agent store, and drovr renders it
+for the vendor: the approval is written before every start (respawns
+included), and the channel flags go on every fresh launch or fork.
 
-Name the servers this host's sessions should hear from:
+```
+bakr create --name rocketr --mcp rocketr+notify --mcp yappr
+bakr rocketr mcp                         # show it
+bakr rocketr mcp rocketr+notify yappr    # replace it (writes the approval now)
+bakr rocketr mcp default                 # back to the host default
+```
+
+`<server>` allows the agent to use a server; `<server>+notify` also launches
+it subscribed to that server's notifications. The servers themselves are
+still defined in the directory's `.mcp.json`; a declared server it does not
+configure is dropped from the start and reported.
+
+An agent with no declaration uses the host default, each server allowed and
+subscribed to:
 
 ```
 BAKR_MCP_NOTIFICATION_SERVERS=yappr      # commas or spaces separate several
 ```
 
-Unset (the default) means none, and every launch is exactly what it was
-before. A server named here is only ever requested for a directory whose own
-`.mcp.json` actually configures it, so naming one has no effect on sessions
-that do not use it. To set it for the daemon, add an `Environment=` line to
-`systemd/bakr.service` before `./scripts/install.sh`, then
-`systemctl --user daemon-reload && systemctl --user restart bakr.service`.
+Set it with an `Environment=` line in `systemd/bakr.service` before
+`./scripts/install.sh`, then
+`systemctl --user daemon-reload && systemctl --user restart bakr.service`. It
+is read from each process's own environment — the unit's for the daemon, the
+caller's shell for the CLI — so an agent that must get the same access
+whichever of them starts it should declare its own.
 
-A directory that needs a channel the host does not name opts in itself, with
-a `.bakr.json` beside its `.mcp.json`:
+When a change reaches a running session: the approval, at its next start. A
+changed `+notify`, only at a fresh launch: `claude respawn` takes no flags
+from bakr (BAKR-22) and reuses the channels the session was first launched
+with.
 
-```json
-{ "channels": ["rocketr"] }
-```
-
-A launch there asks for the host's servers plus the directory's, still only
-those its `.mcp.json` configures. bakr reads `.bakr.json` afresh at every
-launch, so adding or changing one needs no unit edit and no restart.
-Configuring a server in `.mcp.json` is never enough on its own: a development
-channel lets that server push messages into the session, so subscribing to
-one is always an explicit opt-in, by the host or by the directory.
-
-bakr decides *which servers*; it never spells a `claude` flag. The translation
-from "this session must hear from yappr" into `--mcp-config` and
-`--dangerously-load-development-channels server:yappr` belongs to drovr
-(`buildProviderLaunchArgs`), so the provider's CLI contract lives in one place
-for every substrate that launches one. See `src/launch-config.ts`.
-
-Configuration reaches a session only through `launch()` — a fresh one or a
-fork. `claude respawn`, which is how the daemon ordinarily brings a recorded
-session back, carries no flags at all (BAKR-22), so an already-running session
-picks up a change here at its next fresh launch, not on the next reconcile.
+bakr decides *which servers*; it never spells a vendor flag or settings key.
+drovr's `applyMcpAccess` and `buildProviderLaunchArgs` do, so the provider
+contract lives in one place for every substrate that launches one. See
+`src/launch-config.ts`.
 
 `scripts/install.sh` is a **bash** script (already executable in this repo,
 `chmod 755`) — `bun run scripts/install.sh` does NOT work: `bun run` hands a

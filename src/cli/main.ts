@@ -19,6 +19,7 @@ import { attachInPlace } from "./attach";
 import { confirmDelete } from "./confirm";
 import { residentRefusal, resolveResidentCwd, type ResidentMessenger } from "./send";
 import { EXIT_FAILURE, EXIT_REFUSAL, EXIT_SUCCESS, EXIT_USAGE } from "./exit-codes";
+import { formatMcpSpec, parseMcpSpec, type McpServerDeclaration } from "../launch-config";
 
 export interface CliDeps {
   actions: AgentActionDeps;
@@ -37,7 +38,20 @@ export interface CliDeps {
   messenger: ResidentMessenger;
 }
 
-const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n`;
+const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[+notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> mcp [<server>[+notify] ... | default]\n`;
+
+/** Parses every spec, or returns the first refusal; duplicates keep their last spelling. */
+function parseMcpSpecs(specs: readonly string[]): McpServerDeclaration[] | string {
+  const byName = new Map<string, McpServerDeclaration>();
+  for (const spec of specs) {
+    const parsed = parseMcpSpec(spec);
+    if (typeof parsed === "string") return parsed;
+    byName.set(parsed.name, parsed);
+  }
+  return [...byName.values()];
+}
+
+const describeMcp = (servers: readonly McpServerDeclaration[]): string => servers.length === 0 ? "none" : servers.map(formatMcpSpec).join(" ");
 const label = (a: AgentRecord) => `${a.id}${a.name === undefined ? "" : ` \"${a.name}\"`}`;
 const refusalCode = (reason: string) => reason === "store-malformed" || reason === "listing-failed" || reason === "store-degraded" ? EXIT_FAILURE : EXIT_REFUSAL;
 export const isAttachJobListed = (restoreSessionId:string, sessions:readonly {sessionId:string}[]):boolean => sessions.some(session => session.sessionId === restoreSessionId);
@@ -119,8 +133,10 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
     // agent written into an unclaimed one would never come back after a
     // reboot. The claim is idempotent and saved atomically under its lock,
     // so a crash in between leaves at worst a harmless empty claim.
+    const mcp = command.mcp === undefined ? undefined : parseMcpSpecs(command.mcp);
+    if (typeof mcp === "string") { d.stderr(`bakr: usage error: ${mcp}\n`); return EXIT_USAGE; }
     if (!(await claimDirectory(directory, d))) return EXIT_FAILURE;
-    const r = await actions.create(d.actions, directory, command.name); if (!r.ok) return refuse(r,d);
+    const r = await actions.create(d.actions, directory, command.name, mcp); if (!r.ok) return refuse(r,d);
     d.stdout(`created ${label(r.agent)}\nattach with: bakr ${r.agent.id}\n`);
     if (!r.launch.ok) { d.stderr(`launch-failed: ${r.launch.error}\n`); return EXIT_FAILURE; }
     return 0;
@@ -173,6 +189,19 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
     const r=await actions.deleteAgent(d.actions,directory,command.ref); if(!r.ok)return refuse(r,d);
     if(!renderStop(r.stop,d)) return 3;
     if(r.kind==="parked"){d.stderr(`parked: agent was NOT deleted: ${r.message}\n`);return 1;} d.stdout(`deleted ${r.agentId}\n`);return 0;
+  }
+  if (command.kind === "mcp") {
+    const specs = command.specs;
+    const declaration = specs === undefined ? undefined : specs[0] === "default" ? null : parseMcpSpecs(specs);
+    if (typeof declaration === "string") { d.stderr(`bakr: usage error: ${declaration}\n`); return EXIT_USAGE; }
+    const r = await actions.mcp(d.actions, directory, command.ref, declaration); if (!r.ok) return refuse(r, d);
+    const own = r.agent.mcp;
+    d.stdout(own === undefined ? `${label(r.agent)} mcp: host default (${describeMcp(r.hostDefault)})\n` : `${label(r.agent)} mcp: ${describeMcp(own)}\n`);
+    if (r.changed) {
+      d.stdout("approval written; a running session picks it up at its next start.\n");
+      d.stdout("a changed +notify reaches a running session only through a fresh launch: claude respawn reuses the channels the session was first launched with.\n");
+    }
+    return 0;
   }
   if (command.kind === "rename") { const r=await actions.rename(d.actions,directory,command.ref,command.newName);if(!r.ok)return refuse(r,d);d.stdout(`renamed ${label(r.agent)}\n`);return 0; }
   if (command.kind === "on") {

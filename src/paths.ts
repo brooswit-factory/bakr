@@ -7,6 +7,7 @@ import type { ResolveInputs } from "./claim-key-resolve";
 import type { OrphanProbeDeps } from "./orphan-probe";
 import type { TranscriptProbeDeps } from "./transcript-probe";
 import { parseNotificationServers, type LaunchConfigDeps } from "./launch-config";
+import { formatLogLine } from "./log";
 
 // The impure seams for this ticket's two real-filesystem dependencies:
 // XDG resolution and symlink-aware path resolution. Both read real env/os
@@ -93,17 +94,19 @@ export const realTranscriptProbeDeps: TranscriptProbeDeps = {
 };
 
 /**
- * The MCP servers this host wants every session it launches to hear from,
- * read once from the environment (`BAKR_MCP_NOTIFICATION_SERVERS`, e.g.
- * `yappr`) — unset means none, which is this substrate's own prior behaviour.
- * A directory adds its own through `.bakr.json`. Naming a server here never
- * affects a directory whose `.mcp.json` does not configure it (see
- * launch-config.ts's `resolveLaunchInputs`).
+ * This host's default MCP declaration, for an agent that has none of its
+ * own: each server named in `BAKR_MCP_NOTIFICATION_SERVERS` (e.g. `yappr`) is
+ * allowed and subscribed to. Unset means none. It is read from THIS process's
+ * environment, which for the daemon is its unit's but for the CLI is the
+ * caller's shell — so an agent that must get the same access whichever of
+ * them starts it declares it itself (`bakr <agent> mcp …`). Naming a server
+ * here never affects a directory whose `.mcp.json` does not configure it (see
+ * launch-config.ts's `resolveMcpAccess`).
  */
 export const notificationServersFromEnv = (): string[] =>
   parseNotificationServers(process.env["BAKR_MCP_NOTIFICATION_SERVERS"]);
 
-/** The real read-only access to a directory's own `.mcp.json` and `.bakr.json`, for `claudeLaunchArgs` (launch-config.ts). Absent or unreadable configuration resolves to `undefined` rather than throwing: configuration this cannot read must never fail a launch. */
+/** The real access behind `claudeLaunchArgs` (launch-config.ts): reads a directory's own `.mcp.json` (absent or unreadable resolves to `undefined` — configuration this cannot read must never fail a launch), writes approvals through drovr's own settings IO, and reports what it could not do on stderr. */
 export const realLaunchConfigDeps: LaunchConfigDeps = {
   readConfigFile: async (path: string) => {
     try {
@@ -115,4 +118,5 @@ export const realLaunchConfigDeps: LaunchConfigDeps = {
   get notificationServers(): string[] {
     return notificationServersFromEnv();
   },
+  warn: (message: string) => console.error(formatLogLine("warn", message)),
 };

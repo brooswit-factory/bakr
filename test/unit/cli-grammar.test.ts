@@ -27,6 +27,23 @@ describe("bakr CLI grammar", () => {
     [["list","x"],"no arguments"], [["create","--yes"],"not valid"], [["x","on","extra"],"no further"],
     [["x","name"],"requires"], [["x","send"],"exactly one message"], [["x","send","a","b"],"quote it"], [["--help","list"],"used alone"],
   ] as const)("usage edge %#", (argv,message) => { const r=parseArgv([...argv]); if(message===undefined){expect(r).toEqual({ok:true,command:{kind:"attach",ref:"help"}});}else{expect(r.ok).toBe(false);if(!r.ok)expect(r.message).toContain(message);} });
+  test("MCP declarations: --mcp on create, and the mcp verb", () => {
+    expect(ok(["create","--mcp","yappr+notify","--mcp","rocketr"])).toEqual({kind:"create",mcp:["yappr+notify","rocketr"]});
+    expect(ok(["create","--name","rocketr","--mcp","rocketr+notify"])).toEqual({kind:"create",name:"rocketr",mcp:["rocketr+notify"]});
+    expect(ok(["alice","mcp"])).toEqual({kind:"mcp",ref:"alice"});
+    expect(ok(["alice","mcp","yappr+notify","rocketr"])).toEqual({kind:"mcp",ref:"alice",specs:["yappr+notify","rocketr"]});
+    expect(ok(["alice","mcp","default"])).toEqual({kind:"mcp",ref:"alice",specs:["default"]});
+    for (const [argv, message] of [
+      [["create","--mcp"], "--mcp requires a server spec"],
+      [["list","--mcp","yappr"], "--mcp is not valid"],
+      [["alice","on","--mcp","yappr"], "--mcp is not valid"],
+      [["alice","mcp","default","yappr"], "takes no server specs"],
+    ] as const) {
+      const r = parseArgv([...argv]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain(message);
+    }
+  });
   test("C3: every top-level dispatch word is reserved by the model", () => {
     for (const word of TOP_LEVEL_WORDS) expect(RESERVED_NAMES).toContain(word);
   });

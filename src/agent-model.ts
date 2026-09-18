@@ -25,6 +25,7 @@
 // using `validateNameSyntax`/`checkNameAvailability` below).
 
 import type { ClaimKey } from "./claim-key-resolve";
+import type { McpServerDeclaration } from "./launch-config";
 import { stripAnsi } from "./spawn/parse";
 
 export type AgentLifecycleState = "on" | "off" | "archived";
@@ -79,6 +80,13 @@ export interface AgentRecord {
   readonly birthSessionId: string | undefined;
   /** See `RestoreTarget`'s own doc. `undefined` only before this agent's first launch has resolved a session at all. */
   readonly restoreTarget: RestoreTarget | undefined;
+  /**
+   * The MCP servers this agent may use, and which it must hear notifications
+   * from — bakr's own declaration, rendered per vendor by drovr at every start
+   * (launch-config.ts). Absent means "this host's default", which is not the
+   * same as an empty declaration: `[]` is an agent that uses no MCP at all.
+   */
+  readonly mcp?: readonly McpServerDeclaration[];
 }
 
 /**
@@ -310,6 +318,14 @@ export function lookupAgentById(state: AgentStoreState, id: string): AgentRecord
 /** Raw, unvalidated insert/replace — the primitive a migration or a future validated verb builds on. Performs no name/reserved-word/availability check of its own; see the module comment. */
 export function putAgent(state: AgentStoreState, agent: AgentRecord): AgentStoreState {
   return { ...state, agents: { ...state.agents, [agent.id]: agent } };
+}
+
+/** Replaces an agent's MCP declaration; `undefined` returns it to this host's default. A no-op when `agentId` names no agent. */
+export function setAgentMcp(state: AgentStoreState, agentId: string, mcp: readonly McpServerDeclaration[] | undefined): AgentStoreState {
+  const agent = state.agents[agentId];
+  if (agent === undefined) return state;
+  const { mcp: _previous, ...rest } = agent;
+  return putAgent(state, mcp === undefined ? rest : { ...rest, mcp });
 }
 
 /**
@@ -751,6 +767,8 @@ interface PersistedAgentRecord {
   readonly createdAt: number;
   readonly birthSessionId: string | null;
   readonly restoreTarget: PersistedRestoreTarget | null;
+  /** Written only when declared, so a store without declarations serializes exactly as before. */
+  readonly mcp?: readonly McpServerDeclaration[];
 }
 
 interface PersistedLaunchRecord {
@@ -808,8 +826,14 @@ function isValidPersistedAgentRecord(value: unknown): value is PersistedAgentRec
     LIFECYCLE_STATES.includes(value["state"] as AgentLifecycleState) &&
     typeof value["createdAt"] === "number" &&
     (value["birthSessionId"] === null || typeof value["birthSessionId"] === "string") &&
-    (value["restoreTarget"] === null || isValidPersistedRestoreTarget(value["restoreTarget"]))
+    (value["restoreTarget"] === null || isValidPersistedRestoreTarget(value["restoreTarget"])) &&
+    (value["mcp"] === undefined || isValidMcpDeclaration(value["mcp"]))
   );
+}
+
+function isValidMcpDeclaration(value: unknown): value is readonly McpServerDeclaration[] {
+  return Array.isArray(value) && value.every((server) =>
+    isPlainObject(server) && typeof server["name"] === "string" && typeof server["notifications"] === "boolean");
 }
 
 function isValidPersistedLaunchRecord(value: unknown): value is PersistedLaunchRecord {
@@ -870,6 +894,7 @@ export function serializeAgentStoreState(state: AgentStoreState): string {
       createdAt: a.createdAt,
       birthSessionId: a.birthSessionId ?? null,
       restoreTarget: a.restoreTarget ?? null,
+      ...(a.mcp === undefined ? {} : { mcp: a.mcp.map((server) => ({ name: server.name, notifications: server.notifications })) }),
     };
   }
   const launches: PersistedLaunchRecord[] = state.launches.map((l) => ({
@@ -1108,6 +1133,7 @@ export function parseAgentStoreState(source: string): ParseResult {
       createdAt: rawValue.createdAt,
       birthSessionId: rawValue.birthSessionId ?? undefined,
       restoreTarget: rawValue.restoreTarget ?? undefined,
+      ...(rawValue.mcp === undefined ? {} : { mcp: rawValue.mcp.map((server) => ({ name: server.name, notifications: server.notifications })) }),
     };
   }
 
