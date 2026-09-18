@@ -17,6 +17,8 @@ export interface FakePane {
   status: "idle" | "working" | "blocked" | "done";
   pid: number | undefined;
   label: string;
+  /** What `herdr agent read` shows for this pane; defaults to the host's `blockedScreen`, else an idle input box. */
+  screen?: string;
 }
 
 export interface FakeLegacySession {
@@ -85,7 +87,7 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
     if (group === "agent" && verb === "list") {
       if (failing()) throw new Error("simulated listing failure");
       return reply({ type: "agent_list", agents: panes.map((p) => ({
-        pane_id: p.paneId, workspace_id: p.workspaceId, agent: "claude", agent_status: p.status,
+        pane_id: p.paneId, workspace_id: p.workspaceId, agent: "claude", agent_status: p.status, name: p.name ?? null,
         interactive_ready: true, cwd: p.cwd, agent_session: { agent: "claude", kind: "id", value: p.sessionId },
       })) });
     }
@@ -138,7 +140,7 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
         cwd: pane.cwd, agent_session: { agent: "claude", kind: "id", value: pane.sessionId },
       } });
     }
-    if (group === "agent" && verb === "read") return { exitCode: 0, stdout: opts.blockedScreen ?? "❯ ", stderr: "" };
+    if (group === "agent" && verb === "read") return { exitCode: 0, stdout: paneFor(argv[3]!)?.screen ?? opts.blockedScreen ?? "❯ ", stderr: "" };
     if (group === "agent" && verb === "send-keys") return reply({ type: "ok" });
     if (group === "pane" && verb === "process-info") {
       const pane = paneFor(argv[argv.indexOf("--pane") + 1]!);
@@ -149,9 +151,9 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
   }
 
   /** Puts a pane into the fake as if an earlier launch had started it. */
-  function addPane(p: { cwd: string; sessionId: string; status?: FakePane["status"]; pid?: number; args?: string[] }): FakePane {
+  function addPane(p: { cwd: string; sessionId: string; status?: FakePane["status"]; pid?: number; args?: string[]; screen?: string }): FakePane {
     workspace += 1;
-    const pane: FakePane = { paneId: `w${workspace}:p1`, workspaceId: `w${workspace}`, cwd: p.cwd, sessionId: p.sessionId, args: p.args ?? [], status: p.status ?? "idle", pid: p.pid ?? process.pid, label: "" };
+    const pane: FakePane = { paneId: `w${workspace}:p1`, workspaceId: `w${workspace}`, cwd: p.cwd, sessionId: p.sessionId, args: p.args ?? [], status: p.status ?? "idle", pid: p.pid ?? process.pid, label: "", ...(p.screen === undefined ? {} : { screen: p.screen }) };
     panes.push(pane);
     return pane;
   }
@@ -165,3 +167,19 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
 }
 
 export type FakeHost = ReturnType<typeof makeFakeHost>;
+
+/** Claude's tool-permission dialog as `herdr agent read` shows it (claude 2.1.277, as drovr measured it). */
+export function permissionScreen(tool: string, request: readonly string[], options: readonly string[] = ["Yes", "Yes, and always allow access to this directory from this project", "No"]): string {
+  return [
+    "─".repeat(60),
+    ` ${tool}`,
+    "",
+    ...request.map((line) => `   ${line}`),
+    "",
+    " Do you want to proceed?",
+    ...options.map((option, i) => `${i === 0 ? " ❯" : "  "} ${i + 1}. ${option}`),
+    "",
+    " Esc to cancel · Tab to amend",
+    "",
+  ].join("\n");
+}

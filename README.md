@@ -45,6 +45,7 @@ directories — that claim is what brings an agent back after a reboot.
 | `bakr <id\|name> name\|rename <new>` | Rename |
 | `bakr <id\|name> delete [--yes]` | Delete, with confirmation |
 | `bakr <id\|name> send <message>` | Message the running agent and print its reply |
+| `bakr <id\|name> permissions` | List the tool-permission prompts waiting on that agent's pane |
 
 Help is flag-only (`bakr --help`); `help` remains available as an agent
 reference. Attach requires TTY stdin and stdout, inherits all three streams,
@@ -66,6 +67,20 @@ An off, archived, absent, or mid-turn agent is refused (exit 1). Delivery that
 cannot be proven exits 3. A reply still in progress after Drovr's five-minute
 wait prints the text so far, reports `reply-pending`, and exits 1. The
 transport ships in Drovr 0.7.0's release asset.
+
+`permissions` is read-only. It lists the tool-permission prompts ("Do you
+want to proceed?") waiting on that agent's own herdr pane, through Drovr's
+`listPendingPermissions`, which reads every Claude pane's screen and not only
+the ones herdr marks blocked. Drovr returns every pane on the host, so bakr
+keeps only the agent's own: a pane that reports a session must report the
+agent's current session (`restoreTarget.sessionId`), even if its pane id
+matches, and only a pane that reports no session is matched by pane id. Each
+prompt prints its pane, tool, request, options (`>` marks the cursor) and a
+`promptId: <id>` line to copy into the command that answers it. None prints
+`no pending prompts` (exit 0), and so does an agent that was never launched,
+with a note saying so. A legacy `claude --bg` session has no pane to read and
+is noted on stderr. An unknown agent is refused like any other verb (exit 1).
+A failed pane listing exits 3.
 
 | Exit | Meaning |
 |---:|---|

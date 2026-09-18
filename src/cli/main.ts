@@ -9,7 +9,7 @@ import * as actions from "../agent-actions";
 import { adopt } from "../adopt";
 import { probeDirectory } from "../orphan-probe";
 import { classifyClaims, buildOffers, applyDestinationHint } from "../orphan-model";
-import { listBackgroundSessions, type BackgroundSessionInfo } from "../spawn";
+import { isHerdrPaneId, listBackgroundSessions, type BackgroundSessionInfo } from "../spawn";
 import type { AdoptDeps } from "../adopt";
 import type { AgentActionDeps } from "../agent-actions";
 import type { ResolveInputs } from "../claim-key-resolve";
@@ -18,6 +18,7 @@ import { parseArgv, type ParsedCommand } from "./grammar";
 import { attachInPlace } from "./attach";
 import { confirmDelete } from "./confirm";
 import { residentRefusal, resolveResidentCwd, type ResidentMessenger } from "./send";
+import { ownPendingPermissions, renderPendingPermissions, type PermissionHost } from "./permissions";
 import { EXIT_FAILURE, EXIT_REFUSAL, EXIT_SUCCESS, EXIT_USAGE } from "./exit-codes";
 import { formatMcpSpec, parseMcpSpec, type McpServerDeclaration } from "../launch-config";
 
@@ -36,11 +37,13 @@ export interface CliDeps {
   prompt(s: string): Promise<string>;
   spawnAttach(id: string): Promise<number>;
   messenger: ResidentMessenger;
+  /** Reads the tool-permission prompts on this host's Claude panes; `permissions` narrows them to one agent. */
+  permissions: PermissionHost;
   /** The Claude session running this command, if any (CLAUDE_CODE_SESSION_ID): `relaunch` never kills its own caller. */
   selfSessionId?: string;
 }
 
-const help = `usage:\n  bakr [--dir <path>] ...   (run as if started in <path>)\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|name> relaunch\n  bakr relaunch --all\n`;
+const help = `usage:\n  bakr [--dir <path>] ...   (run as if started in <path>)\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> permissions\n  bakr <id|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|name> relaunch\n  bakr relaunch --all\n`;
 
 /** Parses every spec, or returns the first refusal; duplicates keep their last spelling. */
 function parseMcpSpecs(specs: readonly string[]): McpServerDeclaration[] | string {
@@ -186,6 +189,17 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
     if (result.status === "replied") return EXIT_SUCCESS;
     d.stderr(`reply-pending: delivered to agent ${r.agent.id}, but its turn had not finished; attach with \`bakr ${command.ref}\` to follow\n`);
     return EXIT_REFUSAL;
+  }
+  if (command.kind === "permissions") {
+    const r = await actions.resolveTarget(d.actions, directory, command.ref); if (!r.ok) return refuse(r, d);
+    const target = r.agent.restoreTarget;
+    if (target === undefined) { d.stdout(`${label(r.agent)} has never been launched, so it has no pane to prompt on: no pending prompts\n`); return EXIT_SUCCESS; }
+    let pending;
+    try { pending = await d.permissions.list(); }
+    catch (e) { return refuse({ reason: "listing-failed", message: `cannot read agent ${r.agent.id}'s pane: ${e instanceof Error ? e.message : String(e)}` }, d); }
+    d.stdout(renderPendingPermissions(ownPendingPermissions(target, pending)));
+    if (!isHerdrPaneId(target.shortId)) d.stderr(`note: agent ${r.agent.id} still runs under legacy \`claude --bg\` (${target.shortId}), whose prompts cannot be read; \`bakr ${command.ref} relaunch\` moves it into herdr\n`);
+    return EXIT_SUCCESS;
   }
   if (command.kind === "adopt") {
     const store = await loadAgents(d.actions.agentsPath); if (store.status === "malformed") return refuse({reason:"store-degraded",message:store.error},d);

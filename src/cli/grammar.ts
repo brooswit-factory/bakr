@@ -14,6 +14,8 @@ export type ParsedCommand =
   | { kind: "delete"; ref: string; yes: boolean }
   | { kind: "rename"; ref: string; newName: string }
   | { kind: "send"; ref: string; message: string }
+  /** Read-only: the tool-permission prompts waiting on this agent's own pane. */
+  | { kind: "permissions"; ref: string }
   /** `specs` omitted shows the declaration; `["default"]` returns it to the default (every server in its .mcp.json); otherwise it replaces it. */
   | { kind: "mcp"; ref: string; specs?: string[] }
   | { kind: "relaunch"; ref: string }
@@ -110,6 +112,10 @@ export function parseArgv(argv: string[]): ParseResult {
   if (verb === "relaunch") {
     if (words.length !== 2) return error('"relaunch" takes no further arguments');
     return { ok: true, command: { kind: "relaunch", ref: first } };
+  }
+  if (verb === "permissions") {
+    if (words.length !== 2) return error('"permissions" takes no further arguments');
+    return { ok: true, command: { kind: "permissions", ref: first } };
   }
   if (verb === "mcp") {
     const specs = words.slice(2);

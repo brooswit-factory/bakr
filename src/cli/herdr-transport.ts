@@ -5,8 +5,10 @@
 // keeps drovr's own `claude attach` transport until it is relaunched into
 // herdr. The same injected RunCommand as everywhere else runs every command.
 
-import { listClaudeBackgroundSessions, openClaudeAttach, type ClaudeBackgroundListing, type ClaudeResidentDeps, type ResidentTerminal } from "@brooswit/drovr";
+import { listClaudeBackgroundSessions, listPendingPermissions, openClaudeAttach, type ClaudeBackgroundListing, type ClaudeResidentDeps, type ResidentTerminal } from "@brooswit/drovr";
 import { isHerdrPaneId, listBackgroundSessions, type RunCommand } from "../spawn";
+import { parseHerdrReply } from "../spawn/herdr";
+import type { PermissionHost } from "./permissions";
 
 const HERDR_TIMEOUT_MS = 15_000;
 
@@ -44,6 +46,45 @@ export function residentTransport(runCommand: RunCommand): Partial<ClaudeResiden
       return (await runCommand(argv, { timeoutMs: HERDR_TIMEOUT_MS })).stdout;
     },
   };
+}
+
+/** drovr's permission functions take this slice of its client. */
+export type ApprovalClient = Parameters<typeof listPendingPermissions>[0];
+type AgentApi = ApprovalClient["agent"];
+
+async function herdrResult(runCommand: RunCommand, argv: string[]): Promise<Record<string, unknown>> {
+  const out = await runCommand(argv, { timeoutMs: HERDR_TIMEOUT_MS });
+  const reply = parseHerdrReply(out.stdout);
+  if (!reply.ok) throw new Error(`${argv.slice(0, 3).join(" ")}: ${reply.code}: ${reply.message}`);
+  if (out.exitCode !== 0) throw new Error(`${argv.slice(0, 3).join(" ")} exited ${out.exitCode}: ${out.stderr.trim()}`);
+  return reply.result;
+}
+
+/**
+ * drovr's approval client over the herdr CLI, run by the same injected
+ * RunCommand as every other herdr call bakr makes. The CLI prints the RPC's
+ * own result for list, get and send-keys; `agent read` prints only the screen
+ * text, which is the one field of a read drovr's permission functions use.
+ */
+export function herdrApprovalClient(runCommand: RunCommand): ApprovalClient {
+  const agent: AgentApi = {
+    list: async () => (await herdrResult(runCommand, ["herdr", "agent", "list"])) as unknown as Awaited<ReturnType<AgentApi["list"]>>,
+    get: async (target) => (await herdrResult(runCommand, ["herdr", "agent", "get", target])) as unknown as Awaited<ReturnType<AgentApi["get"]>>,
+    read: async (p) => {
+      const argv = ["herdr", "agent", "read", p.target, "--source", p.source, ...(p.lines == null ? [] : ["--lines", String(p.lines)])];
+      const out = await runCommand(argv, { timeoutMs: HERDR_TIMEOUT_MS });
+      if (out.exitCode !== 0) throw new Error(`herdr agent read ${p.target} exited ${out.exitCode}: ${out.stderr.trim()}`);
+      return { type: "pane_read", read: { text: out.stdout, pane_id: p.target, source: p.source } } as unknown as Awaited<ReturnType<AgentApi["read"]>>;
+    },
+    sendKeys: async (p) => (await herdrResult(runCommand, ["herdr", "agent", "send-keys", p.target, ...p.keys])) as unknown as Awaited<ReturnType<AgentApi["sendKeys"]>>,
+  };
+  return { agent };
+}
+
+/** This host's permission prompts: every herdr pane running claude. Legacy `claude --bg` sessions have no pane to read. */
+export function herdrPermissions(runCommand: RunCommand): PermissionHost {
+  const client = herdrApprovalClient(runCommand);
+  return { list: () => listPendingPermissions(client) };
 }
 
 // Re-exported so bin.ts wires one module; the legacy lister stays reachable for diagnostics.

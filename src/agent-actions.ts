@@ -1141,3 +1141,14 @@ export async function attachTarget(deps: AgentActionDeps, directory: ClaimKey, r
   const state: AgentStoreState = loaded.status === "loaded" ? loaded.state : emptyAgentStore();
   return decideAttachTarget(state, directory, ref);
 }
+
+// --- resolve only (a query about an agent, whatever its state) --------------
+
+export type ResolveTargetResult = StoreMalformed | ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord };
+
+/** Resolves `<id|name>` in `directory` with the same refusals every verb gives, and decides nothing about its state. Read-only. */
+export async function resolveTarget(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<ResolveTargetResult> {
+  const loaded = await load(deps.agentsPath);
+  if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
+  return resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), directory, ref);
+}
