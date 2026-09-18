@@ -98,9 +98,15 @@ export function parseMcpSpec(spec: string): McpServerDeclaration | string {
 export const formatMcpSpec = (server: McpServerDeclaration): string => server.notifications ? server.name : `${server.name}${OPT_OUT}`;
 
 export interface ResolvedMcpAccess {
-  /** The declared servers the directory's `.mcp.json` actually configures, less any it explicitly disables. */
+  /**
+   * The declared servers the directory's `.mcp.json` actually configures, plus
+   * any parent-defined server the agent's declaration names (an explicit
+   * opt-in), less any the workspace explicitly disables.
+   */
   readonly servers: readonly McpServerDeclaration[];
-  /** Declared servers the directory's `.mcp.json` does not configure — dropped, and worth reporting. */
+  /** Of `servers`, those opted into by name from a parent `.mcp.json` rather than the directory's own. */
+  readonly fromParent: readonly string[];
+  /** Declared servers no `.mcp.json` here or above configures — dropped, and worth reporting. */
   readonly missing: readonly string[];
   /**
    * Servers only a PARENT directory's `.mcp.json` defines, not yet disabled
@@ -108,7 +114,8 @@ export interface ResolvedMcpAccess {
    * project" for them (measured: factory-dashboard, 2026-09-18). They are
    * disabled for this agent, never approved: a parent's entry is another
    * agent's (the parent directory's own), with its Rocket.Chat account and
-   * yappr identity, and approving it would have this agent speak as that one.
+   * yappr identity, and approving it would have this agent speak as that one
+   * — unless the agent's own declaration names it (`bakr <agent> mcp <name>`).
    */
   readonly inherited: readonly string[];
   readonly mcpConfigPath: string;
@@ -141,9 +148,11 @@ export function parseDisabledServers(contents: string | undefined): string[] {
  * The access one start carries: the agent's own declaration, or — when it has
  * none — every server the directory's `.mcp.json` configures, each subscribed
  * to; kept to the servers that `.mcp.json` configures, less any the
- * workspace explicitly disables. An empty declaration is an agent with no MCP
- * of its own — but servers a parent `.mcp.json` would still load are found
- * either way, so they can be disabled rather than prompt.
+ * workspace explicitly disables. A declaration may also name a server only a
+ * parent `.mcp.json` defines: that is the one way to opt in to one. An empty
+ * declaration is an agent with no MCP of its own — but servers a parent
+ * `.mcp.json` would still load are found either way, so they can be disabled
+ * rather than prompt.
  */
 export async function resolveMcpAccess(directory: string, deps: LaunchConfigDeps, declared?: readonly McpServerDeclaration[]): Promise<ResolvedMcpAccess> {
   const mcpConfigPath = mcpConfigPathFor(directory);
@@ -154,12 +163,15 @@ export async function resolveMcpAccess(directory: string, deps: LaunchConfigDeps
   for (const parent of parentDirsOf(directory)) {
     for (const name of parseMcpServerNames(await deps.readConfigFile(mcpConfigPathFor(parent)))) parentNames.add(name);
   }
-  const inherited = [...parentNames].filter((name) => !configured.has(name) && !disabled.has(name));
   const wanted = declared ?? configuredNames.map((name) => ({ name, notifications: true }));
+  const optedIn = new Set(wanted.map((server) => server.name).filter((name) => !configured.has(name) && parentNames.has(name)));
+  const inherited = [...parentNames].filter((name) => !configured.has(name) && !disabled.has(name) && !optedIn.has(name));
+  // An explicit disable in the workspace's own settings wins: such a server is neither approved nor subscribed.
+  const servers = wanted.filter((server) => (configured.has(server.name) || optedIn.has(server.name)) && !disabled.has(server.name));
   return {
-    // An explicit disable in the workspace's own settings wins: such a server is neither approved nor subscribed.
-    servers: wanted.filter((server) => configured.has(server.name) && !disabled.has(server.name)),
-    missing: wanted.filter((server) => !configured.has(server.name)).map((server) => server.name),
+    servers,
+    fromParent: servers.map((server) => server.name).filter((name) => optedIn.has(name)),
+    missing: wanted.filter((server) => !configured.has(server.name) && !optedIn.has(server.name)).map((server) => server.name),
     inherited,
     mcpConfigPath,
   };
@@ -175,8 +187,10 @@ export async function resolveMcpAccess(directory: string, deps: LaunchConfigDeps
 export function launchInputsFor(access: ResolvedMcpAccess): ProviderLaunchInputs {
   const subscribed = access.servers.filter((server) => server.notifications).map((server) => server.name);
   if (access.servers.length === 0) return {};
+  // Claude finds a parent's servers itself; `--mcp-config` names only the directory's own file, which may not exist.
+  const ownConfig = access.servers.some((server) => !access.fromParent.includes(server.name));
   return {
-    mcpConfigPath: access.mcpConfigPath,
+    ...(ownConfig ? { mcpConfigPath: access.mcpConfigPath } : {}),
     mcpServersApproved: access.servers.map((server) => server.name),
     ...(subscribed.length === 0 ? {} : { mcpNotificationServers: subscribed }),
   };
@@ -218,7 +232,7 @@ async function disableInherited(directory: string, names: readonly string[], dep
     const current = settings as Record<string, unknown>;
     const disabled = [...new Set([...parseDisabledServers(JSON.stringify(current)), ...names])];
     await io.writeSettings(path, `${JSON.stringify({ ...current, disabledMcpjsonServers: disabled }, null, 2)}\n`);
-    deps.warn?.(`${directory}: disabled ${names.join(", ")} for this agent — defined only by a parent directory's .mcp.json (another agent's config); to use one, give this agent its own entry in ${mcpConfigPathFor(directory)}`);
+    deps.warn?.(`${directory}: disabled ${names.join(", ")} for this agent — defined only by a parent directory's .mcp.json (another agent's config); to use one, give this agent its own entry in ${mcpConfigPathFor(directory)}, or opt in by name with \`bakr <agent> mcp <name>\``);
   } catch (err) {
     deps.warn?.(`${directory}: could not disable parent-defined MCP server(s) ${names.join(", ")} (${err instanceof Error ? err.message : String(err)}); the session may stop at an approval prompt`);
   }

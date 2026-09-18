@@ -233,6 +233,25 @@ describe("servers only a parent directory's .mcp.json defines", () => {
     expect(io.files[settingsPath(DIR)]).toBe(JSON.stringify({ disabledMcpjsonServers: ["rocketr", "yappr"] }));
   });
 
+  test("an agent opts in to a parent's server only by naming it in its own declaration", async () => {
+    const DIR = `${FACTORY}/agent`;
+    const io = memorySettings();
+    const args = await claudeLaunchArgs(DIR, deps({ settingsIo: io, files: { [`${FACTORY}/.mcp.json`]: PARENT_MCP } }), [{ name: "yappr", notifications: true }]);
+    expect(args).toContain("--dangerously-load-development-channels=server:yappr");
+    expect(args.join(" ")).not.toContain("rocketr");
+    // Claude finds the parent's file itself; there is no own .mcp.json to name.
+    expect(args).not.toContain("--mcp-config");
+    expect(settingsOf(io, DIR)).toEqual({ enabledMcpjsonServers: ["yappr"], disabledMcpjsonServers: ["rocketr"] });
+  });
+
+  test("a declared name that no .mcp.json here or above defines is still reported missing", async () => {
+    const DIR = `${FACTORY}/agent`;
+    const warnings: string[] = [];
+    const args = await claudeLaunchArgs(DIR, deps({ settingsIo: memorySettings(), warn: (m) => warnings.push(m), files: { [`${FACTORY}/.mcp.json`]: PARENT_MCP } }), [{ name: "atlassian", notifications: true }]);
+    expect(args).toEqual([]);
+    expect(warnings.join("\n")).toContain("atlassian are declared but not configured");
+  });
+
   test("an unreadable settings file is reported, not overwritten", async () => {
     const DIR = `${FACTORY}/agent`;
     const io = memorySettings({ [settingsPath(DIR)]: "{ not json" });
