@@ -31,6 +31,6 @@
     "bun": ">=1.3.11"
   },
   "dependencies": {
-    "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.10.0/brooswit-drovr-0.10.0.tgz"
+    "@brooswit/drovr": "https://github.com/brooswit-factory/drovr/releases/download/v0.10.3/brooswit-drovr-0.10.3.tgz"
   }
 }
