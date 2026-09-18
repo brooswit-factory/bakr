@@ -258,7 +258,52 @@ describe("servers only a parent directory's .mcp.json defines", () => {
     const warnings: string[] = [];
     await claudeLaunchArgs(DIR, deps({ settingsIo: io, warn: (m) => warnings.push(m), files: { [`${FACTORY}/.mcp.json`]: PARENT_MCP } }));
     expect(io.files[settingsPath(DIR)]).toBe("{ not json");
-    expect(warnings.join("\n")).toContain("could not disable");
+    expect(warnings.join("\n")).toContain("could not update disabled");
+  });
+
+  // thatch's review of #32: moved with no yappr of its own, then given one.
+  test("a disable bakr wrote is lifted once the agent defines that server itself", async () => {
+    const THATCH = `/home/op/code/brooswit/thatch`;
+    const io = memorySettings({ [settingsPath(THATCH)]: JSON.stringify({ enableAllProjectMcpServers: true }) });
+    const files: Record<string, string> = {
+      "/home/op/code/brooswit/.mcp.json": PARENT_MCP,
+      [`${THATCH}/.mcp.json`]: JSON.stringify({ mcpServers: { rocketr: {} } }),
+    };
+    await claudeLaunchArgs(THATCH, deps({ settingsIo: io, files }));
+    expect(settingsOf(io, THATCH).disabledMcpjsonServers).toEqual(["yappr"]);
+
+    files[`${THATCH}/.mcp.json`] = JSON.stringify({ mcpServers: { rocketr: {}, yappr: {} } });
+    const warnings: string[] = [];
+    const args = await claudeLaunchArgs(THATCH, deps({ settingsIo: io, files, warn: (m) => warnings.push(m) }));
+    // FALSIFIER: without bakr's record, the old disable wins and thatch's own yappr never loads.
+    expect(args).toContain("--dangerously-load-development-channels=server:yappr");
+    expect(settingsOf(io, THATCH).disabledMcpjsonServers).toEqual([]);
+    expect(settingsOf(io, THATCH).enabledMcpjsonServers).toContain("yappr");
+    expect(settingsOf(io, THATCH).enableAllProjectMcpServers).toBe(true);
+    expect(JSON.parse(io.files[`${THATCH}/.claude/bakr-disabled-mcp.json`]!)).toEqual([]);
+    expect(warnings.join("\n")).toContain("re-enabled yappr");
+  });
+
+  test("a disable bakr wrote is lifted when the agent opts in to the parent's server by name", async () => {
+    const DIR = `${FACTORY}/agent`;
+    const io = memorySettings();
+    const files = { [`${FACTORY}/.mcp.json`]: PARENT_MCP };
+    await claudeLaunchArgs(DIR, deps({ settingsIo: io, files }));
+    expect(settingsOf(io, DIR).disabledMcpjsonServers).toEqual(["rocketr", "yappr"]);
+    const args = await claudeLaunchArgs(DIR, deps({ settingsIo: io, files }), [{ name: "yappr", notifications: true }]);
+    expect(args).toContain("--dangerously-load-development-channels=server:yappr");
+    expect(settingsOf(io, DIR).disabledMcpjsonServers).toEqual(["rocketr"]);
+  });
+
+  test("a person's disable is never lifted, even when the agent defines the server", async () => {
+    const DIR = `${FACTORY}/agent`;
+    const io = memorySettings({
+      [settingsPath(DIR)]: JSON.stringify({ disabledMcpjsonServers: ["yappr"] }),
+      [`${DIR}/.claude/bakr-disabled-mcp.json`]: JSON.stringify(["rocketr"]),
+    });
+    const args = await claudeLaunchArgs(DIR, deps({ settingsIo: io, files: { [`${DIR}/.mcp.json`]: JSON.stringify({ mcpServers: { yappr: {} } }) } }));
+    expect(args).toEqual([]);
+    expect(settingsOf(io, DIR).disabledMcpjsonServers).toEqual(["yappr"]);
   });
 
   test("parents are every directory above, nearest first, up to the root", () => {
