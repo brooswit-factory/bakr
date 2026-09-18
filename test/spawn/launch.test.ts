@@ -13,7 +13,9 @@ describe("launch (herdr)", () => {
     const host = makeFakeHost();
     const r = await launch(DIR, ["--mcp-config", `${DIR}/.mcp.json`], { runCommand: host.runCommand, label: "@rocketr", mintSessionId: () => "fixed-session", ...instant() });
     expect(r).toEqual({ ok: true, id: "w1:p1", sessionId: "fixed-session" });
-    expect(host.calls[0]).toEqual(["herdr", "workspace", "create", "--cwd", DIR, "--label", "bakr @rocketr", "--no-focus"]);
+    // Hosted by drovr (BAKR-37): the workspace carries drovr's label for this agent, `drovr bakr-<id>`.
+    expect(host.calls.find((c) => c[1] === "workspace" && c[2] === "create")).toEqual(["herdr", "workspace", "create", "--cwd", DIR, "--label", "drovr bakr-rocketr", "--no-focus"]);
+    expect(host.panes[0]!.name).toBe("bakr-rocketr");
     // FALSIFIER: a fresh launch names its own session, so its id is known before claude prints anything.
     expect(host.starts()).toEqual([["--session-id", "fixed-session", "--mcp-config", `${DIR}/.mcp.json`]]);
     expect(host.calls.some((c) => c.includes("--bg") || c[0] === "systemd-run")).toBe(false);
@@ -60,11 +62,23 @@ describe("launch (herdr)", () => {
     const host = makeFakeHost();
     const a = await launch("/d/a", [], { runCommand: host.runCommand, label: "@n0y45b5r4f2ydey7nc", ...instant() });
     const b = await launch("/d/b", [], { runCommand: host.runCommand, label: "@tmbqd7bkew6d3xf6p4", ...instant() });
-    const c = await launch("/d/c", [], { runCommand: host.runCommand, label: "@n0y45b5r4f2ydey7nc", ...instant() });
-    expect([a.ok, b.ok, c.ok]).toEqual([true, true, true]);
+    expect([a.ok, b.ok]).toEqual([true, true]);
     const names = host.panes.map((p) => p.name);
-    expect(new Set(names).size).toBe(3);
+    expect(new Set(names).size).toBe(2);
     for (const name of names) expect(name).toMatch(/^[a-z][a-z0-9_-]{0,31}$/);
+  });
+
+  // Ported (BAKR-37): bakr's own host suffixed each name with the workspace id so a second pane of the SAME agent
+  // could start beside a stale one. drovr's label is the agent's own, and it refuses a second pane under a name a
+  // live pane holds, before creating anything: two panes can no longer run one agent.
+  test("a second pane for an agent whose pane is still open is refused, naming the pane that holds it, and nothing is created", async () => {
+    const host = makeFakeHost();
+    const a = await launch("/d/a", [], { runCommand: host.runCommand, label: "@n0y45b5r4f2ydey7nc", ...instant() });
+    const again = await launch("/d/c", [], { runCommand: host.runCommand, label: "@n0y45b5r4f2ydey7nc", ...instant() });
+    expect(again.ok).toBe(false);
+    if (!again.ok && a.ok) expect(again.error).toBe(`label-taken: pane ${a.id} already holds the herdr agent name bakr-n0y45b5r4f2ydey7nc`);
+    expect(host.panes).toHaveLength(1);
+    expect(host.calls.filter((c) => c[1] === "workspace" && c[2] === "create")).toHaveLength(1);
   });
 
   test("a fresh workspace whose shell is not ready yet is started once it is, not abandoned", async () => {
@@ -75,11 +89,13 @@ describe("launch (herdr)", () => {
     expect(host.stops()).toEqual([]);
   });
 
-  test("a shell that never becomes ready gives up with herdr's reason and closes the workspace", async () => {
+  // Ported (BAKR-37): drovr's startManagedAgent gives up with its own shell-readiness error (attempts, elapsed,
+  // the pane's processes), not herdr's last refusal text.
+  test("a shell that never becomes ready gives up and closes the workspace", async () => {
     const host = makeFakeHost({ shellNotReadyTimes: 1_000 });
     const r = await launch(DIR, [], { runCommand: host.runCommand, label: "@a", ...instant() });
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("not an available shell");
+    if (!r.ok) expect(r.error).toContain("Agent shell readiness expired");
     expect(host.panes).toEqual([]);
   });
 });

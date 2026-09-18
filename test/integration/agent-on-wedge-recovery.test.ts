@@ -46,7 +46,7 @@ async function makeTempDir(): Promise<string> {
 }
 
 const isListing = (argv: string[]): boolean =>
-  (argv[0] === "herdr" && argv[1] === "agent" && argv[2] === "list") || (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "process-info") || (argv[0] === "claude" && argv[1] === "agents");
+  (argv[0] === "herdr" && argv[1] === "agent" && argv[2] === "list") || (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "list") || (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "process-info") || (argv[0] === "claude" && argv[1] === "agents");
 const isStop = (argv: string[]): boolean => (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "close") || (argv[0] === "claude" && argv[1] === "stop");
 
 /** An empty fake host that only answers listings. Armed to THROW on any stop — a workspace close or `claude stop` (B7/B13's loop-never-stops-or-clears falsifier) — so a daemon cycle that ever tried would fail this test loudly rather than silently passing; any launch (a workspace create or agent start) throws too. */

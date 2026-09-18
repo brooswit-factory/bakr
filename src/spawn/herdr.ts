@@ -6,19 +6,38 @@
 // frame as a turn, while the same session resumed in a terminal pane — the
 // confirmation answered — receives yappr and rocketr frames as live turns
 // (rocketr agent, session 517fd13a, 2026-09-18). The user's decision: agents
-// live in herdr panes, like butchr's. So `launch` creates a workspace, starts
-// claude in its root pane, answers the startup prompts a resident cannot, and
-// waits for the idle input box; `list` reads herdr's own agent registry; a
-// restore is `claude --resume <session>` in a new pane, carrying the agent's
-// CURRENT flags every time.
+// live in herdr panes, like butchr's.
 //
-// INTERIM: answering startup prompts belongs to drovr (proposed
-// `hostResident`). This module keeps the same shape so it can be swapped for
-// drovr's host without touching daemon.ts or agent-actions.ts. Every command
-// goes through the injected RunCommand, as in the rest of spawn/.
+// Hosting is drovr's (BAKR-37): `herdrLaunch` is drovr's `hostResident`,
+// `herdrList` reads drovr's `listResidents` (with the provider pid it
+// reports), `herdrStop` is drovr's `stopResident` — all through a
+// DrovrClient over the herdr CLI (herdr-cli-client.ts), so every command
+// still goes through the injected RunCommand, as in the rest of spawn/.
+// launch.ts, list.ts and stop.ts keep their shapes, so daemon.ts and
+// agent-actions.ts do not change.
+//
+// What stays bakr's own, and why:
+//   - Panes bakr started before drovr hosted them (workspace `bakr <id>`,
+//     agent name `bakr-<id>-<ws>`) are adopted, never restarted: the listing
+//     still finds every Claude pane herdr runs by its session id, and a stop
+//     of one drovr does not host closes its workspace as before. A relaunch
+//     moves an agent onto drovr's host.
+//   - Every Claude pane herdr runs is listed, not only drovr's: a session
+//     running in a pane bakr did not start is still alive, and the daemon
+//     must not restore it a second time (the double-restore guard, kept
+//     until DROVR-13 lands).
+//   - A fork (`--resume <s> --fork-session`) is started by bakr's own loop
+//     below: drovr's HostResidentRequest can resume a session or name a
+//     fresh one, not fork one.
+//   - drovr always adds `--permission-mode bypassPermissions`; bakr has never
+//     launched with a permission mode, and whether its agents should is an
+//     open decision on BAKR-37, not this change's to make. Until drovr takes a
+//     permission mode on the request, that flag is removed from the start.
 
 import { randomUUID } from "node:crypto";
+import { buildProviderLaunchArgs, hostResident, listResidents, RESIDENT_WORKSPACE_PREFIX, stopResident, type ProviderLaunchInputs } from "@brooswit/drovr";
 import type { RunCommand } from "./exec";
+import { drovrClientOverCli } from "./herdr-cli-client";
 import type { BackgroundSessionInfo } from "./parse";
 
 const HERDR_TIMEOUT_MS = 15_000;
@@ -161,12 +180,14 @@ export type HerdrLaunchResult =
   | { readonly ok: false; readonly error: string };
 
 /**
- * Starts claude with `claudeArgs` in a new herdr workspace rooted at `dir`,
+ * bakr's own host, now only for a fork, which drovr's request cannot express:
+ * starts claude with `claudeArgs` in a new herdr workspace rooted at `dir`,
  * answers its startup prompts, and returns the pane id once the input box is
  * idle. A launch that cannot reach idle closes its workspace — no half-started
  * pane is left holding an MCP identity — and fails with the screen excerpt.
+ * Its prompt classifier and ready loop go with BAKR-40, once drovr can fork.
  */
-export async function herdrLaunch(dir: string, claudeArgs: readonly string[], label: string, deps: HerdrDeps): Promise<HerdrLaunchResult> {
+export async function launchOutsideDrovr(dir: string, claudeArgs: readonly string[], label: string, deps: HerdrDeps): Promise<HerdrLaunchResult> {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? Date.now;
   const created = await herdr(deps, buildWorkspaceCreateArgv(dir, label));
@@ -221,14 +242,16 @@ export async function herdrLaunch(dir: string, claudeArgs: readonly string[], la
   }
 }
 
-/** Every Claude pane herdr runs, as the rest of bakr reads a session listing: `id` is the pane id. */
-export async function herdrList(deps: HerdrDeps): Promise<BackgroundSessionInfo[]> {
-  const listed = await herdr(deps, ["herdr", "agent", "list"]);
-  if (!listed.ok) throw new Error(`\`herdr agent list\` failed: ${listed.message}`);
+/**
+ * The Claude panes in one `herdr agent list` that drovr does not host, as the
+ * rest of bakr reads a session listing: `id` is the pane id. A pane with no
+ * session herdr can name is skipped, as it always was.
+ */
+async function otherClaudePanes(agentList: Record<string, unknown>, residentPanes: ReadonlySet<string>, deps: HerdrDeps): Promise<BackgroundSessionInfo[]> {
   const sessions: BackgroundSessionInfo[] = [];
-  for (const agent of parseAgentList(listed.result)) {
+  for (const agent of parseAgentList(agentList)) {
     const session = agent.agent_session?.value;
-    if (typeof session !== "string") continue;
+    if (typeof session !== "string" || residentPanes.has(agent.pane_id)) continue;
     const info = await herdr(deps, ["herdr", "pane", "process-info", "--pane", agent.pane_id]);
     sessions.push({
       id: agent.pane_id,
@@ -243,10 +266,209 @@ export async function herdrList(deps: HerdrDeps): Promise<BackgroundSessionInfo[
 }
 
 /** Closes the pane's whole workspace: the claude process ends, its transcript stays for a later `--resume`. */
-export async function herdrStop(paneId: string, deps: HerdrDeps): Promise<{ ok: true } | { ok: false; error: string }> {
+async function closePaneWorkspace(paneId: string, deps: HerdrDeps): Promise<{ ok: true } | { ok: false; error: string }> {
   const workspaceId = paneId.includes(":") ? paneId.slice(0, paneId.indexOf(":")) : undefined;
   const closed = workspaceId === undefined
     ? await herdr(deps, ["herdr", "pane", "close", paneId])
     : await herdr(deps, ["herdr", "workspace", "close", workspaceId]);
   return closed.ok ? { ok: true } : { ok: false, error: closed.message };
+}
+
+// --- Hosting through drovr ---------------------------------------------------
+
+/**
+ * The drovr label for a bakr agent: `bakr-` and its id without the `@`. drovr
+ * makes the label the pane's herdr agent name and its workspace
+ * `drovr <label>`, so it follows herdr's name rule (1-32 lowercase letters,
+ * digits, `-`, `_`); an agent id (`@` + 18 lowercase base32) gives 23.
+ * One label per agent: drovr refuses a second pane under a name a live pane
+ * already holds (`label-taken`), so two panes can never run one agent.
+ */
+export const residentLabelFor = (label: string): string =>
+  `bakr-${label.toLowerCase().replace(/[^a-z0-9_-]/g, "") || "agent"}`.slice(0, 32);
+
+const DEVELOPMENT_CHANNELS = "--dangerously-load-development-channels=";
+
+export type ResidentLaunch =
+  | { readonly ok: true; readonly resume?: string; readonly sessionId?: string; readonly model?: string; readonly inputs: ProviderLaunchInputs }
+  | { readonly ok: false; readonly error: string };
+
+/**
+ * Reads a launch's claude argv back into drovr's request. bakr's flags come
+ * from drovr's own `buildProviderLaunchArgs` (launch-config.ts), so they read
+ * back exactly; the check below rebuilds them and refuses any argv that would
+ * not come out the same, so nothing a caller asked for is ever dropped
+ * silently on the way into `hostResident`.
+ */
+export function residentLaunchFrom(claudeArgs: readonly string[]): ResidentLaunch {
+  let resume: string | undefined;
+  let sessionId: string | undefined;
+  let model: string | undefined;
+  let mcpConfigPath: string | undefined;
+  let approved: string[] | undefined;
+  const channels: string[] = [];
+  const provider: string[] = [];
+  for (let i = 0; i < claudeArgs.length; i++) {
+    const arg = claudeArgs[i]!;
+    const value = claudeArgs[i + 1];
+    const takesValue = ["--resume", "--session-id", "--model", "--mcp-config", "--settings"].includes(arg);
+    if (takesValue && value === undefined) return { ok: false, error: `claude argument ${arg} has no value` };
+    if (arg === "--resume") resume = value;
+    else if (arg === "--session-id") sessionId = value;
+    else if (arg === "--model") model = value;
+    else if (arg === "--mcp-config") { mcpConfigPath = value; provider.push(arg, value!); }
+    else if (arg === "--settings") {
+      const servers = approvedServersIn(value!);
+      if (servers === undefined) return { ok: false, error: `drovr's hostResident cannot carry --settings ${value}: only an enabledMcpjsonServers approval is carried` };
+      approved = servers;
+      provider.push(arg, value!);
+    } else if (arg.startsWith(DEVELOPMENT_CHANNELS)) { channels.push(arg.slice(DEVELOPMENT_CHANNELS.length)); provider.push(arg); }
+    else return { ok: false, error: `drovr's hostResident cannot carry the claude argument ${arg}` };
+    if (takesValue) i++;
+  }
+  if (resume !== undefined && sessionId !== undefined) return { ok: false, error: "a launch cannot both --resume a session and name a new one with --session-id" };
+  const inputs: ProviderLaunchInputs = {
+    ...(mcpConfigPath === undefined ? {} : { mcpConfigPath }),
+    ...(approved === undefined ? {} : { mcpServersApproved: approved }),
+    ...(channels.length === 0 ? {} : { developmentChannels: channels }),
+  };
+  const rebuilt = buildProviderLaunchArgs("claude", inputs);
+  if (JSON.stringify(rebuilt) !== JSON.stringify(provider)) {
+    return { ok: false, error: `drovr would start claude with ${JSON.stringify(rebuilt)} where bakr asked for ${JSON.stringify(provider)}` };
+  }
+  return {
+    ok: true,
+    inputs,
+    ...(resume === undefined ? {} : { resume }),
+    ...(sessionId === undefined ? {} : { sessionId }),
+    ...(model === undefined ? {} : { model }),
+  };
+}
+
+/** The servers a `--settings` value approves, when that is all it says. */
+function approvedServersIn(settings: string): string[] | undefined {
+  try {
+    const parsed = JSON.parse(settings) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const keys = Object.keys(parsed);
+    const servers = (parsed as { enabledMcpjsonServers?: unknown }).enabledMcpjsonServers;
+    if (keys.length !== 1 || !Array.isArray(servers) || !servers.every((s) => typeof s === "string")) return undefined;
+    return servers as string[];
+  } catch {
+    return undefined;
+  }
+}
+
+type HostClient = Parameters<typeof hostResident>[0];
+
+/**
+ * INTERIM, until drovr's request takes a permission mode (see the banner):
+ * the client `hostResident` starts claude through, minus the
+ * `--permission-mode bypassPermissions` drovr adds to every start.
+ */
+export function withoutForcedPermissionMode(client: HostClient): HostClient {
+  return {
+    ...client,
+    agent: {
+      list: () => client.agent.list(),
+      get: (target) => client.agent.get(target),
+      read: (p) => client.agent.read(p),
+      sendKeys: (p) => client.agent.sendKeys(p),
+      prompt: (p) => client.agent.prompt(p),
+      start: (p) => client.agent.start({ ...p, args: withoutPermissionMode(p.args ?? []) }),
+    },
+  };
+}
+
+export function withoutPermissionMode(args: readonly string[]): string[] {
+  const at = args.findIndex((arg, i) => arg === "--permission-mode" && args[i + 1] === "bypassPermissions");
+  return at < 0 ? [...args] : [...args.slice(0, at), ...args.slice(at + 2)];
+}
+
+/**
+ * Starts claude with `claudeArgs` in `dir` through drovr's `hostResident`,
+ * under this agent's own label, and returns the pane id once drovr has
+ * answered its startup prompts and seen the input box ready. A launch drovr
+ * refuses fails with drovr's reason, and the screen excerpt when there is one;
+ * drovr has already closed any workspace it created.
+ */
+export async function herdrLaunch(dir: string, claudeArgs: readonly string[], label: string, deps: HerdrDeps): Promise<HerdrLaunchResult> {
+  if (claudeArgs.includes("--fork-session")) return launchOutsideDrovr(dir, claudeArgs, label, deps);
+  const request = residentLaunchFrom(claudeArgs);
+  if (!request.ok) return request;
+  const now = deps.now ?? Date.now;
+  const wait = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const mint = request.sessionId === undefined ? deps.mintSessionId ?? randomUUID : () => request.sessionId!;
+  const hosted = await hostResident(withoutForcedPermissionMode(drovrClientOverCli(deps.runCommand)), {
+    provider: "claude",
+    cwd: dir,
+    label: residentLabelFor(label),
+    inputs: request.inputs,
+    ...(request.resume === undefined ? {} : { resume: request.resume }),
+    ...(request.model === undefined ? {} : { model: request.model }),
+  }, {
+    readyTimeoutMs: READY_TIMEOUT_MS,
+    pollIntervalMs: READY_POLL_MS,
+    cleanReadsWithoutSession: READY_CONFIRM_POLLS,
+    startTimeoutMs: AGENT_START_TIMEOUT_MS,
+    startOptions: { readinessTimeoutMs: SHELL_READY_TIMEOUT_MS, now, wait },
+    now,
+    wait,
+    mintSessionId: mint,
+  });
+  if (hosted.ok) return { ok: true, id: hosted.paneId, sessionId: hosted.sessionId };
+  return { ok: false, error: `${hosted.reason}: ${hosted.detail}${hosted.excerpt === undefined ? "" : `:\n${hosted.excerpt}`}` };
+}
+
+/**
+ * Every Claude pane herdr runs, as the rest of bakr reads a session listing:
+ * `id` is the pane id. drovr's residents come from `listResidents`, with the
+ * provider pid it reports; every other Claude pane — one bakr started before
+ * drovr hosted it, or one nobody here started — is listed as before, so a
+ * session alive anywhere is never restored a second time.
+ */
+export async function herdrList(deps: HerdrDeps): Promise<BackgroundSessionInfo[]> {
+  const client = drovrClientOverCli(deps.runCommand);
+  // One `herdr agent list` per listing: drovr's residents and every other pane come from the same read.
+  const agents = client.agent.list();
+  const [residents, agentList] = await Promise.all([listResidents(sharingAgentList(client, agents)), agents]);
+  const hosted: BackgroundSessionInfo[] = [];
+  for (const resident of residents) {
+    if (resident.provider !== "claude" || resident.sessionId === undefined) continue;
+    hosted.push({ id: resident.paneId, sessionId: resident.sessionId, cwd: resident.cwd ?? "", startedAt: 0, pid: resident.pid, state: stateOf(resident.status) });
+  }
+  const residentPanes = new Set(residents.map((resident) => resident.paneId));
+  return [...hosted, ...await otherClaudePanes(agentList as unknown as Record<string, unknown>, residentPanes, deps)];
+}
+
+/** `client`, with `agent.list` answered by one listing already in hand. */
+function sharingAgentList(client: HostClient, agents: ReturnType<HostClient["agent"]["list"]>): HostClient {
+  return {
+    ...client,
+    agent: {
+      list: () => agents,
+      get: (target) => client.agent.get(target),
+      read: (p) => client.agent.read(p),
+      sendKeys: (p) => client.agent.sendKeys(p),
+      prompt: (p) => client.agent.prompt(p),
+      start: (p) => client.agent.start(p),
+    },
+  };
+}
+
+/**
+ * Closes the pane's whole workspace: the claude process ends, its transcript
+ * stays for a later `--resume`. A pane in a workspace drovr hosts is stopped
+ * by drovr's `stopResident`; any other (one bakr started before drovr hosted
+ * it) has its workspace closed exactly as before, so adopting a pane never
+ * changes how it is stopped.
+ */
+export async function herdrStop(paneId: string, deps: HerdrDeps): Promise<{ ok: true } | { ok: false; error: string }> {
+  const client = drovrClientOverCli(deps.runCommand);
+  const workspaceId = paneId.includes(":") ? paneId.slice(0, paneId.indexOf(":")) : undefined;
+  const { workspaces } = await client.workspace.list();
+  const drovrHosts = workspaces.some((workspace) => workspace.workspace_id === workspaceId && workspace.label.startsWith(RESIDENT_WORKSPACE_PREFIX));
+  if (!drovrHosts) return closePaneWorkspace(paneId, deps);
+  const stopped = await stopResident(client, paneId);
+  return stopped.ok ? { ok: true } : { ok: false, error: `${stopped.reason}: ${stopped.detail}` };
 }

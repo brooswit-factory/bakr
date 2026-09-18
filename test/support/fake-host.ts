@@ -99,6 +99,12 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
       panes.push({ paneId, workspaceId: `w${workspace}`, cwd, sessionId: "", args: [], status: "idle", pid: undefined, label });
       return reply({ type: "workspace_created", workspace: { workspace_id: `w${workspace}`, label }, root_pane: { pane_id: paneId, cwd } });
     }
+    if (group === "workspace" && verb === "list") {
+      if (failing()) throw new Error("simulated listing failure");
+      const seen = new Map<string, string>();
+      for (const p of panes) if (!seen.has(p.workspaceId)) seen.set(p.workspaceId, p.label);
+      return reply({ type: "workspace_list", workspaces: [...seen].map(([workspace_id, label]) => ({ workspace_id, label })) });
+    }
     if (group === "workspace" && verb === "close") {
       if (opts.failStop) return refuse("close_failed", "workspace close refused");
       const id = argv[3];
@@ -117,7 +123,8 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
       if (holder) return refuse("agent_name_in_use", `agent name ${name} is already used; candidates: pane_id=${holder.paneId}`);
       if (shellNotReady > 0) {
         shellNotReady -= 1;
-        return refuse("pane_not_shell", `agent target pane ${paneId} is not an available shell`);
+        // herdr 0.8.2's own code and text for it, measured 2026-09-18 on a pane whose shell was busy.
+        return refuse("agent_pane_busy", `agent target pane ${paneId} is not an available shell`);
       }
       pane.name = name;
       const args = argv.slice(argv.indexOf("--") + 1);
@@ -145,15 +152,16 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
     if (group === "pane" && verb === "process-info") {
       const pane = paneFor(argv[argv.indexOf("--pane") + 1]!);
       if (!pane) return refuse("pane_not_found", "no such pane");
-      return reply({ type: "process_info", process_info: { foreground_processes: pane.pid === undefined ? [] : [{ pid: pane.pid, name: "claude", argv: ["claude", ...pane.args] }] } });
+      // `pane_process_info` is herdr 0.8.2's own tag (measured 2026-09-18); drovr's listResidents reads the pid only under it.
+      return reply({ type: "pane_process_info", process_info: { foreground_processes: pane.pid === undefined ? [] : [{ pid: pane.pid, name: "claude", argv: ["claude", ...pane.args] }] } });
     }
     throw new Error(`fake host: unexpected herdr argv ${JSON.stringify(argv)}`);
   }
 
-  /** Puts a pane into the fake as if an earlier launch had started it. */
-  function addPane(p: { cwd: string; sessionId: string; status?: FakePane["status"]; pid?: number; args?: string[]; screen?: string }): FakePane {
+  /** Puts a pane into the fake as if an earlier launch had started it; `label` is its workspace's (e.g. `bakr @a1` for one bakr started before drovr hosted it). */
+  function addPane(p: { cwd: string; sessionId: string; status?: FakePane["status"]; pid?: number; args?: string[]; screen?: string; label?: string; name?: string }): FakePane {
     workspace += 1;
-    const pane: FakePane = { paneId: `w${workspace}:p1`, workspaceId: `w${workspace}`, cwd: p.cwd, sessionId: p.sessionId, args: p.args ?? [], status: p.status ?? "idle", pid: p.pid ?? process.pid, label: "", ...(p.screen === undefined ? {} : { screen: p.screen }) };
+    const pane: FakePane = { paneId: `w${workspace}:p1`, workspaceId: `w${workspace}`, cwd: p.cwd, sessionId: p.sessionId, args: p.args ?? [], status: p.status ?? "idle", pid: p.pid ?? process.pid, label: p.label ?? "", ...(p.name === undefined ? {} : { name: p.name }), ...(p.screen === undefined ? {} : { screen: p.screen }) };
     panes.push(pane);
     return pane;
   }
