@@ -35,7 +35,7 @@ import {
   type McpSettingsIo,
   type ProviderLaunchInputs,
 } from "@brooswit/drovr";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /** One server an agent may use, as bakr stores it. */
 export interface McpServerDeclaration {
@@ -98,28 +98,69 @@ export function parseMcpSpec(spec: string): McpServerDeclaration | string {
 export const formatMcpSpec = (server: McpServerDeclaration): string => server.notifications ? server.name : `${server.name}${OPT_OUT}`;
 
 export interface ResolvedMcpAccess {
-  /** The declared servers the directory's `.mcp.json` actually configures. */
+  /** The declared servers the directory's `.mcp.json` actually configures, less any it explicitly disables. */
   readonly servers: readonly McpServerDeclaration[];
   /** Declared servers the directory's `.mcp.json` does not configure — dropped, and worth reporting. */
   readonly missing: readonly string[];
+  /**
+   * Servers only a PARENT directory's `.mcp.json` defines, not yet disabled
+   * here. Claude loads those too and stops at "New MCP server found in this
+   * project" for them (measured: factory-dashboard, 2026-09-18). They are
+   * disabled for this agent, never approved: a parent's entry is another
+   * agent's (the parent directory's own), with its Rocket.Chat account and
+   * yappr identity, and approving it would have this agent speak as that one.
+   */
+  readonly inherited: readonly string[];
   readonly mcpConfigPath: string;
+}
+
+/** Every directory above `directory`, nearest first, up to the filesystem root. */
+export function parentDirsOf(directory: string): string[] {
+  const parents: string[] = [];
+  for (let dir = dirname(directory); ; dir = dirname(dir)) {
+    parents.push(dir);
+    if (dirname(dir) === dir) return parents;
+  }
+}
+
+/** The workspace settings file Claude reads approvals and disables from. */
+export const localSettingsPathFor = (directory: string): string => join(directory, ".claude", "settings.local.json");
+
+/** The servers a settings file explicitly disables (`disabledMcpjsonServers`); `[]` for anything unreadable. */
+export function parseDisabledServers(contents: string | undefined): string[] {
+  if (contents === undefined) return [];
+  try {
+    const disabled = (JSON.parse(contents) as { disabledMcpjsonServers?: unknown }).disabledMcpjsonServers;
+    return Array.isArray(disabled) ? disabled.filter((name): name is string => typeof name === "string") : [];
+  } catch {
+    return [];
+  }
 }
 
 /**
  * The access one start carries: the agent's own declaration, or — when it has
  * none — every server the directory's `.mcp.json` configures, each subscribed
- * to; kept to the servers that `.mcp.json` configures. An empty declaration
- * is an agent with no MCP at all, and reads nothing.
+ * to; kept to the servers that `.mcp.json` configures, less any the
+ * workspace explicitly disables. An empty declaration is an agent with no MCP
+ * of its own — but servers a parent `.mcp.json` would still load are found
+ * either way, so they can be disabled rather than prompt.
  */
 export async function resolveMcpAccess(directory: string, deps: LaunchConfigDeps, declared?: readonly McpServerDeclaration[]): Promise<ResolvedMcpAccess> {
   const mcpConfigPath = mcpConfigPathFor(directory);
-  if (declared !== undefined && declared.length === 0) return { servers: [], missing: [], mcpConfigPath };
   const configuredNames = parseMcpServerNames(await deps.readConfigFile(mcpConfigPath));
-  const wanted = declared ?? configuredNames.map((name) => ({ name, notifications: true }));
   const configured = new Set(configuredNames);
+  const disabled = new Set(parseDisabledServers(await (deps.settingsIo ?? realMcpSettingsIo).readSettings(localSettingsPathFor(directory)).catch(() => undefined)));
+  const parentNames = new Set<string>();
+  for (const parent of parentDirsOf(directory)) {
+    for (const name of parseMcpServerNames(await deps.readConfigFile(mcpConfigPathFor(parent)))) parentNames.add(name);
+  }
+  const inherited = [...parentNames].filter((name) => !configured.has(name) && !disabled.has(name));
+  const wanted = declared ?? configuredNames.map((name) => ({ name, notifications: true }));
   return {
-    servers: wanted.filter((server) => configured.has(server.name)),
+    // An explicit disable in the workspace's own settings wins: such a server is neither approved nor subscribed.
+    servers: wanted.filter((server) => configured.has(server.name) && !disabled.has(server.name)),
     missing: wanted.filter((server) => !configured.has(server.name)).map((server) => server.name),
+    inherited,
     mcpConfigPath,
   };
 }
@@ -151,12 +192,35 @@ export async function provisionMcpAccess(directory: string, access: ResolvedMcpA
   if (access.missing.length > 0) {
     deps.warn?.(`${directory}: MCP server(s) ${access.missing.join(", ")} are declared but not configured in ${access.mcpConfigPath}; the session starts without them`);
   }
+  if (access.inherited.length > 0) await disableInherited(directory, access.inherited, deps);
   if (access.servers.length === 0) return;
   const servers: McpServerAccess[] = access.servers.map((server) => ({ name: server.name, notifications: server.notifications }));
   try {
     await applyMcpAccess("claude", { servers, cwd: directory, runtime: "interactive" }, deps.settingsIo ?? realMcpSettingsIo);
   } catch (err) {
     deps.warn?.(`${directory}: could not write MCP approval for ${servers.map((s) => s.name).join(", ")} (${err instanceof Error ? err.message : String(err)}); the session may stop at an approval prompt`);
+  }
+}
+
+/**
+ * Adds `names` to the workspace's `disabledMcpjsonServers`, keeping every
+ * other setting. Never throws: a settings file that cannot be read as a JSON
+ * object is left alone and reported, since the start then stops at Claude's
+ * prompt exactly as it would have before.
+ */
+async function disableInherited(directory: string, names: readonly string[], deps: LaunchConfigDeps): Promise<void> {
+  const io = deps.settingsIo ?? realMcpSettingsIo;
+  const path = localSettingsPathFor(directory);
+  try {
+    const raw = await io.readSettings(path);
+    const settings = raw === undefined || raw.trim() === "" ? {} : JSON.parse(raw) as unknown;
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new Error(`${path} is not a JSON object`);
+    const current = settings as Record<string, unknown>;
+    const disabled = [...new Set([...parseDisabledServers(JSON.stringify(current)), ...names])];
+    await io.writeSettings(path, `${JSON.stringify({ ...current, disabledMcpjsonServers: disabled }, null, 2)}\n`);
+    deps.warn?.(`${directory}: disabled ${names.join(", ")} for this agent — defined only by a parent directory's .mcp.json (another agent's config); to use one, give this agent its own entry in ${mcpConfigPathFor(directory)}`);
+  } catch (err) {
+    deps.warn?.(`${directory}: could not disable parent-defined MCP server(s) ${names.join(", ")} (${err instanceof Error ? err.message : String(err)}); the session may stop at an approval prompt`);
   }
 }
 

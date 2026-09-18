@@ -5,6 +5,7 @@ import {
   formatMcpSpec,
   mcpConfigPathFor,
   parseMcpServerNames,
+  parentDirsOf,
   parseMcpSpec,
   provisionMcpFor,
   resolveMcpAccess,
@@ -182,5 +183,66 @@ describe("server specs on the command line", () => {
 
   test.each(["", "+notify", ":no-notify", "yappr+other", "a/b", "yappr notify", "../x", "yappr:quiet"])("%p is refused", (spec) => {
     expect(typeof parseMcpSpec(spec)).toBe("string");
+  });
+});
+
+// Measured 2026-09-18: Claude also loads `.mcp.json` from PARENT directories.
+// factory-dashboard has none of its own; ~/code/brooswit-factory/.mcp.json (the
+// manager's own config: rocketr as manage-brooswit-factory, yappr as
+// brooswit-factory) made its session stop at "New MCP server found in this
+// project: rocketr". A parent's server is another agent's identity: it is
+// disabled for this agent, never approved.
+describe("servers only a parent directory's .mcp.json defines", () => {
+  const FACTORY = "/home/op/code/brooswit-factory";
+  const PARENT_MCP = JSON.stringify({ mcpServers: { rocketr: { headers: { "x-rocketr-account": "manage-brooswit-factory" } }, yappr: {} } });
+  const settingsPath = (dir: string) => `${dir}/.claude/settings.local.json`;
+  const settingsOf = (io: { files: Record<string, string> }, dir: string) => JSON.parse(io.files[settingsPath(dir)] ?? "{}");
+
+  test("are disabled for the agent, never approved or subscribed, and other settings are kept", async () => {
+    const DASH = `${FACTORY}/factory-dashboard`;
+    const io = memorySettings({ [settingsPath(DASH)]: JSON.stringify({ permissions: { allow: ["Bash(ls)"] }, disabledMcpjsonServers: ["yappr"] }) });
+    const warnings: string[] = [];
+    const args = await claudeLaunchArgs(DASH, deps({ settingsIo: io, warn: (m) => warnings.push(m), files: { [`${FACTORY}/.mcp.json`]: PARENT_MCP } }));
+    // FALSIFIER: approving rocketr here would have factory-dashboard post to Rocket.Chat as the manager.
+    expect(args).toEqual([]);
+    expect(settingsOf(io, DASH)).toEqual({ permissions: { allow: ["Bash(ls)"] }, disabledMcpjsonServers: ["yappr", "rocketr"] });
+    expect(settingsOf(io, DASH).enabledMcpjsonServers).toBeUndefined();
+    expect(warnings.join("\n")).toContain("disabled rocketr");
+  });
+
+  test("the agent's own entry for the same server wins: it is approved and subscribed, never disabled", async () => {
+    const YAPPR = `${FACTORY}/yappr`;
+    const io = memorySettings();
+    const args = await claudeLaunchArgs(YAPPR, deps({ settingsIo: io, files: {
+      [`${FACTORY}/.mcp.json`]: PARENT_MCP,
+      [`${YAPPR}/.mcp.json`]: JSON.stringify({ mcpServers: { yappr: {} } }),
+    } }));
+    expect(args).toContain("--dangerously-load-development-channels=server:yappr");
+    expect(args.join(" ")).not.toContain("rocketr");
+    expect(settingsOf(io, YAPPR)).toEqual({ enabledMcpjsonServers: ["yappr"], disabledMcpjsonServers: ["rocketr"] });
+  });
+
+  test("a server the workspace already disables is left alone, and an explicit disable of its own server is respected", async () => {
+    const DIR = `${FACTORY}/agent`;
+    const io = memorySettings({ [settingsPath(DIR)]: JSON.stringify({ disabledMcpjsonServers: ["rocketr", "yappr"] }) });
+    const args = await claudeLaunchArgs(DIR, deps({ settingsIo: io, files: {
+      [`${FACTORY}/.mcp.json`]: PARENT_MCP,
+      [`${DIR}/.mcp.json`]: JSON.stringify({ mcpServers: { yappr: {} } }),
+    } }));
+    expect(args).toEqual([]);
+    expect(io.files[settingsPath(DIR)]).toBe(JSON.stringify({ disabledMcpjsonServers: ["rocketr", "yappr"] }));
+  });
+
+  test("an unreadable settings file is reported, not overwritten", async () => {
+    const DIR = `${FACTORY}/agent`;
+    const io = memorySettings({ [settingsPath(DIR)]: "{ not json" });
+    const warnings: string[] = [];
+    await claudeLaunchArgs(DIR, deps({ settingsIo: io, warn: (m) => warnings.push(m), files: { [`${FACTORY}/.mcp.json`]: PARENT_MCP } }));
+    expect(io.files[settingsPath(DIR)]).toBe("{ not json");
+    expect(warnings.join("\n")).toContain("could not disable");
+  });
+
+  test("parents are every directory above, nearest first, up to the root", () => {
+    expect(parentDirsOf("/home/op/code/x")).toEqual(["/home/op/code", "/home/op", "/home", "/"]);
   });
 });
