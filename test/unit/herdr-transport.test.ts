@@ -81,6 +81,25 @@ describe("permission prompts over herdr", () => {
     for (const read of reads) expect(read.slice(-2)).toEqual(["--format", "text"]);
   });
 
+  // lead-drovr, on BAKR-38: approvePermission also calls agent.get (for the
+  // audit's label and session) and agent.sendKeys (the answer itself).
+  test("agent.get and agent.sendKeys reach herdr as `agent get` and `agent send-keys <pane> <keys…>`", async () => {
+    const host = makeFakeHost();
+    const pane = host.addPane({ cwd: "/work", sessionId: "s-1", screen: permissionScreen("Bash command", ["ls"]) });
+    const client = herdrApprovalClient(host.runCommand);
+    const got = await client.agent.get(pane.paneId);
+    expect([got.agent.pane_id, got.agent.agent_session?.value]).toEqual([pane.paneId, "s-1"]);
+    await client.agent.sendKeys({ target: pane.paneId, keys: ["down", "enter"] });
+    expect(host.calls).toEqual([["herdr", "agent", "get", pane.paneId], ["herdr", "agent", "send-keys", pane.paneId, "down", "enter"]]);
+    expect(pane.answered).toEqual(["Yes, and always allow access to this directory from this project"]);
+  });
+
+  test("a herdr error from get or send-keys is thrown, never read as success", async () => {
+    const client = herdrApprovalClient(async () => ({ exitCode: 1, stdout: JSON.stringify({ error: { code: "agent_not_found", message: "no such agent" } }), stderr: "" }));
+    await expect(client.agent.get("w9:p1")).rejects.toThrow("herdr agent get: agent_not_found: no such agent");
+    await expect(client.agent.sendKeys({ target: "w9:p1", keys: ["enter"] })).rejects.toThrow("herdr agent send-keys: agent_not_found: no such agent");
+  });
+
   test("a herdr error is thrown, never read as an empty listing", async () => {
     const client = herdrApprovalClient(async () => ({ exitCode: 1, stdout: JSON.stringify({ error: { code: "server_unreachable", message: "no herdr" } }), stderr: "" }));
     await expect(client.agent.list()).rejects.toThrow("herdr agent list: server_unreachable: no herdr");
