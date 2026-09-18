@@ -8,7 +8,7 @@ import { save as saveClaims } from "../../src/claim-store-io";
 import { emptySessionSlots, beginLaunch, markLaunchStarted, resolveLaunch, markLaunchFailed, serializeSessionSlotsState } from "../../src/session-slots";
 import { save as saveAgents, load as loadAgents } from "../../src/agent-store-io";
 import { emptyAgentStore, putAgent, unresolvedLaunches, type AgentRecord } from "../../src/agent-model";
-import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
+import { initialDaemonState, runReconcileCycle, type DaemonDeps, type DaemonState } from "../../src/daemon";
 import type { ClaimKey } from "../../src/claim-key-resolve";
 import type { RunCommandOptions, CommandResult } from "../../src/spawn";
 import { makeFakeHost, type FakeHostOptions } from "../support/fake-host";
@@ -542,7 +542,14 @@ describe("regression (PR #7 review, ported): a crash mid-launch must not silentl
     const fake = makeNoStopHost();
     const deps = baseDeps(dir, fake.runCommand);
 
-    const result = await runReconcileCycle(initialDaemonState(), deps);
+    // BAKR-33: `isFirstCycle: false` — this test is about `promoteWedgedLaunches`
+    // making a crash mid-launch LOUD rather than silently lost (PR #7's own
+    // concern), not this ticket's separate first-cycle-since-restart
+    // exception (daemon-no-wedge-clear.test.ts): the freshly-promoted
+    // record's target is also "absent" here, which on an actual first cycle
+    // would legitimately supersede-and-restore it instead of leaving it
+    // blocked.
+    const result = await runReconcileCycle({ ...initialDaemonState(), isFirstCycle: false }, deps);
     expect(result.skippedListingFailed).toBe(false); // the listing succeeded — the zero launches below are the block, not a skipped cycle
 
     const reloadedAfter = await loadAgents(join(dir, "agents.json"));
@@ -603,7 +610,15 @@ describe("AC14: a given-up (errored) v1 launch record must keep blocking its mig
     const fake = makeNoStopHost(); // empty listing every cycle -> both agents look "absent", so the block is the only thing stopping a relaunch of the given-up one
     const deps = baseDeps(dir, fake.runCommand);
 
-    let state = initialDaemonState();
+    // BAKR-33: `isFirstCycle: false` from the start — this test is about
+    // migration correctly ATTRIBUTING the given-up record to the right
+    // agent (never a wrong one) and B13's steady-state block surviving
+    // that migration, which is a different, orthogonal question from this
+    // ticket's own first-cycle-since-restart exception (covered by
+    // daemon-no-wedge-clear.test.ts and launch-record-cleanup.test.ts). A
+    // migration that happened some time before THIS particular daemon run
+    // began is exactly this shape.
+    let state: DaemonState = { ...initialDaemonState(), isFirstCycle: false };
     let cycles: Awaited<ReturnType<typeof runReconcileCycle>>[] = [];
     for (let i = 0; i < 5; i++) {
       const result = await runReconcileCycle(state, deps);
@@ -749,9 +764,19 @@ describe("BAKR-24 Q4: report, don't launch — an orphaned claim's on-agents are
     console.log = (...args: unknown[]) => {
       capturedLines2.push(args.map(String).join(" "));
     };
+    // BAKR-33: NOT this process's first cycle (each call below opts out via
+    // `isFirstCycle: false`) — an actual first cycle would hit this ticket's
+    // OWN new exception (the target verifies `absent`, same as an agent
+    // whose pane genuinely vanished after a reboot) and legitimately
+    // supersede-and-restore this "healthy" agent, which is a different,
+    // already-covered behavior (see daemon-no-wedge-clear.test.ts), not
+    // what THIS negative control is testing (Q4's directory-classification
+    // suppression specifically). A steady-state daemon reaches this shape
+    // constantly; only its very first cycle ever does not.
+    const notFirstCycle = { ...initialDaemonState(), isFirstCycle: false };
     try {
-      await runReconcileCycle(initialDaemonState(), deps2);
-      await runReconcileCycle(initialDaemonState(), deps2);
+      await runReconcileCycle(notFirstCycle, deps2);
+      await runReconcileCycle(notFirstCycle, deps2);
     } finally {
       console.log = originalConsoleLog;
     }

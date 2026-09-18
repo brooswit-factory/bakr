@@ -552,11 +552,27 @@ export function hasLaunchRecordFor(state: AgentStoreState, agentId: string, atte
  * racing a resolution that is still coming, which is exactly the hazard
  * `hasLaunchRecordFor`'s guard exists to prevent (AC4).
  *
- * MUST be called only from an explicit, operator-initiated verb
- * (`agent-actions.ts`'s `on`) — never from `daemon.ts` or anything reachable
- * from its reconcile loop. B7 stays intact: "never retried automatically"
- * was written for an unattended loop; an operator who calls `on` again
- * after a launch demonstrably failed is not that.
+ * Historically (B13, BAKR-21): MUST be called only from an explicit,
+ * operator-initiated verb (`agent-actions.ts`'s `on`) — never from
+ * `daemon.ts` or anything reachable from its reconcile loop. B7's "never
+ * retried automatically" was written for an unattended loop; an operator
+ * who calls `on` again after a launch demonstrably failed is not that.
+ *
+ * AMENDED (BAKR-33, 2026-09-18, reviewer lead-bakr): `daemon.ts` MAY now
+ * call this too, but only through the ONE narrow, bounded door
+ * `decideAndBeginForAgent`'s respawn branch opens — gated on BOTH (a) this
+ * being the very first reconcile cycle since THIS PROCESS started
+ * (`DaemonState.isFirstCycle`), never any cycle after, and (b) a FRESH
+ * liveness check, computed this same cycle, independently verifying the
+ * record's target `absent` right now (never on `alive` or
+ * `not-verifiable`). This does not weaken B7/B13's steady-state guarantee —
+ * every cycle after the first still treats an existing failed record as
+ * permanent, exactly as before — it only says a process that just started
+ * (an operator's `systemctl restart`, or the host itself rebooting) gets
+ * ONE fresh, evidence-gated look, the daemon's own equivalent of an
+ * operator running `on` again. See `test/unit/daemon-no-wedge-clear.test.ts`
+ * for the behavioral tests that pin exactly this boundary — bounded to one
+ * cycle, gated on verified absence, never a second chance.
  */
 export function clearFailedLaunchRecord(state: AgentStoreState, agentId: string, attemptKey: AttemptKey | undefined): AgentStoreState {
   const record = state.launches.find((l) => l.agentId === agentId && attemptKeyEquals(l.attemptKey, attemptKey) && l.error !== undefined);

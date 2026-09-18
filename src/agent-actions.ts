@@ -61,6 +61,12 @@
 // spawn-only reconcile loop) and B13 (the loop's give-up stays final) both
 // stay intact; see `test/unit/daemon-no-stop-path.test.ts`'s sibling
 // assertion in this story's own test suite.
+//
+// AMENDED (BAKR-33, 2026-09-18): that last sentence is no longer literally
+// true — see `clearFailedLaunchRecord`'s own doc (agent-model.ts) for the
+// one narrow, bounded exception `daemon.ts` now has (first reconcile cycle
+// since process start, gated on a fresh verified-absent liveness check).
+// B7/B13 stay intact for every cycle after the first.
 
 import {
   emptyAgentStore,

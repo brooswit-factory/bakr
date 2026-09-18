@@ -80,13 +80,13 @@ function daemonDeps(dir: string, runCommand: RunCommand): DaemonDeps {
   };
 }
 
-async function runCycles(deps: DaemonDeps, count: number): Promise<{ capturedLines: string[] }> {
+async function runCycles(deps: DaemonDeps, count: number, startState: DaemonState = initialDaemonState()): Promise<{ capturedLines: string[] }> {
   const capturedLines: string[] = [];
   const originalConsoleLog = console.log;
   console.log = (...args: unknown[]) => {
     capturedLines.push(args.map(String).join(" "));
   };
-  let state: DaemonState = initialDaemonState();
+  let state: DaemonState = startState;
   try {
     for (let i = 0; i < count; i++) {
       const result = await runReconcileCycle(state, deps);
@@ -145,7 +145,14 @@ describe("BAKR-33 fix 3: a daemon restart logs no unresolved-launch ERROR for an
     const fake = makeFakeHost();
     const deps = daemonDeps(dir, fake.runCommand);
 
-    const { capturedLines } = await runCycles(deps, 2);
+    // BAKR-33: `isFirstCycle: false` — this test is specifically about the
+    // REPORTING suppression's own liveness gate (fix 3), a cycle-invariant
+    // concept, not about this ticket's separate first-cycle-since-restart
+    // exception (fix 4, covered by daemon-no-wedge-clear.test.ts): an
+    // "absent" verdict on an actual first cycle would legitimately
+    // supersede-and-restore this record instead, which is a different,
+    // already-covered behavior this test isn't exercising.
+    const { capturedLines } = await runCycles(deps, 2, { ...initialDaemonState(), isFirstCycle: false });
 
     const unresolvedLines = capturedLines.filter((l) => l.includes("unresolved launch for agent") && l.includes(AGENT_ID));
     expect(unresolvedLines).toHaveLength(2); // still reported every cycle — this agent is NOT verified alive

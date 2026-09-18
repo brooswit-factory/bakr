@@ -43,6 +43,7 @@ import {
   unresolvedLaunches,
   isSupersededStaleCwdRespawnFailure,
   hasLaunchRecordFor,
+  clearFailedLaunchRecord,
   promoteUnresolvableLaunches,
   restoreAttemptCount,
   recordRestoreAttempt,
@@ -109,10 +110,36 @@ export interface DaemonState {
    * signature and reports again.
    */
   readonly orphanReportSignatures: Readonly<Record<string, string>>;
+  /**
+   * BAKR-33: `true` until this process's per-agent decision loop
+   * (`decideAndBeginForAgent`, below) has been reached at least once, then
+   * `false` for the rest of this process's life — never re-armed, never
+   * re-derived from anything on disk. This is the ONE bounded exception to
+   * B7/B13's "never retried automatically" for a respawn plan already
+   * blocked by an existing FAILED launch record: on the first cycle only,
+   * AND only when a fresh liveness check this same cycle independently
+   * verifies the record's target `absent` right now, that one record is
+   * superseded (`clearFailedLaunchRecord`) and a normal restore attempt
+   * proceeds — the daemon's own equivalent of an operator running `on`
+   * again after this daemon's own process was restarted (however that
+   * restart was triggered — an operator-issued service restart, or the
+   * host itself rebooting) — see `decideAndBeginForAgent`'s own doc. Every cycle
+   * after the first treats an existing failed record exactly as permanent
+   * as before this ticket; this flag is what makes that bound structural
+   * rather than a matter of remembering to check.
+   *
+   * OPTIONAL, defaulting to `false` wherever read (never `true`) — so every
+   * `DaemonState` object literal that predates this ticket (scripts,
+   * fixtures, hand-built test states) keeps compiling and keeps behaving
+   * exactly as it did before: no bypass privilege it never asked for. Only
+   * `initialDaemonState()` sets it `true` — the one true "a process just
+   * started" signal in this tree.
+   */
+  readonly isFirstCycle?: boolean;
 }
 
 export function initialDaemonState(): DaemonState {
-  return { claimDegraded: false, agentsDegraded: false, orphanReportSignatures: {} };
+  return { claimDegraded: false, agentsDegraded: false, orphanReportSignatures: {}, isFirstCycle: true };
 }
 
 function lockOpts(deps: DaemonDeps): { acquireTimeoutMs?: number } {
@@ -184,6 +211,8 @@ export interface ReconcileResult {
   readonly skippedListingFailed: boolean;
   /** See `DaemonState.orphanReportSignatures` — carried forward into the next cycle's `DaemonState` by `runDaemonLoop`. */
   readonly orphanReportSignatures: Readonly<Record<string, string>>;
+  /** See `DaemonState.isFirstCycle` — carried forward into the next cycle's `DaemonState` by `runDaemonLoop`, exactly like `orphanReportSignatures`. OPTIONAL for the identical reason: a pre-BAKR-33 literal that omits it defaults to `false` wherever read. */
+  readonly isFirstCycle?: boolean;
 }
 
 /**
@@ -296,7 +325,8 @@ export type AgentDecision =
   | { readonly kind: "not-verifiable"; readonly reason: string }
   | { readonly kind: "give-up"; readonly attemptsSoFar: number; readonly shortId: string }
   | { readonly kind: "begin-fresh-launch"; readonly attemptId: string }
-  | { readonly kind: "begin-respawn"; readonly attemptId: string; readonly shortId: string; readonly restoreSessionId: string };
+  /** `supersededStaleRecord`: BAKR-33 — set only when this attempt exists BECAUSE the first-cycle-verified-absent exception (below) superseded an existing FAILED record at this exact key; absent (not merely `false`) on every ordinary `begin-respawn`. */
+  | { readonly kind: "begin-respawn"; readonly attemptId: string; readonly shortId: string; readonly restoreSessionId: string; readonly supersededStaleRecord?: true };
 
 /**
  * ONE agent's reconcile decision AND its write, made inside a SINGLE lock
@@ -311,8 +341,16 @@ export type AgentDecision =
  * directly rather than a hand-written replica of its discipline, so the
  * test binds to the actual shipped decision boundary and regresses if a
  * future edit ever moves the read outside the lock.
+ *
+ * `isFirstCycle` (BAKR-33): see `DaemonState.isFirstCycle`'s own doc — the
+ * ONE bounded exception to "a FAILED respawn-keyed record blocks forever"
+ * (B7/B13), gated on this being the first reconcile cycle since this
+ * process started AND a fresh liveness check this same cycle independently
+ * verifying the record's target `absent` right now. See the respawn branch
+ * below for exactly where it applies — nowhere else in this function reads
+ * it (a `fresh` plan has no prior target to verify absent against at all).
  */
-export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, key: ClaimKey, sessions: readonly BackgroundSessionInfo[]): Promise<{ malformed: boolean; error?: string; decision?: AgentDecision }> {
+export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, key: ClaimKey, sessions: readonly BackgroundSessionInfo[], isFirstCycle: boolean = false): Promise<{ malformed: boolean; error?: string; decision?: AgentDecision }> {
   const result = await withAgentStoreLock<AgentDecision>(
     deps.agentsPath,
     (current) => {
@@ -333,9 +371,6 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
 
       const shortId = plan.shortId;
       const attemptKey: AttemptKey = { kind: "respawn", shortId };
-      if (hasLaunchRecordFor(current, agentId, attemptKey)) {
-        return { state: current, result: { kind: "skip" } };
-      }
 
       // BAKR-22: liveness is checked against the SHORT id now (what
       // `respawn` itself keys on — `checkLiveness`'s own convention),
@@ -358,24 +393,55 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
       // this design actually has.
       // Matched by SESSION id: under herdr a restore resumes the same session in a new pane, so the
       // short id (the pane) changes while the session id does not. A session alive in any pane is alive.
+      // COMPUTED BEFORE the hasLaunchRecordFor guard below (BAKR-33): the
+      // one bounded exception needs this cycle's own fresh verdict to
+      // decide whether an existing FAILED record may be superseded at all.
       const entry = sessions.find((s) => s.sessionId === agent.restoreTarget?.sessionId) ?? sessions.find((s) => s.id === shortId);
       const pidVerifiedAlive = entry?.pid !== undefined ? isPidAlive(entry.pid) : false;
       const verdict = decideLiveness(shortId, entry, pidVerifiedAlive);
 
-      if (verdict.status === "alive") {
-        if (restoreAttemptCount(current, agentId) > 0) {
-          return { state: resetRestoreAttempts(current, agentId), result: { kind: "reset" } };
+      let store = current;
+      let supersededStaleRecord = false;
+      if (hasLaunchRecordFor(store, agentId, attemptKey)) {
+        // BAKR-33 (reviewer lead-bakr, escalation 2026-09-18): normally this
+        // is a hard, permanent block (B7/B13) — a FAILED record at this
+        // exact key never automatically retries, by design, so the daemon
+        // never flaps against a persistently broken target. The ONE bounded
+        // exception: the very first reconcile cycle since THIS PROCESS
+        // started (`isFirstCycle`), and ONLY when the verdict just computed
+        // above independently verifies the target `absent` right now — the
+        // daemon's own equivalent of an operator running `on` again after a
+        // restart. Never on `alive` or `not-verifiable`: those still skip,
+        // identically to every cycle after the first. A still-PENDING
+        // record (genuinely in-flight, `error === undefined`) is NEVER
+        // superseded either way — `clearFailedLaunchRecord` is a no-op
+        // against one, so `superseded === store` below catches that case
+        // and still skips, exactly as before this ticket.
+        if (!isFirstCycle || verdict.status !== "absent") {
+          return { state: current, result: { kind: "skip" } };
         }
-        return { state: current, result: { kind: "alive" } };
-      }
-      if (verdict.status === "not-verifiable") {
-        return { state: current, result: { kind: "not-verifiable", reason: verdict.reason } };
+        const superseded = clearFailedLaunchRecord(store, agentId, attemptKey);
+        if (superseded === store) {
+          return { state: current, result: { kind: "skip" } };
+        }
+        store = superseded;
+        supersededStaleRecord = true;
       }
 
-      const attemptsSoFar = restoreAttemptCount(current, agentId);
+      if (verdict.status === "alive") {
+        if (restoreAttemptCount(store, agentId) > 0) {
+          return { state: resetRestoreAttempts(store, agentId), result: { kind: "reset" } };
+        }
+        return { state: store, result: { kind: "alive" } };
+      }
+      if (verdict.status === "not-verifiable") {
+        return { state: store, result: { kind: "not-verifiable", reason: verdict.reason } };
+      }
+
+      const attemptsSoFar = restoreAttemptCount(store, agentId);
       if (attemptsSoFar >= MAX_CONSECUTIVE_UNVERIFIED_RESTORES) {
         const giveUpAttemptId = deps.generateAttemptId();
-        let next = beginLaunch(current, agentId, key, attemptKey, giveUpAttemptId, deps.now());
+        let next = beginLaunch(store, agentId, key, attemptKey, giveUpAttemptId, deps.now());
         next = markLaunchFailed(
           next,
           giveUpAttemptId,
@@ -385,9 +451,12 @@ export async function decideAndBeginForAgent(deps: DaemonDeps, agentId: string, 
       }
 
       const attemptId = deps.generateAttemptId();
-      let next = beginLaunch(current, agentId, key, attemptKey, attemptId, deps.now());
+      let next = beginLaunch(store, agentId, key, attemptKey, attemptId, deps.now());
       next = recordRestoreAttempt(next, agentId);
-      return { state: next, result: { kind: "begin-respawn", attemptId, shortId, restoreSessionId: agent.restoreTarget?.sessionId ?? shortId } };
+      return {
+        state: next,
+        result: { kind: "begin-respawn", attemptId, shortId, restoreSessionId: agent.restoreTarget?.sessionId ?? shortId, ...(supersededStaleRecord ? { supersededStaleRecord: true as const } : {}) },
+      };
     },
     lockOpts(deps)
   );
@@ -530,17 +599,17 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
     if (prior.claimDegraded) parts.push(`claim store "${deps.claimsPath}" is malformed`);
     if (prior.agentsDegraded) parts.push(`agent store at "${deps.agentsPath}" (or its pre-migration session-slots.json) is malformed`);
     log("error", `reconcile skipped this cycle: ${parts.join("; ")} — this process will never write to the affected file(s); restart after repairing on disk`);
-    return { claimDegraded: prior.claimDegraded, agentsDegraded: prior.agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
+    return { claimDegraded: prior.claimDegraded, agentsDegraded: prior.agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
   }
 
   const { claimState, claimDegraded, agentsDegraded } = await loadStores(deps);
   if (claimDegraded || agentsDegraded) {
-    return { claimDegraded, agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
+    return { claimDegraded, agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
   }
 
   const promoted = await promoteWedgedLaunches(deps);
   if (promoted.malformed) {
-    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
   }
 
   let sessions: BackgroundSessionInfo[];
@@ -551,12 +620,12 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       "error",
       `reconcile skipped this cycle: the session listing failed: ${err instanceof Error ? err.message : String(err)} — never treated as "nothing running"; no restore is issued this cycle (BAKR-8 Constraint 1)`
     );
-    return { claimDegraded: false, agentsDegraded: false, restored: [], skippedListingFailed: true, orphanReportSignatures: prior.orphanReportSignatures };
+    return { claimDegraded: false, agentsDegraded: false, restored: [], skippedListingFailed: true, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
   }
 
   const resolved = await resolvePendingLaunches(deps, sessions);
   if (resolved.malformed) {
-    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
   }
 
   // A fresh, unlocked peek to enumerate WHICH agent ids to consider this
@@ -566,7 +635,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   const peeked = await loadAgents(deps.agentsPath);
   if (peeked.status === "malformed") {
     log("error", `agent store at "${deps.agentsPath}" became malformed mid-cycle: ${peeked.error} — degrading for the rest of this process's life`);
-    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
   }
   const peekedState = peeked.status === "loaded" ? peeked.state : emptyAgentStore();
 
@@ -694,9 +763,9 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
     }
 
     for (const agent of onAgents) {
-      const outcome = await decideAndBeginForAgent(deps, agent.id, key, sessions);
+      const outcome = await decideAndBeginForAgent(deps, agent.id, key, sessions, prior.isFirstCycle);
       if (outcome.malformed) {
-        return { claimDegraded: false, agentsDegraded: true, restored, skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures };
+        return { claimDegraded: false, agentsDegraded: true, restored, skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: false };
       }
       const decision = outcome.decision as AgentDecision;
 
@@ -716,6 +785,19 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       }
 
       if (decision.kind === "begin-respawn") {
+        if (decision.supersededStaleRecord) {
+          // BAKR-33: this cycle's own fresh liveness check independently
+          // verified `decision.shortId` absent, and this was the first
+          // reconcile cycle since this process started — the daemon's own
+          // equivalent of an operator running `on` again after a restart.
+          // Loud and explicit, per B13's own "the clearing must be
+          // reported... never done silently" — same standard as the
+          // operator verbs' `launchWedgeCleared`.
+          log(
+            "warn",
+            `agent ${agent.id} in "${key}": a FAILED launch record for short id ${decision.shortId} was superseded — this is the FIRST reconcile cycle since this process started, and a fresh check just verified that target is absent right now (BAKR-33: a process restart gets one evidence-gated look, never a repeating retry). Attempting a normal restore.`
+          );
+        }
         // The write already landed inside the same lock hold as the
         // decision (R-F.3). Now respawn (or its stale-cwd forkFrom escape)
         // runs UNLOCKED (R-F: never hold the lock across a spawn).
@@ -780,7 +862,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
     }
   }
 
-  return { claimDegraded: false, agentsDegraded: false, restored, skippedListingFailed: false, orphanReportSignatures: nextOrphanReportSignatures };
+  return { claimDegraded: false, agentsDegraded: false, restored, skippedListingFailed: false, orphanReportSignatures: nextOrphanReportSignatures, isFirstCycle: false };
 }
 
 export interface DaemonLoopOptions {
@@ -813,7 +895,7 @@ export async function runDaemonLoop(deps: DaemonDeps, options: DaemonLoopOptions
   while (options.signal?.aborted !== true) {
     try {
       const result = await runReconcileCycle(state, deps);
-      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures };
+      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures, isFirstCycle: result.isFirstCycle ?? false };
     } catch (err) {
       log("error", `reconcile cycle threw and was caught, daemon continues: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     }
