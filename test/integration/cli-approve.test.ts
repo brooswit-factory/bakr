@@ -157,7 +157,9 @@ test("the switch-to-auto-mode option is never selected", async () => {
 
 // The operator saw an earlier prompt; the pane has moved on to another one.
 // FALSIFIER (performed for the PR): deleting findOwnPrompt's promptId check
-// turns this test red.
+// turns this test red — drovr's own re-read then refuses instead, with its
+// own message. Deleting drovr's re-check as well lets the stale id through:
+// exit 0, keys pressed. bakr's check alone keeps this green.
 test("a stale promptId is refused with nothing pressed", async () => {
   const earlier = permissionScreen("Bash command", ["rm -rf build", "Clean the build"]);
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }]);
