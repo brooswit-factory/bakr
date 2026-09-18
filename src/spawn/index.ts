@@ -6,9 +6,7 @@
 // each file's own banner comment for the rule it exists to satisfy:
 //   - launch.ts   — the only site that starts a session: a herdr pane,
 //                    under the herdr server, never under bakr.service
-//   - herdr.ts    — hosting through drovr (hostResident / listResidents /
-//                    stopResident), and the panes it adopts from before
-//   - herdr-cli-client.ts — the DrovrClient those use, over the herdr CLI
+//   - herdr.ts    — herdr commands, startup-prompt answering, parsing
 //   - respawn.ts  — a restore: `--resume <session>` in a new pane
 //   - stop.ts     — the only site that stops a session; always by its own
 //                    listed identity, never by killing a scope/cgroup or

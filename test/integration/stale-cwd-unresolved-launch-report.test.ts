@@ -155,7 +155,7 @@ describe("B13a AC6: a stale respawn(X) record already on disk, written by a PRE-
     const fake = makeFakeHost();
     fake.addPane({ cwd: KEY, sessionId: "new-session-uuid" });
     const runCommand: RunCommand = async (argv, opts) => {
-      const listing = (argv[0] === "herdr" && argv[1] === "agent" && argv[2] === "list") || (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "list") || (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "process-info") || (argv[0] === "claude" && argv[1] === "agents");
+      const listing = (argv[0] === "herdr" && argv[1] === "agent" && argv[2] === "list") || (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "process-info") || (argv[0] === "claude" && argv[1] === "agents");
       if (!listing) throw new Error(`unexpected argv (nothing should be dispatched): ${JSON.stringify(argv)}`);
       return fake.runCommand(argv, opts);
     };

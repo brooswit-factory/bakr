@@ -131,10 +131,7 @@ describe("the TOCTOU re-check before respawn (BAKR-23's caught incident)", () =>
 
     await runReconcileCycle(initialDaemonState(), daemonDeps(dir, fake.runCommand));
 
-    // Both bakr listings ran, counted by their legacy half (one `claude agents` each): `herdr agent list` is no
-    // longer one per listing, since drovr's hostResident reads it once more itself before it creates anything,
-    // to refuse a label another pane already holds (BAKR-37).
-    expect(fake.calls.filter((c) => c[0] === "claude" && c[1] === "agents")).toHaveLength(2);
+    expect(fake.calls.filter(isList)).toHaveLength(2);
     expect(fake.starts()).toEqual([["--resume", SESSION_ID]]);
   });
 });

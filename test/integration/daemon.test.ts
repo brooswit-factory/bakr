@@ -183,9 +183,8 @@ describe("missing stores: a normal, empty first run", () => {
     expect(result.agentsDegraded).toBe(false);
     expect(result.skippedListingFailed).toBe(false); // the listing genuinely SUCCEEDED — not a vacuous "nothing restored" from a failed one
     expect(result.restored).toEqual([]);
-    // Exactly ONE listing: herdr's panes (with the workspace labels drovr's listResidents reads to tell
-    // its own residents apart — BAKR-37) plus the legacy background sessions, nothing else.
-    expect(fake.calls.map((c) => c.slice(0, 3))).toEqual([["herdr", "agent", "list"], ["herdr", "workspace", "list"], ["claude", "agents", "--json"]]);
+    // Exactly ONE listing: herdr's panes plus the legacy background sessions, nothing else.
+    expect(fake.calls.map((c) => c.slice(0, 3))).toEqual([["herdr", "agent", "list"], ["claude", "agents", "--json"]]);
   });
 });
 

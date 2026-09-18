@@ -22,8 +22,7 @@ type Listed = { sessionId: string; cwd: string; pid?: number };
 /** A listing reads herdr's panes (and each pane's claude pid) plus legacy `claude agents --json` — nothing else. */
 const isListingCommand = (argv: string[]): boolean => {
   const line = argv.join(" ");
-  // `herdr workspace list` is drovr's listResidents telling its residents' workspaces apart (BAKR-37).
-  return line === "herdr agent list" || line === "herdr workspace list" || line.startsWith("herdr pane process-info --pane ") || line === "claude agents --json";
+  return line === "herdr agent list" || line.startsWith("herdr pane process-info --pane ") || line === "claude agents --json";
 };
 
 async function setup(agent: Partial<AgentRecord>, send: ResidentMessenger["message"], listing?: (root: string) => Listed[] | Error) {

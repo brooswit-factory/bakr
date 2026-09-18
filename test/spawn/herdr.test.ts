@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildAgentStartArgv, claudePid, classifyStartupPrompt, launchOutsideDrovr, parseHerdrReply, stateOf, withSessionId } from "../../src/spawn/herdr";
+import { buildAgentStartArgv, claudePid, classifyStartupPrompt, herdrLaunch, parseHerdrReply, stateOf, withSessionId } from "../../src/spawn/herdr";
 import type { CommandResult, RunCommandOptions } from "../../src/spawn";
 
 // Screens copied from real panes (rocketr, claude 2.1.276, 2026-09-18), trimmed.
@@ -93,9 +93,7 @@ describe("herdr replies", () => {
   });
 });
 
-// bakr's own ready loop: since BAKR-37 it starts only a fork (drovr's hostResident cannot), so these measured
-// screens test it there by name. BAKR-40 ports them onto drovr's path before the loop is deleted.
-describe("launchOutsideDrovr answers the startup prompts a resident cannot", () => {
+describe("herdrLaunch answers the startup prompts a resident cannot", () => {
   test("trust, then development channels, then idle — each answered once with its own keys", async () => {
     const screens = [TRUST, CHANNELS];
     const sent: string[][] = [];
@@ -115,7 +113,7 @@ describe("launchOutsideDrovr answers the startup prompts a resident cannot", () 
       throw new Error(`unexpected ${JSON.stringify(argv)}`);
     };
     let clock = 0;
-    const r = await launchOutsideDrovr("/d", ["--resume", "s1"], "@a", { runCommand, sleep: async (ms) => { clock += ms; }, now: () => clock });
+    const r = await herdrLaunch("/d", ["--resume", "s1"], "@a", { runCommand, sleep: async (ms) => { clock += ms; }, now: () => clock });
     expect(r).toEqual({ ok: true, id: "w1:p1", sessionId: "s1" });
     expect(sent).toEqual([["down", "enter"], ["enter"]]);
   });
@@ -148,7 +146,7 @@ describe("launchOutsideDrovr answers the startup prompts a resident cannot", () 
       { screen: CHANNELS, ready: false },
       { screen: IDLE, ready: true, session: "s1" },
     ]);
-    const r = await launchOutsideDrovr("/d", ["--resume", "s1"], "@a", pane.deps);
+    const r = await herdrLaunch("/d", ["--resume", "s1"], "@a", pane.deps);
     // FALSIFIER: accepting herdr's first "ready" reported the launch up and never answered the warning.
     expect(pane.sent).toEqual([["enter"]]);
     expect(r).toEqual({ ok: true, id: "w1:p1", sessionId: "s1" });
@@ -156,7 +154,7 @@ describe("launchOutsideDrovr answers the startup prompts a resident cannot", () 
 
   test("a session herdr never names is still accepted once its screen stays clean and ready", async () => {
     const pane = scripted([{ screen: IDLE, ready: true }]);
-    const r = await launchOutsideDrovr("/d", ["--resume", "s1"], "@a", pane.deps);
+    const r = await herdrLaunch("/d", ["--resume", "s1"], "@a", pane.deps);
     expect(r).toEqual({ ok: true, id: "w1:p1", sessionId: "s1" });
     expect(pane.sent).toEqual([]);
   });
