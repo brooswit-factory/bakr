@@ -50,6 +50,7 @@ async function setup(agent: Partial<AgentRecord>, send: ResidentMessenger["messa
     stdout: s => { out.push(s); }, stderr: s => { err.push(s); },
     prompt: async () => { throw new Error("must not prompt"); }, spawnAttach: async () => { throw new Error("must not attach"); },
     messenger: { message: async (target, text) => { sent.push([target, text]); return send(target, text); } },
+    permissions: { list: async () => { throw new Error("send must not read permission prompts"); } },
   };
   return { root, deps, out, err, sent, commands, agentsPath, host };
 }

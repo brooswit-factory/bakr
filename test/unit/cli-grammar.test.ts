@@ -60,6 +60,25 @@ describe("bakr CLI grammar", () => {
     }
   });
 
+  test("permissions: one agent's pending prompts, no arguments, no flags", () => {
+    expect(ok(["alice","permissions"])).toEqual({kind:"permissions",ref:"alice"});
+    expect(ok(["@a1","permissions"])).toEqual({kind:"permissions",ref:"@a1"});
+    expect(ok(["permissions"])).toEqual({kind:"attach",ref:"permissions"});
+    for (const [argv, message] of [
+      [["alice","permissions","extra"], '"permissions" takes no further arguments'],
+      [["alice","permissions","--yes"], '--yes/-y is not valid with "permissions"'],
+      [["alice","permissions","--all"], '--all is not valid with "permissions"'],
+      [["alice","permissions","--archived"], '--archived is not valid with "permissions"'],
+      [["alice","permissions","--name","x"], '--name is not valid with "permissions"'],
+      [["alice","permissions","--mcp","yappr"], '--mcp is not valid with "permissions"'],
+      [["alice","permissions","--help"], "used alone"],
+    ] as const) {
+      const r = parseArgv([...argv]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain(message);
+    }
+  });
+
   test("C3: every top-level dispatch word is reserved by the model", () => {
     for (const word of TOP_LEVEL_WORDS) expect(RESERVED_NAMES).toContain(word);
   });

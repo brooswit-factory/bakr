@@ -74,6 +74,7 @@ function cliDeps(storeDir: string, cwd: string, runCommand: DaemonDeps["runComma
     stdout: (s) => { out.push(s); }, stderr: (s) => { err.push(s); },
     prompt: async () => { throw new Error("must not prompt"); }, spawnAttach: async () => { throw new Error("must not attach"); },
     messenger: { message: async () => { throw new Error("must not send"); } },
+    permissions: { list: async () => { throw new Error("must not read permission prompts"); } },
   };
   return { deps, out, err };
 }

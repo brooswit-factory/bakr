@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { openHerdrPane, residentTransport } from "../../src/cli/herdr-transport";
-import { makeFakeHost } from "../support/fake-host";
+import { herdrApprovalClient, openHerdrPane, residentTransport } from "../../src/cli/herdr-transport";
+import { makeFakeHost, permissionScreen } from "../support/fake-host";
 
 describe("bakr send over herdr", () => {
   test("typing into a pane sends the text, then Enter as a key, in order", async () => {
@@ -39,5 +39,23 @@ describe("bakr send over herdr", () => {
     await transport.readScreen!("w1:p1");
     await transport.readScreen!("abcd1234");
     expect(reads).toEqual([["herdr", "agent", "read", "w1:p1"], ["claude", "logs", "abcd1234"]]);
+  });
+});
+
+describe("permission prompts over herdr", () => {
+  test("the herdr approval client reads a pane's visible screen through the herdr CLI", async () => {
+    const host = makeFakeHost();
+    const pane = host.addPane({ cwd: "/work", sessionId: "s-1", screen: permissionScreen("Bash command", ["ls"]) });
+    const client = herdrApprovalClient(host.runCommand);
+    const listed = await client.agent.list();
+    expect(listed.agents.map((a) => [a.pane_id, a.agent_session?.value])).toEqual([[pane.paneId, "s-1"]]);
+    const read = await client.agent.read({ target: pane.paneId, source: "visible", strip_ansi: true });
+    expect(read.read.text).toBe(pane.screen!);
+    expect(host.calls).toEqual([["herdr", "agent", "list"], ["herdr", "agent", "read", pane.paneId, "--source", "visible"]]);
+  });
+
+  test("a herdr error is thrown, never read as an empty listing", async () => {
+    const client = herdrApprovalClient(async () => ({ exitCode: 1, stdout: JSON.stringify({ error: { code: "server_unreachable", message: "no herdr" } }), stderr: "" }));
+    await expect(client.agent.list()).rejects.toThrow("herdr agent list: server_unreachable: no herdr");
   });
 });
