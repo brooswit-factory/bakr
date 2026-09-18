@@ -18,7 +18,7 @@ import { parseArgv, type ParsedCommand } from "./grammar";
 import { attachInPlace } from "./attach";
 import { confirmDelete } from "./confirm";
 import { residentRefusal, resolveResidentCwd, type ResidentMessenger } from "./send";
-import { ownPendingPermissions, renderPendingPermissions, type PermissionHost } from "./permissions";
+import { approvalExitCode, findOwnPrompt, ownPendingPermissions, renderApproval, renderPendingPermissions, resolveOperator, type PermissionHost } from "./permissions";
 import { EXIT_FAILURE, EXIT_REFUSAL, EXIT_SUCCESS, EXIT_USAGE } from "./exit-codes";
 import { formatMcpSpec, parseMcpSpec, type McpServerDeclaration } from "../launch-config";
 
@@ -39,11 +39,15 @@ export interface CliDeps {
   messenger: ResidentMessenger;
   /** Reads the tool-permission prompts on this host's Claude panes; `permissions` narrows them to one agent. */
   permissions: PermissionHost;
+  /** Where `approve` records every attempt: `$XDG_STATE_HOME/bakr/permission-approvals.jsonl`, beside agents.json. */
+  permissionAuditPath: string;
+  /** `$USER`: the operator `approve` records when `--as` is not given. */
+  user?: string;
   /** The Claude session running this command, if any (CLAUDE_CODE_SESSION_ID): `relaunch` never kills its own caller. */
   selfSessionId?: string;
 }
 
-const help = `usage:\n  bakr [--dir <path>] ...   (run as if started in <path>)\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> permissions\n  bakr <id|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|name> relaunch\n  bakr relaunch --all\n`;
+const help = `usage:\n  bakr [--dir <path>] ...   (run as if started in <path>)\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> permissions\n  bakr <id|name> approve <promptId> [--always] [--as <operator>]\n  bakr <id|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|name> relaunch\n  bakr relaunch --all\n`;
 
 /** Parses every spec, or returns the first refusal; duplicates keep their last spelling. */
 function parseMcpSpecs(specs: readonly string[]): McpServerDeclaration[] | string {
@@ -199,6 +203,36 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
     catch (e) { return refuse({ reason: "listing-failed", message: `cannot read agent ${r.agent.id}'s pane: ${e instanceof Error ? e.message : String(e)}` }, d); }
     d.stdout(renderPendingPermissions(ownPendingPermissions(target, pending)));
     if (!isHerdrPaneId(target.shortId)) d.stderr(`note: agent ${r.agent.id} still runs under legacy \`claude --bg\` (${target.shortId}), whose prompts cannot be read; \`bakr ${command.ref} relaunch\` moves it into herdr\n`);
+    return EXIT_SUCCESS;
+  }
+  if (command.kind === "approve") {
+    // Refused before anything is read or pressed: drovr records the operator
+    // on every attempt and an empty one would be an unattributed approval.
+    const operator = resolveOperator(command.operator, d.user);
+    if (operator === undefined) { d.stderr(`bakr: usage error: approve needs an operator: $USER is ${d.user === undefined ? "unset" : "empty"}; pass --as <operator>\n`); return EXIT_USAGE; }
+    const r = await actions.resolveTarget(d.actions, directory, command.ref); if (!r.ok) return refuse(r, d);
+    const target = r.agent.restoreTarget;
+    if (target === undefined) return refuse({ reason: "no-prompt", message: `${label(r.agent)} has never been launched, so it has no pane to prompt on; nothing was pressed` }, d);
+    let pending;
+    try { pending = await d.permissions.list(); }
+    catch (e) { return refuse({ reason: "listing-failed", message: `cannot read agent ${r.agent.id}'s pane: ${e instanceof Error ? e.message : String(e)}; nothing was pressed` }, d); }
+    const own = findOwnPrompt(target, pending, command.promptId, label(r.agent));
+    if (!own.ok) {
+      d.stderr(`${own.reason}: ${own.detail}; nothing was pressed\n`);
+      if (!isHerdrPaneId(target.shortId)) d.stderr(`note: agent ${r.agent.id} still runs under legacy \`claude --bg\` (${target.shortId}), whose prompts cannot be read or answered; \`bakr ${command.ref} relaunch\` moves it into herdr\n`);
+      return EXIT_REFUSAL;
+    }
+    // `always` is reachable only from a typed --always; there is no other
+    // scope and no path to drovr's auto-mode option, which it never picks.
+    const scope = command.always ? "always" : "once";
+    let result;
+    try { result = await d.permissions.approve({ paneId: own.prompt.paneId, promptId: command.promptId, operator, scope, auditPath: d.permissionAuditPath }); }
+    catch (e) {
+      d.stderr(`approve-failed: ${e instanceof Error ? e.message : String(e)}; whether a key reached pane ${own.prompt.paneId} is unknown and nothing was retried; \`bakr ${command.ref} permissions\` shows what is on it now\n`);
+      return EXIT_FAILURE;
+    }
+    if (!result.ok) { d.stderr(`${result.reason}: ${result.detail} (attempt ${result.attemptId}; not retried)\n`); return approvalExitCode(result.reason); }
+    d.stdout(renderApproval(label(r.agent), result, d.permissionAuditPath));
     return EXIT_SUCCESS;
   }
   if (command.kind === "adopt") {

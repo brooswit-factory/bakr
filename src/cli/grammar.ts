@@ -16,6 +16,11 @@ export type ParsedCommand =
   | { kind: "send"; ref: string; message: string }
   /** Read-only: the tool-permission prompts waiting on this agent's own pane. */
   | { kind: "permissions"; ref: string }
+  /**
+   * Answers one prompt `permissions` listed. `always` is true only when
+   * `--always` was typed; `operator` only when `--as` was (else `$USER`).
+   */
+  | { kind: "approve"; ref: string; promptId: string; always: boolean; operator?: string }
   /** `specs` omitted shows the declaration; `["default"]` returns it to the default (every server in its .mcp.json); otherwise it replaces it. */
   | { kind: "mcp"; ref: string; specs?: string[] }
   | { kind: "relaunch"; ref: string }
@@ -24,11 +29,11 @@ export type ParsedCommand =
 
 export type ParseResult = { ok: true; command: ParsedCommand } | { ok: false; message: string };
 
-type Flags = { name?: string; mcp: string[]; yes: boolean; archived: boolean; all: boolean; help: boolean };
+type Flags = { name?: string; mcp: string[]; yes: boolean; archived: boolean; all: boolean; always: boolean; as?: string; help: boolean };
 
 function scan(argv: string[]): { ok: true; words: string[]; flags: Flags } | { ok: false; message: string } {
   const words: string[] = [];
-  const flags: Flags = { mcp: [], yes: false, archived: false, all: false, help: false };
+  const flags: Flags = { mcp: [], yes: false, archived: false, all: false, always: false, help: false };
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!;
     if (token === "--name") {
@@ -39,9 +44,15 @@ function scan(argv: string[]): { ok: true; words: string[]; flags: Flags } | { o
       const value = argv[++i];
       if (value === undefined || value.startsWith("-")) return { ok: false, message: "--mcp requires a server spec" };
       flags.mcp.push(value);
+    } else if (token === "--as") {
+      const value = argv[++i];
+      if (value === undefined || value.startsWith("-")) return { ok: false, message: "--as requires an operator name" };
+      if (value.trim() === "") return { ok: false, message: "--as requires a non-empty operator name" };
+      flags.as = value;
     } else if (token === "--yes" || token === "-y") flags.yes = true;
     else if (token === "--archived") flags.archived = true;
     else if (token === "--all") flags.all = true;
+    else if (token === "--always") flags.always = true;
     else if (token === "--help" || token === "-h") flags.help = true;
     else if (token.startsWith("-")) return { ok: false, message: `unrecognized flag "${token}"` };
     else words.push(token);
@@ -56,6 +67,8 @@ function disallowed(f: Flags, allowed: Partial<Record<keyof Flags, boolean>>, la
   if (f.yes && !allowed.yes) return `--yes/-y is not valid with "${label}"`;
   if (f.archived && !allowed.archived) return `--archived is not valid with "${label}"`;
   if (f.all && !allowed.all) return `--all is not valid with "${label}"`;
+  if (f.always && !allowed.always) return `--always is not valid with "${label}"`;
+  if (f.as !== undefined && !allowed.as) return `--as is not valid with "${label}"`;
   return undefined;
 }
 
@@ -63,7 +76,7 @@ export function parseArgv(argv: string[]): ParseResult {
   const s = scan(argv); if (!s.ok) return s;
   const { words, flags } = s;
   if (flags.help) {
-    if (words.length || flags.name !== undefined || flags.mcp.length > 0 || flags.yes || flags.archived || flags.all) return error("--help/-h must be used alone");
+    if (words.length || flags.name !== undefined || flags.mcp.length > 0 || flags.yes || flags.archived || flags.all || flags.always || flags.as !== undefined) return error("--help/-h must be used alone");
     return { ok: true, command: { kind: "help" } };
   }
   if (!words.length) {
@@ -93,7 +106,7 @@ export function parseArgv(argv: string[]): ParseResult {
     if (words.length < 2) return error('"adopt" requires at least one @id');
     return { ok: true, command: { kind: "adopt", ids: words.slice(1) } };
   }
-  const bad = disallowed(flags, { yes: words[1] === "delete" }, words[1] ?? "attach");
+  const bad = disallowed(flags, { yes: words[1] === "delete", always: words[1] === "approve", as: words[1] === "approve" }, words[1] ?? "attach");
   if (bad) return error(bad);
   if (words.length === 1) return { ok: true, command: { kind: "attach", ref: first } };
   const verb = words[1]!;
@@ -116,6 +129,10 @@ export function parseArgv(argv: string[]): ParseResult {
   if (verb === "permissions") {
     if (words.length !== 2) return error('"permissions" takes no further arguments');
     return { ok: true, command: { kind: "permissions", ref: first } };
+  }
+  if (verb === "approve") {
+    if (words.length !== 3) return error('"approve" requires exactly one promptId; `bakr <id|name> permissions` lists them');
+    return { ok: true, command: { kind: "approve", ref: first, promptId: words[2]!, always: flags.always, ...(flags.as === undefined ? {} : { operator: flags.as }) } };
   }
   if (verb === "mcp") {
     const specs = words.slice(2);

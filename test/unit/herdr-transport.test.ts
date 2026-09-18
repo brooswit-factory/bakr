@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { herdrApprovalClient, openHerdrPane, residentTransport } from "../../src/cli/herdr-transport";
+import { herdrApprovalClient, herdrPermissions, openHerdrPane, residentTransport } from "../../src/cli/herdr-transport";
 import { makeFakeHost, permissionScreen } from "../support/fake-host";
 
 describe("bakr send over herdr", () => {
@@ -51,7 +51,34 @@ describe("permission prompts over herdr", () => {
     expect(listed.agents.map((a) => [a.pane_id, a.agent_session?.value])).toEqual([[pane.paneId, "s-1"]]);
     const read = await client.agent.read({ target: pane.paneId, source: "visible", strip_ansi: true });
     expect(read.read.text).toBe(pane.screen!);
-    expect(host.calls).toEqual([["herdr", "agent", "list"], ["herdr", "agent", "read", pane.paneId, "--source", "visible"]]);
+    expect(host.calls).toEqual([["herdr", "agent", "list"], ["herdr", "agent", "read", pane.paneId, "--source", "visible", "--format", "text"]]);
+  });
+
+  // lead-bakr, on BAKR-36: drovr asks for strip_ansi, and herdr's --format is
+  // how the CLI says it. Left to herdr's default, a default that became ansi
+  // would make classifyPermissionPrompt match nothing and every blocked pane
+  // would list as "no pending prompts".
+  test("strip_ansi is passed to herdr as an explicit --format, never left to its default", async () => {
+    const reads: string[][] = [];
+    const client = herdrApprovalClient(async (argv) => { reads.push(argv); return { exitCode: 0, stdout: "screen", stderr: "" }; });
+    await client.agent.read({ target: "w1:p1", source: "visible", strip_ansi: true });
+    await client.agent.read({ target: "w1:p1", source: "recent", strip_ansi: false, lines: 40 });
+    await client.agent.read({ target: "w1:p1", source: "visible" });
+    expect(reads).toEqual([
+      ["herdr", "agent", "read", "w1:p1", "--source", "visible", "--format", "text"],
+      ["herdr", "agent", "read", "w1:p1", "--source", "recent", "--lines", "40", "--format", "ansi"],
+      ["herdr", "agent", "read", "w1:p1", "--source", "visible"],
+    ]);
+  });
+
+  test("the listing drovr runs reads every pane with --format text", async () => {
+    const host = makeFakeHost();
+    host.addPane({ cwd: "/work", sessionId: "s-1", screen: permissionScreen("Bash command", ["ls"]) });
+    host.addPane({ cwd: "/work", sessionId: "s-2" });
+    await herdrPermissions(host.runCommand).list();
+    const reads = host.calls.filter((c) => c[2] === "read");
+    expect(reads).toHaveLength(2);
+    for (const read of reads) expect(read.slice(-2)).toEqual(["--format", "text"]);
   });
 
   test("a herdr error is thrown, never read as an empty listing", async () => {
