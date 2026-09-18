@@ -40,7 +40,7 @@ export interface CliDeps {
   selfSessionId?: string;
 }
 
-const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|name> relaunch\n  bakr relaunch --all\n`;
+const help = `usage:\n  bakr [--dir <path>] ...   (run as if started in <path>)\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|name> relaunch\n  bakr relaunch --all\n`;
 
 /** Parses every spec, or returns the first refusal; duplicates keep their last spelling. */
 function parseMcpSpecs(specs: readonly string[]): McpServerDeclaration[] | string {

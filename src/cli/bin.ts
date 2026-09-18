@@ -7,10 +7,15 @@ import { runCli } from "./main";
 import { spawnClaudeAttach } from "./attach";
 import { createResidentAgentMessenger } from "@brooswit/drovr";
 import { residentTransport } from "./herdr-transport";
+import { takeDirOption } from "./dir-option";
+import { EXIT_USAGE } from "./exit-codes";
 
+const dirOption=takeDirOption(process.argv.slice(2));
+if("error" in dirOption){process.stderr.write(`bakr: usage error: ${dirOption.error}\n`);process.exit(EXIT_USAGE);}
+if(dirOption.dir!==undefined){try{process.chdir(dirOption.dir);}catch(err){process.stderr.write(`bakr: usage error: --dir ${dirOption.dir}: ${err instanceof Error ? err.message : String(err)}\n`);process.exit(EXIT_USAGE);}}
 async function prompt(text:string):Promise<string>{const rl=readline.createInterface({input:process.stdin,output:process.stdout});try{return await rl.question(text);}finally{rl.close();}}
 const common={agentsPath:agentsPath(),runCommand,now:Date.now,generateAttemptId:randomUUID,randomBytes:realRandomBytes,transcriptProbeDeps:realTranscriptProbeDeps};
-runCli(process.argv.slice(2),{
+runCli(dirOption.rest,{
   actions:common,
   adopt:{claimsPath:claimsPath(),agentsPath:agentsPath(),now:Date.now,resolveInputs:realResolveInputs,lexicalInputs:{cwd:process.cwd(),home:process.env.HOME ?? ""},probeDeps:realOrphanProbeDeps},
   claimsPath:claimsPath(),resolveInputs:realResolveInputs,probeDeps:realOrphanProbeDeps,cwd:process.cwd(),...(process.env.HOME === undefined ? {} : {home:process.env.HOME}),
