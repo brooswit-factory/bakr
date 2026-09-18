@@ -13,6 +13,7 @@ import { withAgentStoreLock } from "../../../src/agent-store-io";
 import { beginLaunch, hasLaunchRecordFor, putAgent, type AgentRecord } from "../../../src/agent-model";
 import { on, type AgentActionDeps } from "../../../src/agent-actions";
 import type { ClaimKey } from "../../../src/claim-key-resolve";
+import { makeFakeHost } from "../../support/fake-host";
 
 async function fakeLaunchOk(): Promise<{ ok: true; id: string }> {
   return { ok: true, id: `short-${process.pid}` };
@@ -27,16 +28,10 @@ function baseDeps(agentsPath: string): AgentActionDeps {
     // code this fixture originally modeled (which only ever called
     // `launch()`). This fixture's agent is seeded fresh (no restoreTarget),
     // so the listing's actual content is irrelevant to the race being
-    // tested; `[]` is enough to let `on()` proceed to its `fresh` branch.
-    runCommand: async (argv) => {
-      if (argv[0] === "systemd-run") {
-        return { exitCode: 0, stdout: `backgrounded · short-${process.pid} (idle — send a prompt to start)\n`, stderr: "" };
-      }
-      if (argv[0] === "claude" && argv[1] === "agents") {
-        return { exitCode: 0, stdout: "[]", stderr: "" };
-      }
-      throw new Error(`fixture fake runCommand: unexpected argv ${JSON.stringify(argv)}`);
-    },
+    // tested; an empty host is enough to let `on()` proceed to its `fresh`
+    // branch. The launch itself runs through the shared fake herdr host
+    // (one per process: each process's own launch lands in its own fake).
+    runCommand: makeFakeHost().runCommand,
     now: () => Date.now(),
     generateAttemptId: () => `attempt-${process.pid}-${Date.now()}-${Math.random()}`,
     randomBytes: (n: number) => new Uint8Array(n).fill(process.pid & 0xff),

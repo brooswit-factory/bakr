@@ -1,6 +1,7 @@
 // Integration coverage for agent-actions.ts's effect layer, against a real
-// temp-dir store through the real `withAgentStoreLock`, with a fake
-// `runCommand` standing in for `claude`/`systemd-run` (no real process
+// temp-dir store through the real `withAgentStoreLock`, with the shared fake
+// host (test/support/fake-host.ts) standing in for herdr and legacy `claude
+// --bg` (no real process
 // spawned here — that is the live demonstration's job, PR body). Each
 // group states its falsifier in the test name or a comment.
 
@@ -26,8 +27,8 @@ import {
   type AgentActionDeps,
 } from "../../src/agent-actions";
 import type { ClaimKey } from "../../src/claim-key-resolve";
-import type { CommandResult, RunCommandOptions } from "../../src/spawn";
 import type { McpSettingsIo } from "@brooswit/drovr";
+import { makeFakeHost, type FakeHost } from "../support/fake-host";
 
 /** In-memory vendor settings, so no test writes a real `.claude/settings.local.json`. */
 function memorySettings(): McpSettingsIo & { files: Record<string, string> } {
@@ -55,49 +56,23 @@ async function makeTempDir(): Promise<string> {
   return dir;
 }
 
-interface FakeListingEntry {
-  id: string;
-  sessionId: string;
-  cwd: string;
-  startedAt: number;
-  kind: string;
-  pid?: number;
-}
+/** A listing read: herdr's pane registry, one pane's process info, or legacy `claude agents --json`. */
+const isListingRead = (argv: string[]): boolean =>
+  (argv[0] === "herdr" && argv[1] === "agent" && argv[2] === "list") ||
+  (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "process-info") ||
+  (argv[0] === "claude" && argv[1] === "agents");
 
-/** Records every argv this test's fake `runCommand` sees, in order — the raw evidence a test can assert the exact stop/launch mechanism against. */
-function makeFakeClaude(opts?: { failListing?: boolean; stopBehavior?: (id: string) => { ok: boolean; error?: string } }) {
-  const listing: FakeListingEntry[] = [];
-  const calls: string[][] = [];
-  let nextShortId = 0;
+/** How many full listings ran (each begins with `herdr agent list`). */
+const listings = (host: FakeHost): number => host.calls.filter((c) => c[0] === "herdr" && c[1] === "agent" && c[2] === "list").length;
 
-  async function runCommand(argv: string[], cmdOpts: RunCommandOptions): Promise<CommandResult> {
-    calls.push(argv);
-    if (argv[0] === "claude" && argv[1] === "agents") {
-      if (opts?.failListing) throw new Error("simulated listing failure");
-      return { exitCode: 0, stdout: JSON.stringify(listing), stderr: "" };
-    }
-    if (argv[0] === "claude" && argv[1] === "stop") {
-      const id = argv[2] as string;
-      const behavior = opts?.stopBehavior?.(id) ?? { ok: true };
-      if (!behavior.ok) return { exitCode: 1, stdout: "", stderr: behavior.error ?? "stop failed" };
-      const idx = listing.findIndex((s) => s.id === id);
-      if (idx !== -1) listing.splice(idx, 1);
-      return { exitCode: 0, stdout: "", stderr: "" };
-    }
-    if (argv[0] === "claude" && argv[1] === "respawn") {
-      const shortId = argv[2] as string;
-      return { exitCode: 0, stdout: `respawned ${shortId}\n`, stderr: "" };
-    }
-    if (argv[0] === "systemd-run") {
-      const shortId = `short-${nextShortId++}`;
-      const sessionId = `session-${shortId}`;
-      listing.push({ id: shortId, sessionId, cwd: cmdOpts.cwd ?? "", startedAt: 1, kind: "background", pid: 12345 });
-      return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
-    }
-    throw new Error(`fake runCommand: unexpected argv ${JSON.stringify(argv)}`);
-  }
+/** Every command that is NOT a listing read, in order — the raw evidence a test can assert the exact stop/launch mechanism against. */
+const effects = (host: FakeHost): string[][] => host.calls.filter((c) => !isListingRead(c));
 
-  return { runCommand, listing, calls };
+/** A fresh launch names its own session first (`--session-id <uuid>`); returns the claude args bakr chose after that. */
+function afterNamedSession(args: readonly string[]): string[] {
+  expect(args[0]).toBe("--session-id");
+  expect(args[1]).toMatch(/^[0-9a-f-]{36}$/);
+  return args.slice(2);
 }
 
 function baseDeps(dir: string, runCommand: AgentActionDeps["runCommand"]): AgentActionDeps {
@@ -130,27 +105,27 @@ async function seedAgent(agentsPath: string, agent: AgentRecord): Promise<void> 
 // --- create: B8 (no prompt at all), name validation, honest about sessionId ---
 
 describe("create", () => {
-  test("mints an unnamed `on` agent and issues a launch with NO ARGS AT ALL (B8: create passes no prompt, no resume)", async () => {
+  test("mints an unnamed `on` agent and issues a launch with NO ARGS AT ALL beyond its own session name (B8: create passes no prompt, no resume)", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     const result = await create(baseDeps(dir, fake.runCommand), KEY);
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error("expected ok");
     expect(result.agent.state).toBe("on");
     expect(result.agent.name).toBeUndefined();
-    expect(result.agent.birthSessionId).toBeUndefined(); // honest: never known synchronously (Q3)
-    expect(result.launch.ok).toBe(true);
+    expect(result.agent.birthSessionId).toBeUndefined(); // honest: resolved into the record later, never at create time (Q3)
+    expect(result.launch).toEqual({ ok: true, launchShortId: "w1:p1" });
 
-    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    // Between "claude" and the trailing "--bg": options must precede --bg,
-    // which does not parse anything placed after it.
-    const claudeArgs = systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"));
-    expect(claudeArgs).toEqual([]); // FALSIFIER: any extra argv element here is a B8 violation
+    // One herdr workspace in the claimed directory, claude started in its root pane.
+    expect(fake.calls.filter((c) => c[1] === "workspace" && c[2] === "create").map((c) => c[c.indexOf("--cwd") + 1])).toEqual([KEY]);
+    expect(fake.starts()).toHaveLength(1);
+    // FALSIFIER: any argv element beyond the launch's own `--session-id <uuid>` is a B8 violation.
+    expect(afterNamedSession(fake.starts()[0]!)).toEqual([]);
   });
 
   test("a session whose directory configures a requested MCP server launches subscribed to it", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     const settingsIo = memorySettings();
     const result = await create({
       ...baseDeps(dir, fake.runCommand),
@@ -165,8 +140,7 @@ describe("create", () => {
     // Approved before the launch, or the session sits blocked on an approval prompt.
     expect(approvalIn(settingsIo, KEY)).toEqual(["yappr"]);
 
-    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    const claudeArgs = systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"));
+    const claudeArgs = afterNamedSession(fake.starts()[0]!);
     // FALSIFIER: this is the whole point — MCP configured but never subscribed
     // to is the bug. The flag spellings come from drovr, never from this repo.
     expect(claudeArgs).toEqual([
@@ -178,7 +152,7 @@ describe("create", () => {
 
   test("channels are on by default: every server the directory configures is subscribed, with no opt-in", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     await create({
       ...baseDeps(dir, fake.runCommand),
       launchConfigDeps: {
@@ -186,8 +160,7 @@ describe("create", () => {
         settingsIo: memorySettings(),
       },
     }, KEY);
-    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([
+    expect(afterNamedSession(fake.starts()[0]!)).toEqual([
       "--mcp-config", `${KEY}/.mcp.json`,
       "--settings", JSON.stringify({ enabledMcpjsonServers: ["atlassian"] }),
       "--dangerously-load-development-channels=server:atlassian",
@@ -196,15 +169,14 @@ describe("create", () => {
 
   test("a directory with no .mcp.json still launches with no args", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     await create(baseDeps(dir, fake.runCommand), KEY);
-    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([]);
+    expect(afterNamedSession(fake.starts()[0]!)).toEqual([]);
   });
 
   test("with an MCP declaration: the agent keeps it, and its launch is approved and subscribed per it", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     const settingsIo = memorySettings();
     const deps = {
       ...baseDeps(dir, fake.runCommand),
@@ -212,8 +184,7 @@ describe("create", () => {
     };
     const result = await create(deps, KEY, "rocketr", [{ name: "rocketr", notifications: true }, { name: "yappr", notifications: false }]);
     expect(result.ok).toBe(true);
-    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([
+    expect(afterNamedSession(fake.starts()[0]!)).toEqual([
       "--mcp-config", `${KEY}/.mcp.json`,
       "--settings", JSON.stringify({ enabledMcpjsonServers: ["rocketr", "yappr"] }),
       "--dangerously-load-development-channels=server:rocketr",
@@ -226,14 +197,14 @@ describe("create", () => {
 
   test("with a name: the agent holds it", async () => {
     const dir = await makeTempDir();
-    const result = await create(baseDeps(dir, makeFakeClaude().runCommand), KEY, "bob");
+    const result = await create(baseDeps(dir, makeFakeHost().runCommand), KEY, "bob");
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.agent.name).toBe("bob");
   });
 
   test("refused: name taken in this directory — no agent created", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@existing0000000000", name: "taken" }));
     const result = await create(deps, KEY, "taken");
     expect(result.ok).toBe(false);
@@ -244,20 +215,20 @@ describe("create", () => {
 
   test("refused: reserved word", async () => {
     const dir = await makeTempDir();
-    const result = await create(baseDeps(dir, makeFakeClaude().runCommand), KEY, "archive");
+    const result = await create(baseDeps(dir, makeFakeHost().runCommand), KEY, "archive");
     expect(result.ok).toBe(false);
   });
 
   test("launch failure is reported honestly, but the agent record still exists (recoverable via `on`)", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, async (argv: string[]) => {
-      if (argv[0] === "systemd-run") return { exitCode: 1, stdout: "", stderr: "systemd-run: permission denied" };
-      throw new Error(`unexpected argv ${JSON.stringify(argv)}`);
-    });
+    const fake = makeFakeHost({ failStart: "permission denied" });
+    const deps = baseDeps(dir, fake.runCommand);
     const result = await create(deps, KEY);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.launch.ok).toBe(false);
+      if (!result.launch.ok) expect(result.launch.error).toContain("permission denied");
+      expect(fake.panes).toEqual([]); // the failed launch's workspace is closed, not left half-started
       const store = await loadAgents(deps.agentsPath);
       if (store.status === "loaded") expect(store.state.agents[result.agent.id]?.state).toBe("on");
     }
@@ -267,9 +238,9 @@ describe("create", () => {
 // --- on: resume-id routes through exactly one function, B8, no-change, archived refusal ---
 
 describe("on", () => {
-  test("restore: dispatches EXACTLY `claude respawn <shortId>` — the resume id is never hard-coded inline in agent-actions.ts", async () => {
+  test("restore: resumes EXACTLY the agent's own session (`--resume <sessionId>`) in a new herdr pane, which becomes its restore handle — the resume id is never hard-coded inline in agent-actions.ts", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off", birthSessionId: "durable-xyz", restoreTarget: { sessionId: "durable-xyz", shortId: "durable-x" } }));
     const result = await on(deps, KEY, "@a1");
@@ -278,34 +249,39 @@ describe("on", () => {
       expect(result.kind).toBe("turn-on");
       expect(result.launchIssued).toBe(true);
     }
-    expect(fake.calls).toEqual([
-      ["claude", "agents", "--json"], // the liveness-gate listing, fetched before any decision
-      ["claude", "respawn", "durable-x"], // EXACTLY this — BAKR-22's argv-exactness
-    ]);
+    // The liveness-gate listing is fetched before any decision.
+    expect(isListingRead(fake.calls[0]!)).toBe(true);
+    // EXACTLY this claude argv and nothing else — BAKR-22's argv-exactness; never a fork, never a fresh session.
+    expect(fake.starts()).toEqual([["--resume", "durable-xyz"]]);
+    expect(fake.stops()).toEqual([]);
+    const store = await loadAgents(deps.agentsPath);
+    if (store.status !== "loaded") throw new Error("expected loaded store");
+    expect(store.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: "durable-xyz", shortId: "w1:p1" }); // same session, new pane
+    expect(store.state.launches).toEqual([]); // a resume resolves synchronously
   });
 
-  test("fresh (no restoreTarget yet): a real launch() with NO args at all — no --resume, nothing else", async () => {
+  test("fresh (no restoreTarget yet): a real launch() with NO args at all beyond its own session name — no --resume, nothing else", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off", restoreTarget: undefined }));
     await on(deps, KEY, "@a1");
 
-    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    const dashIdx = systemdCall.indexOf("--");
-    expect(systemdCall.slice(dashIdx + 3)).toEqual([]);
+    expect(fake.starts()).toHaveLength(1);
+    expect(afterNamedSession(fake.starts()[0]!)).toEqual([]);
   });
 
   test("no-change: already on, healthy (verified alive by the liveness gate) — no launch issued, nothing reported as cleared", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     // BAKR-22: `on()` always fetches a listing first now (the liveness
-    // gate) — seed it so this agent's short id verifies ALIVE, which is
-    // what makes "no-change, healthy" the correct outcome rather than an
-    // attempted (and wrongly-issued) respawn of a live session.
-    fake.listing.push({ id: "d1shortx", sessionId: "d1", cwd: KEY, startedAt: 1, kind: "background", pid: process.pid });
+    // gate) — seed it so this agent's session verifies ALIVE (the pane's
+    // claude pid is this test process), which is what makes "no-change,
+    // healthy" the correct outcome rather than an attempted (and
+    // wrongly-issued) restore of a live session.
+    const pane = fake.addPane({ cwd: KEY, sessionId: "d1" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: "d1shortx" } }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: pane.paneId } }));
     const result = await on(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -314,25 +290,44 @@ describe("on", () => {
       expect(result.launchWedgeCleared).toBe(false);
       expect(result.forkWedgeCleared).toBe(false);
     }
-    expect(fake.calls).toEqual([["claude", "agents", "--json"]]); // the liveness-gate listing, and NOTHING else — never respawns a verified-alive session
+    expect(listings(fake)).toBe(1);
+    expect(effects(fake)).toEqual([]); // the liveness-gate listing, and NOTHING else — never restores a verified-alive session
   });
 
-  test("BAKR-22 liveness gate: an already-on agent whose session cannot be independently verified alive is left ALONE this call — never respawned on an uncertain signal", async () => {
+  test("liveness gate keys on the SESSION id: a session alive under a handle other than the recorded one (a legacy short id, or a pane it has since moved to) is still alive — never restored beside itself", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
-    // Listed, but with NO pid reported this cycle — `decideLiveness` calls this `not-verifiable`, distinct from both "alive" and "dead".
-    fake.listing.push({ id: "d1shortx", sessionId: "d1", cwd: KEY, startedAt: 1, kind: "background" });
+    const fake = makeFakeHost();
+    fake.addPane({ cwd: KEY, sessionId: "d1" });
     const deps = baseDeps(dir, fake.runCommand);
+    // FALSIFIER: a gate that looked the session up by `shortId` alone would find nothing, call it absent, and start a second process on session d1.
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: "d1shortx" } }));
     const result = await on(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.kind).toBe("no-change");
+      expect(result.launchIssued).toBe(false);
+    }
+    expect(effects(fake)).toEqual([]);
+  });
+
+  test("BAKR-22 liveness gate: an already-on agent whose session cannot be independently verified alive is left ALONE this call — never restored on an uncertain signal", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeHost();
+    // Listed, but with NO claude pid in its pane this cycle — `decideLiveness` calls this `not-verifiable`, distinct from both "alive" and "dead".
+    const pane = fake.addPane({ cwd: KEY, sessionId: "d1" });
+    pane.pid = undefined;
+    const deps = baseDeps(dir, fake.runCommand);
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: pane.paneId } }));
+    const result = await on(deps, KEY, "@a1");
+    expect(result.ok).toBe(true);
     if (result.ok) expect(result.launchIssued).toBe(false);
-    expect(fake.calls).toEqual([["claude", "agents", "--json"]]); // never respawns — not-verifiable is not "dead"
+    expect(listings(fake)).toBe(1);
+    expect(effects(fake)).toEqual([]); // never restores — not-verifiable is not "dead"
   });
 
   test("refused: archived", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "archived" }));
     const result = await on(deps, KEY, "@a1");
     expect(result.ok).toBe(false);
@@ -414,28 +409,12 @@ describe("on", () => {
 describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the agent's current restore target, not only the respawn/fresh-keyed wedge", () => {
   const OLD_SHORT = "oldshort";
   const OLD_SESSION = "old-session-uuid";
+  // Text of the failures a pre-herdr stale-cwd escape left behind in the store: seeded as history only, never produced by the fake.
   const STALE_CWD_ERROR = `respawn exited 1: Couldn't start a background session (working directory no longer exists or is not accessible: /tmp/old-claimed-dir)`;
-
-  function makeFakeClaudeAlwaysStaleCwd(opts: { forkSucceeds: boolean }) {
-    const calls: string[][] = [];
-    let nextShortId = 0;
-    const runCommand: AgentActionDeps["runCommand"] = async (argv, cmdOpts) => {
-      calls.push(argv);
-      if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
-      if (argv[0] === "claude" && argv[1] === "respawn") return { exitCode: 1, stdout: "", stderr: STALE_CWD_ERROR };
-      if (argv[0] === "systemd-run") {
-        if (!opts.forkSucceeds) return { exitCode: 1, stdout: "", stderr: "systemd-run: simulated failure" };
-        const shortId = `newshort-${nextShortId++}`;
-        return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
-      }
-      throw new Error(`fake runCommand: unexpected argv ${JSON.stringify(argv)} (cwd=${cmdOpts.cwd})`);
-    };
-    return { runCommand, calls };
-  }
 
   test("BEFORE this fix's shape: a FAILED forkFrom(sessionId) record left by a previously-failed escape is invisible to on()'s wedge check — proven here by seeding ONLY that record (no respawn-keyed wedge at all) and showing on() reaches it anyway", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaudeAlwaysStaleCwd({ forkSucceeds: true });
+    const fake = makeFakeHost(); // nothing running: on() restores the session
     const deps = baseDeps(dir, fake.runCommand);
 
     const agent = makeAgent({ id: "@a1", state: "on", birthSessionId: OLD_SESSION, restoreTarget: { sessionId: OLD_SESSION, shortId: OLD_SHORT } });
@@ -465,17 +444,22 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
     if (reloaded.status !== "loaded") throw new Error("expected loaded store");
     const staleRecordStillPresent = reloaded.state.launches.some((l) => l.attemptId === "stale-fork-attempt");
     expect(staleRecordStillPresent).toBe(false); // cleared
+    expect(fake.starts()).toEqual([["--resume", OLD_SESSION]]); // and the restore below the clear ran
   });
 
-  test("the retried escape below the clear still runs normally: respawn refused (stale cwd) -> forkFrom dispatched and recorded fresh, no duplicate/stray record left over", async () => {
+  // Rewritten for herdr: this test used to drive the clear into a stale-cwd
+  // refusal from `claude respawn` and on into the moved-directory fork escape.
+  // A resume in a herdr pane never produces that refusal, so the escape is
+  // unreachable from here; what still applies is the clear itself, followed
+  // by an ordinary restore that leaves no stray record behind.
+  test("both stray records are cleared and the restore below the clear runs normally: the session is resumed, and no duplicate/stray record is left over", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaudeAlwaysStaleCwd({ forkSucceeds: true });
+    const fake = makeFakeHost();
     const deps: AgentActionDeps = {
       ...baseDeps(dir, fake.runCommand),
-      // This test fakes every Claude process edge; make the transcript edge
-      // deterministic too. Falling through to the real ~/.claude/projects
-      // made a clean CI host report could-not-tell while a developer host
-      // with transcript storage happened to take the intended fork path.
+      // Deterministic transcript edge: a restore never needs it, but falling
+      // through to the real ~/.claude/projects would make the outcome depend
+      // on the host if any path consulted it.
       transcriptProbeDeps: {
         listProjectDirs: async () => ({ ok: true, dirs: ["fixture-project"] }),
         transcriptExistsIn: async () => ({ ok: true, exists: true }),
@@ -503,25 +487,24 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
     expect(result.launchWedgeCleared).toBe(true);
     expect(result.forkWedgeCleared).toBe(true);
     expect(result.launchIssued).toBe(true);
-    expect(result.recovery?.kind).toBe("moved-directory-escape"); // respawn refused stale-cwd again, escaped again
+    expect(result.recovery).toBeUndefined(); // an ordinary restore: no escape or refusal to report
+    expect(fake.starts()).toEqual([["--resume", OLD_SESSION]]); // the SAME session, once
 
     const reloaded = await loadAgents(deps.agentsPath);
     if (reloaded.status !== "loaded") throw new Error("expected loaded store");
     expect(reloaded.state.launches.some((l) => l.attemptId === "old-respawn-attempt")).toBe(false);
     expect(reloaded.state.launches.some((l) => l.attemptId === "stale-fork-attempt")).toBe(false);
-    // Exactly ONE forkFrom-kind record remains: the NEW attempt this call
-    // just issued (started, not failed) — no stray left beside it.
-    const forkRecords = reloaded.state.launches.filter((l) => l.attemptKey?.kind === "forkFrom");
-    expect(forkRecords).toHaveLength(1);
-    expect(forkRecords[0]?.error).toBeUndefined();
+    // Nothing remains: the restore resolved synchronously, and no stray record is left beside it.
+    expect(reloaded.state.launches).toEqual([]);
+    expect(reloaded.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: OLD_SESSION, shortId: "w1:p1" });
   });
 
   test("NEGATIVE CONTROL: no stray forkFrom record exists for this agent's CURRENT target -> both clearing reports stay false", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
-    fake.listing.push({ id: "d1shortx", sessionId: "d1", cwd: KEY, startedAt: 1, kind: "background", pid: process.pid });
+    const fake = makeFakeHost();
+    const pane = fake.addPane({ cwd: KEY, sessionId: "d1" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: "d1shortx" } }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: pane.paneId } }));
 
     const result = await on(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
@@ -535,20 +518,27 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
 // --- off / archive / delete share ONE stop path (DoD item 2) -------------
 
 describe("off, archive and delete all stop a session through the IDENTICAL `stopLiveSession` function", () => {
-  test("stopLiveSession: exact sessionId match against a listing, then stop that entry's short id — never cwd", async () => {
-    const fake = makeFakeClaude();
-    fake.listing.push({ id: "short-9", sessionId: "live-9", cwd: "/somewhere/else", startedAt: 1, kind: "background" });
+  test("stopLiveSession: exact sessionId match against a listing, then stop that entry's own id (its pane's workspace) — never cwd", async () => {
+    const fake = makeFakeHost();
+    const pane = fake.addPane({ cwd: "/somewhere/else", sessionId: "live-9" });
     const deps = baseDeps(await makeTempDir(), fake.runCommand);
     const outcome = await stopLiveSession(deps, "live-9");
-    expect(outcome.kind).toBe("stopped");
-    expect(fake.calls).toEqual([
-      ["claude", "agents", "--json"],
-      ["claude", "stop", "short-9"],
-    ]);
+    expect(outcome).toEqual({ kind: "stopped", shortId: pane.paneId });
+    expect(listings(fake)).toBe(1);
+    expect(effects(fake)).toEqual([["herdr", "workspace", "close", pane.workspaceId]]);
+  });
+
+  test("stopLiveSession: a session still under legacy `claude --bg` is stopped by `claude stop <its short id>`", async () => {
+    const fake = makeFakeHost();
+    fake.legacy.push({ id: "short-9", sessionId: "live-9", cwd: KEY, startedAt: 1, kind: "background" });
+    const deps = baseDeps(await makeTempDir(), fake.runCommand);
+    const outcome = await stopLiveSession(deps, "live-9");
+    expect(outcome).toEqual({ kind: "stopped", shortId: "short-9" });
+    expect(effects(fake)).toEqual([["claude", "stop", "short-9"]]);
   });
 
   // Review finding 1 (PR #16, round 1): every prior stop-path test pushed
-  // exactly ONE entry into `fake.listing`, so "exact sessionId match" was
+  // exactly ONE entry into the fake listing, so "exact sessionId match" was
   // indistinguishable from "take sessions[0]" — a mutation to exactly that
   // effect passed the full suite. This is THE headline invariant (B9): the
   // reason candlestix's directory-keyed stop mechanism is forbidden here.
@@ -558,87 +548,76 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
   // test fail — the target agent's session is deliberately placed neither
   // first nor last in a 3-entry listing.
   test("stopLiveSession: selects the SIBLING agent's own session out of a listing containing SEVERAL — never sessions[0], never positional", async () => {
-    const fake = makeFakeClaude();
-    fake.listing.push(
-      { id: "short-other-1", sessionId: "live-OTHER-1", cwd: KEY, startedAt: 1, kind: "background" },
-      { id: "short-target", sessionId: "live-TARGET", cwd: KEY, startedAt: 2, kind: "background" }, // the one we want — in the MIDDLE, not sessions[0]
-      { id: "short-other-2", sessionId: "live-OTHER-2", cwd: KEY, startedAt: 3, kind: "background" }
-    );
+    const fake = makeFakeHost();
+    fake.addPane({ cwd: KEY, sessionId: "live-OTHER-1" });
+    const target = fake.addPane({ cwd: KEY, sessionId: "live-TARGET" }); // the one we want — in the MIDDLE, not sessions[0]
+    fake.addPane({ cwd: KEY, sessionId: "live-OTHER-2" });
     const deps = baseDeps(await makeTempDir(), fake.runCommand);
     const outcome = await stopLiveSession(deps, "live-TARGET");
     expect(outcome.kind).toBe("stopped");
-    if (outcome.kind === "stopped") expect(outcome.shortId).toBe("short-target"); // NOT short-other-1 (sessions[0])
-    expect(fake.calls).toEqual([
-      ["claude", "agents", "--json"],
-      ["claude", "stop", "short-target"],
-    ]); // exactly one stop call, naming the right sibling and nothing else
+    if (outcome.kind === "stopped") expect(outcome.shortId).toBe(target.paneId); // NOT w1:p1 (sessions[0])
+    expect(effects(fake)).toEqual([["herdr", "workspace", "close", target.workspaceId]]); // exactly one stop call, naming the right sibling and nothing else
+    expect(fake.panes.map((p) => p.sessionId)).toEqual(["live-OTHER-1", "live-OTHER-2"]);
   });
 
   test("stopLiveSession: the target is ABSENT while siblings are present — reports already-gone, and issues NO stop at all (never stops a sibling by mistake)", async () => {
-    const fake = makeFakeClaude();
-    fake.listing.push(
-      { id: "short-other-1", sessionId: "live-OTHER-1", cwd: KEY, startedAt: 1, kind: "background" },
-      { id: "short-other-2", sessionId: "live-OTHER-2", cwd: KEY, startedAt: 2, kind: "background" }
-    );
+    const fake = makeFakeHost();
+    fake.addPane({ cwd: KEY, sessionId: "live-OTHER-1" });
+    fake.addPane({ cwd: KEY, sessionId: "live-OTHER-2" });
     const deps = baseDeps(await makeTempDir(), fake.runCommand);
     const outcome = await stopLiveSession(deps, "live-TARGET-not-in-listing");
     expect(outcome.kind).toBe("already-gone");
-    expect(fake.calls).toEqual([["claude", "agents", "--json"]]); // listed, but NEVER called stop on either sibling
-    expect(fake.listing.length).toBe(2); // both siblings still present — nothing was removed
+    expect(listings(fake)).toBe(1);
+    expect(effects(fake)).toEqual([]); // listed, but NEVER called stop on either sibling
+    expect(fake.panes.length).toBe(2); // both siblings still present — nothing was removed
   });
 
   test("off calls stopLiveSession, but BAKR-22 leaves restoreTarget INTACT on success — clearing it would make the next `on` take the `fresh` branch and silently discard the conversation", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
-    fake.listing.push({ id: "short-1", sessionId: "live-1", cwd: KEY, startedAt: 1, kind: "background" });
+    const fake = makeFakeHost();
+    const pane = fake.addPane({ cwd: KEY, sessionId: "live-1" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-1", shortId: "short-1" } }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-1", shortId: pane.paneId } }));
 
     const result = await off(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("stopped");
-    expect(fake.calls).toEqual([
-      ["claude", "agents", "--json"],
-      ["claude", "stop", "short-1"],
-    ]);
+    expect(listings(fake)).toBe(1);
+    expect(effects(fake)).toEqual([["herdr", "workspace", "close", pane.workspaceId]]);
 
     const store = await loadAgents(deps.agentsPath);
     if (store.status === "loaded") {
       expect(store.state.agents["@a1"]?.state).toBe("off");
-      expect(store.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: "live-1", shortId: "short-1" }); // UNCHANGED — a future `on` still respawns it
+      expect(store.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: "live-1", shortId: pane.paneId }); // UNCHANGED — a future `on` still resumes it
     }
   });
 
   test("archive calls the SAME stop sequence as off, for an equivalent fixture", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
-    fake.listing.push({ id: "short-2", sessionId: "live-2", cwd: KEY, startedAt: 1, kind: "background" });
+    const fake = makeFakeHost();
+    const pane = fake.addPane({ cwd: KEY, sessionId: "live-2" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-2", shortId: "short-2" } }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-2", shortId: pane.paneId } }));
 
     const result = await archive(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "archived") expect(result.stop.kind).toBe("stopped");
-    expect(fake.calls).toEqual([
-      ["claude", "agents", "--json"],
-      ["claude", "stop", "short-2"],
-    ]); // IDENTICAL shape to off's own call sequence above
+    expect(listings(fake)).toBe(1);
+    expect(effects(fake)).toEqual([["herdr", "workspace", "close", pane.workspaceId]]); // IDENTICAL shape to off's own call sequence above
   });
 
   test("delete calls the SAME stop sequence too, then removes the record and retires the id", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
-    fake.listing.push({ id: "short-3", sessionId: "live-3", cwd: KEY, startedAt: 1, kind: "background" });
+    const fake = makeFakeHost();
+    const pane = fake.addPane({ cwd: KEY, sessionId: "live-3" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-3", shortId: "short-3" } }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-3", shortId: pane.paneId } }));
 
     const result = await deleteAgent(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "deleted") expect(result.stop.kind).toBe("stopped");
-    expect(fake.calls).toEqual([
-      ["claude", "agents", "--json"],
-      ["claude", "stop", "short-3"],
-    ]);
+    expect(listings(fake)).toBe(1);
+    expect(effects(fake)).toEqual([["herdr", "workspace", "close", pane.workspaceId]]);
 
     const store = await loadAgents(deps.agentsPath);
     if (store.status === "loaded") {
@@ -649,7 +628,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
 
   test("off: nothing to stop when there is no live session — stop.kind is 'nothing-to-stop', no listing call at all", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude();
+    const fake = makeFakeHost();
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: undefined }));
     const result = await off(deps, KEY, "@a1");
@@ -660,7 +639,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
 
   test("off: session already gone from a SUCCESSFUL listing — restoreTarget left INTACT (BAKR-22: it is not a liveness cache any more, see the dedicated 'restoreTarget INTACT' test above)", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(await makeTempDir(), makeFakeClaude().runCommand); // empty listing
+    const deps = baseDeps(dir, makeFakeHost().runCommand); // empty listing
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "vanished", shortId: "vanished" } }));
     const result = await off(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
@@ -671,7 +650,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
 
   test("off: a LISTING FAILURE is reported distinctly and restoreTarget is LEFT ALONE (BAKR-17 Q2: never collapse to 'nothing running')", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude({ failListing: true });
+    const fake = makeFakeHost({ failListing: true });
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-1", shortId: "short-1" } }));
     const result = await off(deps, KEY, "@a1");
@@ -684,23 +663,24 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     }
   });
 
-  test("off: a failed `claude stop` is reported and restoreTarget is left alone so a retry is meaningful", async () => {
+  test("off: a failed stop (the workspace close is refused) is reported and restoreTarget is left alone so a retry is meaningful", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude({ stopBehavior: () => ({ ok: false, error: "claude: no such session" }) });
-    fake.listing.push({ id: "short-4", sessionId: "live-4", cwd: KEY, startedAt: 1, kind: "background" });
+    const fake = makeFakeHost({ failStop: true });
+    const pane = fake.addPane({ cwd: KEY, sessionId: "live-4" });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-4", shortId: "short-4" } }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-4", shortId: pane.paneId } }));
     const result = await off(deps, KEY, "@a1");
+    expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("stop-failed");
     const store = await loadAgents(deps.agentsPath);
-    if (store.status === "loaded") expect(store.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: "live-4", shortId: "short-4" });
+    if (store.status === "loaded") expect(store.state.agents["@a1"]?.restoreTarget).toEqual({ sessionId: "live-4", shortId: pane.paneId });
   });
 
   test("delete: when the stop cannot be confirmed, the agent is PARKED as archived, not removed — retrying delete is meaningful", async () => {
     const dir = await makeTempDir();
-    const fake = makeFakeClaude({ failListing: true });
+    const fake = makeFakeHost({ failListing: true });
     const deps = baseDeps(dir, fake.runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-5", shortId: "short-5" } }));
+    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-5", shortId: "w1:p1" } }));
     const result = await deleteAgent(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.kind).toBe("parked");
@@ -711,12 +691,13 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     }
 
     // Retry, now with a working listing — completes the delete.
-    const fake2 = makeFakeClaude();
-    fake2.listing.push({ id: "short-5", sessionId: "live-5", cwd: KEY, startedAt: 1, kind: "background" });
+    const fake2 = makeFakeHost();
+    fake2.addPane({ cwd: KEY, sessionId: "live-5" });
     const retryDeps = { ...deps, runCommand: fake2.runCommand };
     const retryResult = await deleteAgent(retryDeps, KEY, "@a1");
     expect(retryResult.ok).toBe(true);
     if (retryResult.ok) expect(retryResult.kind).toBe("deleted");
+    expect(fake2.stops()).toEqual(["w1"]);
   });
 
   test("delete leaves Claude Code's own conversation storage untouched — this file may READ it (BAKR-22's transcriptProbeDeps seam) but never writes to it", async () => {
@@ -743,7 +724,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
 describe("archive / unarchive", () => {
   test("archive keeps the name; unarchive lands on off, never on", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", name: "keepme" }));
 
     const archived = await archive(deps, KEY, "@a1");
@@ -760,7 +741,7 @@ describe("archive / unarchive", () => {
 
   test("unarchive refused on a non-archived agent", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off" }));
     const result = await unarchive(deps, KEY, "@a1");
     expect(result.ok).toBe(false);
@@ -768,7 +749,7 @@ describe("archive / unarchive", () => {
 
   test("rename refuses a taken name held by an ARCHIVED agent (B4)", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1" }));
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a2", name: "held", state: "archived" }));
     const result = await rename(deps, KEY, "@a1", "held");
@@ -782,7 +763,7 @@ describe("rename / name", () => {
   test("name (the alias) and rename are the same function — persisted identically", async () => {
     expect(nameVerb).toBe(rename);
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1" }));
     const result = await nameVerb(deps, KEY, "@a1", "firstname");
     expect(result.ok).toBe(true);
@@ -796,7 +777,7 @@ describe("rename / name", () => {
 describe("list", () => {
   test("scoped to the given directory, archived included, another directory's agents excluded", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
     await saveAgents(
       deps.agentsPath,
       putAgent(
@@ -818,7 +799,7 @@ describe("list", () => {
 describe("attachTarget", () => {
   test("on + live: returns the session identity, refuses nothing", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "l1", shortId: "l1short0" } }));
     const result = await attachTarget(deps, KEY, "@a1");
     expect(result.ok).toBe(true);
@@ -830,7 +811,7 @@ describe("attachTarget", () => {
 
   test("off: refused with a message pointing at `on`, never silently started", async () => {
     const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off" }));
     const result = await attachTarget(deps, KEY, "@a1");
     expect(result.ok).toBe(false);
@@ -848,7 +829,7 @@ describe("a malformed agents.json is refused, never overwritten, by every verb",
     const dir = await makeTempDir();
     const agentsPath = join(dir, "agents.json");
     await Bun.write(agentsPath, "{ not json");
-    const deps = baseDeps(dir, makeFakeClaude().runCommand);
+    const deps = baseDeps(dir, makeFakeHost().runCommand);
 
     const createResult = await create(deps, KEY);
     expect(createResult.ok).toBe(false);
@@ -868,7 +849,7 @@ describe("mcp", () => {
     const dir = await makeTempDir();
     const settingsIo = memorySettings();
     const deps = {
-      ...baseDeps(dir, makeFakeClaude().runCommand),
+      ...baseDeps(dir, makeFakeHost().runCommand),
       launchConfigDeps: { readConfigFile: async () => ROCKETR_MCP, settingsIo },
     };
     const created = await create(deps, KEY, "rocketr");
@@ -902,7 +883,7 @@ describe("mcp", () => {
   test("refused for an agent that is not in this directory, and nothing is written", async () => {
     const dir = await makeTempDir();
     const settingsIo = memorySettings();
-    const deps = { ...baseDeps(dir, makeFakeClaude().runCommand), launchConfigDeps: { readConfigFile: async () => ROCKETR_MCP, settingsIo } };
+    const deps = { ...baseDeps(dir, makeFakeHost().runCommand), launchConfigDeps: { readConfigFile: async () => ROCKETR_MCP, settingsIo } };
     const result = await mcp(deps, KEY, "nobody", [{ name: "rocketr", notifications: true }]);
     expect(result.ok).toBe(false);
     expect(settingsIo.files).toEqual({});

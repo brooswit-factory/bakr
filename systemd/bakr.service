@@ -47,18 +47,12 @@ ExecStart="@@BUN_PATH@@" run "@@REPO_ROOT@@/src/index.ts"
 Restart=on-failure
 RestartSec=5
 
-# Deliberately the default (control-group), not overridden — same as
-# candlestix's own unit, and for the identical reason, re-verified for
-# bakr's own spawn substrate rather than assumed to transfer: every session
-# bakr launches goes through its own `systemd-run --user --scope`
-# (src/spawn/launch.ts), a SIBLING cgroup to this unit's own, never a
-# descendant — so `systemctl --user restart bakr` only ever tears down
-# bakr's own process, never a session it launched. See this ticket's PR
-# description for the before/after cgroup inspection that verifies this
-# for bakr specifically, not merely inherited from candlestix's own
-# measurement. KillMode=process was considered and rejected as unnecessary
-# once that sibling-cgroup property was confirmed to already hold
-# structurally, exactly as candlestix's own unit comment reasons.
+# Deliberately the default (control-group), not overridden. Every session
+# bakr launches runs in a herdr pane, a child of the herdr server
+# (herdr.service, its own cgroup), never a descendant of this unit — so
+# `systemctl --user restart bakr` only ever tears down bakr's own process,
+# never a session it launched. That holds only while the herdr server runs
+# as its own service: bakr must never be the process that starts it.
 KillMode=control-group
 
 [Install]

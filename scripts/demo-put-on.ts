@@ -76,11 +76,12 @@ async function main(): Promise<void> {
   const path = agentsPath();
   let attemptId: string;
   let respawnShortId: string | undefined;
+  let respawnSessionId: string | undefined;
   let targetAgentId: string;
 
   if (agentId !== undefined) {
     // Restore path (BAKR-22: now `respawn <shortId>`, not `--resume <fullId>`) — the named agent must already exist, in THIS directory, with a restoreTarget.
-    const decision = await withAgentStoreLock<{ ok: true; attemptId: string; shortId: string } | { ok: false; error: string }>(path, (current) => {
+    const decision = await withAgentStoreLock<{ ok: true; attemptId: string; shortId: string; sessionId: string } | { ok: false; error: string }>(path, (current) => {
       const outcome = resolveAgent(current, key, agentId);
       if (outcome.outcome === "not-found") return { state: current, result: { ok: false, error: `no agent "${agentId}" found in "${key}"` } };
       if (outcome.outcome === "found-elsewhere") return { state: current, result: { ok: false, error: `agent "${agentId}" belongs to a different directory: "${outcome.directory}"` } };
@@ -89,7 +90,7 @@ async function main(): Promise<void> {
       const newAttemptId = crypto.randomUUID();
       const attemptKey: AttemptKey = { kind: "respawn", shortId: agent.restoreTarget.shortId };
       const next = beginLaunch(current, agent.id, key, attemptKey, newAttemptId, Date.now());
-      return { state: next, result: { ok: true, attemptId: newAttemptId, shortId: agent.restoreTarget.shortId } };
+      return { state: next, result: { ok: true, attemptId: newAttemptId, shortId: agent.restoreTarget.shortId, sessionId: agent.restoreTarget.sessionId } };
     });
     if (decision.status === "malformed") {
       console.error(`refusing to write: agent store at "${path}" is malformed: ${decision.error}`);
@@ -101,6 +102,7 @@ async function main(): Promise<void> {
     }
     attemptId = decision.result.attemptId;
     respawnShortId = decision.result.shortId;
+    respawnSessionId = decision.result.sessionId;
     targetAgentId = agentId;
   } else {
     // Fresh path: mint a brand-new, unnamed `on` agent with no session yet.
@@ -121,15 +123,16 @@ async function main(): Promise<void> {
     console.log(`minted: unnamed agent ${targetAgentId} in "${key}"`);
   }
 
-  if (respawnShortId !== undefined) {
-    const result = await respawnSession(respawnShortId, { runCommand });
+  if (respawnShortId !== undefined && respawnSessionId !== undefined) {
+    // Under herdr a restore resumes the same session in a new pane (src/spawn/respawn.ts). This demo passes no MCP flags.
+    const result = await respawnSession({ sessionId: respawnSessionId, directory: key, args: [] }, { runCommand, label: targetAgentId });
     if (!result.ok) {
       await withAgentStoreLock(path, (current) => ({ state: markLaunchFailed(current, attemptId, result.error), result: undefined }));
       console.error(`respawn failed: ${result.error}`);
       process.exit(1);
     }
-    await withAgentStoreLock(path, (current) => ({ state: resolveRespawnAttempt(current, attemptId), result: undefined }));
-    console.log(`respawned: short id ${respawnShortId} for agent ${targetAgentId} in "${key}" — same session, no fork`);
+    await withAgentStoreLock(path, (current) => ({ state: resolveRespawnAttempt(current, attemptId, result.id), result: undefined }));
+    console.log(`restored: session ${respawnSessionId} for agent ${targetAgentId} in "${key}" into pane ${result.id} — same session, no fork`);
     return;
   }
 

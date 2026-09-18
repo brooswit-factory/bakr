@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { checkLiveness, decideLiveness, isPidAlive } from "../../src/spawn/liveness";
+import { makeFakeHost } from "../support/fake-host";
 import type { BackgroundSessionInfo } from "../../src/spawn/parse";
 
 describe("isPidAlive", () => {
@@ -44,32 +45,26 @@ describe("decideLiveness", () => {
 
 describe("checkLiveness", () => {
   test("a listing that finds the session with our own (alive) pid reports alive", async () => {
-    const verdict = await checkLiveness("abc", {
-      runCommand: async () => ({
-        exitCode: 0,
-        stdout: JSON.stringify([{ id: "abc", cwd: "/x", kind: "background", startedAt: 1, sessionId: "s", pid: process.pid }]),
-        stderr: "",
-      }),
-    });
-    expect(verdict).toEqual({ status: "alive", pid: process.pid });
+    const host = makeFakeHost();
+    host.legacy.push({ id: "abc", cwd: "/x", kind: "background", startedAt: 1, sessionId: "s", pid: process.pid });
+    expect(await checkLiveness("abc", { runCommand: host.runCommand })).toEqual({ status: "alive", pid: process.pid });
   });
 
   test("a listing that finds the session with an implausible pid reports not-verifiable", async () => {
-    const verdict = await checkLiveness("abc", {
-      runCommand: async () => ({
-        exitCode: 0,
-        stdout: JSON.stringify([{ id: "abc", cwd: "/x", kind: "background", startedAt: 1, sessionId: "s", pid: 2 ** 30 }]),
-        stderr: "",
-      }),
-    });
-    expect(verdict.status).toBe("not-verifiable");
+    const host = makeFakeHost();
+    host.legacy.push({ id: "abc", cwd: "/x", kind: "background", startedAt: 1, sessionId: "s", pid: 2 ** 30 });
+    expect((await checkLiveness("abc", { runCommand: host.runCommand })).status).toBe("not-verifiable");
   });
 
   test("a listing that does not contain the session reports absent, not dead", async () => {
-    const verdict = await checkLiveness("abc", {
-      runCommand: async () => ({ exitCode: 0, stdout: "[]", stderr: "" }),
-    });
-    expect(verdict.status).toBe("absent");
+    expect((await checkLiveness("abc", { runCommand: makeFakeHost().runCommand })).status).toBe("absent");
+  });
+
+  test("by session id: a session restored into a new pane is still alive, whatever its old short id was", async () => {
+    const host = makeFakeHost();
+    host.addPane({ cwd: "/x", sessionId: "s", pid: process.pid });
+    expect(await checkLiveness("old-short-id", { runCommand: host.runCommand }, "s")).toEqual({ status: "alive", pid: process.pid });
+    expect((await checkLiveness("old-short-id", { runCommand: host.runCommand })).status).toBe("absent");
   });
 
   // BAKR-22: THIS is the test that closes the epic's incident — a listing
@@ -82,10 +77,8 @@ describe("checkLiveness", () => {
   // `checkLiveness` still folded these together, this test's `.status`
   // would read `absent` (or the old `unknown`), not `listing-failed`.
   test("a failed listing reports its OWN verdict, listing-failed — NEVER absent, and never throws", async () => {
-    const verdict = await checkLiveness("abc", {
-      runCommand: async () => ({ exitCode: 1, stdout: "", stderr: "not logged in" }),
-    });
-    expect(verdict).toEqual({ status: "listing-failed", reason: expect.stringContaining("not logged in") });
+    const verdict = await checkLiveness("abc", { runCommand: makeFakeHost({ failListing: true }).runCommand });
+    expect(verdict).toEqual({ status: "listing-failed", reason: expect.stringContaining("listing failure") });
     expect(verdict.status).not.toBe("absent");
   });
 });

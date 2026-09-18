@@ -8,6 +8,7 @@ import type { ClaimKey } from "../../src/claim-key-resolve";
 import { runCli, type CliDeps } from "../../src/cli/main";
 import type { ResidentMessenger, ResidentTarget } from "../../src/cli/send";
 import { realOrphanProbeDeps, realResolveInputs } from "../../src/paths";
+import { makeFakeHost } from "../support/fake-host";
 
 const dirs: string[] = [];
 afterEach(async () => { while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true }); });
@@ -18,6 +19,12 @@ function refusal(reason: string): Error {
 
 type Listed = { sessionId: string; cwd: string; pid?: number };
 
+/** A listing reads herdr's panes (and each pane's claude pid) plus legacy `claude agents --json` — nothing else. */
+const isListingCommand = (argv: string[]): boolean => {
+  const line = argv.join(" ");
+  return line === "herdr agent list" || line.startsWith("herdr pane process-info --pane ") || line === "claude agents --json";
+};
+
 async function setup(agent: Partial<AgentRecord>, send: ResidentMessenger["message"], listing?: (root: string) => Listed[] | Error) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "bakr-cli-send-")));
   dirs.push(root);
@@ -27,15 +34,16 @@ async function setup(agent: Partial<AgentRecord>, send: ResidentMessenger["messa
     birthSessionId: "full-session", restoreTarget: { sessionId: "full-session", shortId: "fullsess" }, ...agent,
   }));
   const out: string[] = [], err: string[] = [], sent: [ResidentTarget, string][] = [], commands: string[][] = [];
-  const listed = listing ?? (r => [{ sessionId: "full-session", cwd: r, pid: 1 }]);
+  const l = (listing ?? (r => [{ sessionId: "full-session", cwd: r, pid: process.pid }]))(root);
+  // The listed sessions run in herdr panes; a listing Error makes every listing throw.
+  const host = makeFakeHost({ failListing: l instanceof Error });
+  if (!(l instanceof Error)) for (const e of l) host.addPane({ sessionId: e.sessionId, cwd: e.cwd, ...(e.pid === undefined ? {} : { pid: e.pid }) });
   const deps: CliDeps = {
-    actions: { agentsPath, runCommand: async argv => {
+    actions: { agentsPath, runCommand: async (argv, opts) => {
       commands.push(argv);
-      // send only ever reads the listing — never launches, respawns, or stops a session itself.
-      if (argv.join(" ") !== "claude agents --json") throw new Error(`send must not run ${argv.join(" ")}`);
-      const l = listed(root);
-      if (l instanceof Error) return { exitCode: 1, stdout: "", stderr: l.message };
-      return { exitCode: 0, stderr: "", stdout: JSON.stringify(l.map(e => ({ kind: "background", id: e.sessionId.slice(0, 8), startedAt: 1, ...e }))) };
+      // send only ever reads the listing — never launches, restores, or stops a session itself.
+      if (!isListingCommand(argv)) throw new Error(`send must not run ${argv.join(" ")}`);
+      return host.runCommand(argv, opts);
     }, now: () => 1, generateAttemptId: () => "x", randomBytes: n => new Uint8Array(n) },
     adopt: {} as CliDeps["adopt"], claimsPath: join(root, "claims.json"), resolveInputs: realResolveInputs, probeDeps: realOrphanProbeDeps,
     cwd: root, home: root, stdinIsTTY: false, stdoutIsTTY: false,
@@ -43,7 +51,7 @@ async function setup(agent: Partial<AgentRecord>, send: ResidentMessenger["messa
     prompt: async () => { throw new Error("must not prompt"); }, spawnAttach: async () => { throw new Error("must not attach"); },
     messenger: { message: async (target, text) => { sent.push([target, text]); return send(target, text); } },
   };
-  return { root, deps, out, err, sent, commands, agentsPath };
+  return { root, deps, out, err, sent, commands, agentsPath, host };
 }
 
 test("send targets the agent's current session and prints the reply without a TTY", async () => {
@@ -81,7 +89,7 @@ test("an off agent is refused before any transport call", async () => {
 // the agent directory, which matched no listed cwd, and was refused as
 // not-running.
 test("an agent whose session moved into a worktree under its directory is listed and sendable there", async () => {
-  const s = await setup({}, async () => ({ status: "replied", reply: "done" }), r => [{ sessionId: "full-session", cwd: `${r}/.claude/worktrees/feat`, pid: 1 }]);
+  const s = await setup({}, async () => ({ status: "replied", reply: "done" }), r => [{ sessionId: "full-session", cwd: `${r}/.claude/worktrees/feat` }]);
   expect(await runCli(["list"], s.deps)).toBe(0);
   expect(s.out.join("")).toBe(`@a1 "alice" — on — listed by claude in .claude/worktrees/feat\n`);
   s.out.length = 0;
@@ -91,24 +99,34 @@ test("an agent whose session moved into a worktree under its directory is listed
 });
 
 test("an on agent whose session is not running is reported as such by list and refused by send, with nothing respawned", async () => {
-  const s = await setup({}, async () => { throw new Error("must not send"); }, r => [{ sessionId: "other-session", cwd: r, pid: 1 }]);
+  const s = await setup({}, async () => { throw new Error("must not send"); }, r => [{ sessionId: "other-session", cwd: r }]);
   const before = await loadAgents(s.agentsPath);
   expect(await runCli(["list"], s.deps)).toBe(0);
   expect(s.out.join("")).toBe(`@a1 "alice" — on — not listed\n`);
   expect(await runCli(["alice", "send", "hi"], s.deps)).toBe(1);
   expect(s.sent).toEqual([]);
   expect(s.err.join("")).toContain("not-running: agent @a1 is on in bakr's store but its exact session full-session is not a running background session — nothing was sent; the daemon restores it, or run `bakr alice on`");
-  expect(s.commands.every(c => c.join(" ") === "claude agents --json")).toBe(true);
+  expect(s.commands.every(isListingCommand)).toBe(true);
   expect(await loadAgents(s.agentsPath)).toEqual(before);
 });
 
 test("the exact session running outside the agent's directory is never messaged", async () => {
-  const s = await setup({}, async () => { throw new Error("must not send"); }, r => [{ sessionId: "full-session", cwd: `${r}-sibling`, pid: 1 }]);
+  const s = await setup({}, async () => { throw new Error("must not send"); }, r => [{ sessionId: "full-session", cwd: `${r}-sibling` }]);
   expect(await runCli(["list"], s.deps)).toBe(0);
   expect(s.out.join("")).toBe(`@a1 "alice" — on — listed by claude, not sendable (outside-directory)\n`);
   expect(await runCli(["alice", "send", "hi"], s.deps)).toBe(1);
   expect(s.sent).toEqual([]);
   expect(s.err.join("")).toContain("outside-directory:");
+});
+
+test("a session still running under legacy `claude --bg` (not yet relaunched into herdr) is listed and sendable too", async () => {
+  const s = await setup({}, async () => ({ status: "replied", reply: "done" }), () => []);
+  s.host.legacy.push({ id: "fullsess", sessionId: "full-session", cwd: s.root, startedAt: 1, kind: "background", pid: process.pid });
+  expect(await runCli(["list"], s.deps)).toBe(0);
+  expect(s.out.join("")).toBe(`@a1 "alice" — on — listed by claude\n`);
+  s.out.length = 0;
+  expect(await runCli(["alice", "send", "status?"], s.deps)).toBe(0);
+  expect(s.sent).toEqual([[{ provider: "claude", sessionId: "full-session", cwd: s.root }, "status?"]]);
 });
 
 test("a failed listing refuses send without guessing a cwd", async () => {

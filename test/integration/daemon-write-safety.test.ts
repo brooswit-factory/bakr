@@ -24,7 +24,7 @@ import { realResolveInputs, realOrphanProbeDeps } from "../../src/paths";
 import { beginLaunch, emptySessionSlots, markLaunchStarted, resolveLaunch } from "../../src/session-slots";
 import { save as saveSlots } from "../../src/session-slots-store";
 import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
-import type { RunCommandOptions, CommandResult } from "../../src/spawn";
+import { makeFakeHost } from "../support/fake-host";
 
 const cleanupDirs: string[] = [];
 const pendingChmodRestores: Array<{ path: string; mode: number }> = [];
@@ -77,25 +77,22 @@ function expectUnchanged(before: Snapshot, after: Snapshot): void {
   }
 }
 
-function fakeRunCommand(): (argv: string[], opts: RunCommandOptions) => Promise<CommandResult> {
-  let n = 0;
-  return async (argv) => {
-    if (argv[0] === "claude" && argv[1] === "agents") {
-      return { exitCode: 0, stdout: "[]", stderr: "" }; // nothing currently running -> forces a restore attempt
-    }
-    // BAKR-22: an agent that already has a `restoreTarget` (as this file's
-    // migrated seed does) restores via `claude respawn <shortId>`, not
-    // `systemd-run ... --bg`. Only a genuinely FRESH launch (no restoreTarget
-    // yet) still goes through systemd-run.
-    if (argv[0] === "claude" && argv[1] === "respawn") {
-      return { exitCode: 0, stdout: `respawned ${argv[2]}\n`, stderr: "" };
-    }
-    if (argv[0] === "systemd-run") {
-      const shortId = `short-${n++}`;
-      return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
-    }
-    throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
-  };
+/**
+ * The shared herdr + legacy-claude fake (test/support/fake-host.ts). It
+ * touches no filesystem, so any change inside the claimed directory is bakr's
+ * own. Nothing is running at the start of the cycle, which forces a restore:
+ * an agent that already has a `restoreTarget` (as this file's migrated seed
+ * does) is resumed (`--resume <sessionId>`) in a new pane rooted at its
+ * directory. launch-config is NOT stubbed: it reads the claimed directory's
+ * real (absent) `.mcp.json`, so no MCP approval is due and none may be
+ * written there.
+ */
+const fakeHost = () => makeFakeHost();
+
+/** The restore really happened: exactly one resume of the seeded session, in a pane rooted at the claimed directory. */
+function expectRestoredInto(host: ReturnType<typeof fakeHost>, key: string): void {
+  expect(host.starts()).toEqual([["--resume", "session-to-restore"]]);
+  expect(host.panes.map((p) => p.cwd)).toEqual([key]);
 }
 
 describe("nothing is written inside a claimed directory across a full daemon cycle, including a restore", () => {
@@ -123,8 +120,9 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     slots = resolveLaunch(slots, "seed-short", "session-to-restore");
     await saveSlots(join(storeDir, "session-slots.json"), slots);
 
+    const host = fakeHost();
     const deps: DaemonDeps = {
-      runCommand: fakeRunCommand(),
+      runCommand: host.runCommand,
       claimsPath: join(storeDir, "claims.json"),
       agentsPath: join(storeDir, "agents.json"),
       sessionSlotsPath: join(storeDir, "session-slots.json"),
@@ -137,6 +135,7 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     const before = await snapshot(claimedDir);
     const result = await runReconcileCycle(initialDaemonState(), deps);
     expect(result.restored).toHaveLength(1); // confirms a restore genuinely happened, not a vacuous pass
+    expectRestoredInto(host, resolved.key);
     const after = await snapshot(claimedDir);
 
     expectUnchanged(before, after);
@@ -168,8 +167,9 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     // exactly what the reconcile cycle itself does to the directory.
     const before = await snapshot(claimedDir);
 
+    const host = fakeHost();
     const deps: DaemonDeps = {
-      runCommand: fakeRunCommand(),
+      runCommand: host.runCommand,
       claimsPath: join(storeDir, "claims.json"),
       agentsPath: join(storeDir, "agents.json"),
       sessionSlotsPath: join(storeDir, "session-slots.json"),
@@ -182,6 +182,7 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     // Any write attempt into claimedDir from here on would throw EACCES and fail this test outright.
     const result = await runReconcileCycle(initialDaemonState(), deps);
     expect(result.restored).toHaveLength(1);
+    expectRestoredInto(host, resolved.key);
 
     // Snapshot BEFORE restoring permissions — chmod itself changes the
     // directory's own ctime, and that must not be mistaken for a write

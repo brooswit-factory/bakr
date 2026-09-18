@@ -1,11 +1,15 @@
 // bakr's spawn substrate (BAKR-11, implementing story BAKR-7): launch,
-// list, independently verify, and stop `claude` background sessions in a
-// directory bakr is handed. See each file's own banner comment for the
-// specific non-negotiable rule it exists to satisfy:
-//   - launch.ts   — the only site that constructs `claude --bg`; every
-//                    launch goes through its own systemd-run --user --scope
+// list, independently verify, and stop `claude` sessions in a directory
+// bakr is handed. Every session runs interactively in its own herdr
+// workspace pane (herdr.ts explains why `claude --bg` was dropped); legacy
+// background sessions are still listed and stoppable until relaunched. See
+// each file's own banner comment for the rule it exists to satisfy:
+//   - launch.ts   — the only site that starts a session: a herdr pane,
+//                    under the herdr server, never under bakr.service
+//   - herdr.ts    — herdr commands, startup-prompt answering, parsing
+//   - respawn.ts  — a restore: `--resume <session>` in a new pane
 //   - stop.ts     — the only site that stops a session; always by its own
-//                    recorded identity, never by killing a scope/cgroup or
+//                    listed identity, never by killing a scope/cgroup or
 //                    touching `claude daemon run`
 //   - liveness.ts — pid verification is a positive fact, never an
 //                    inference from absence; alive/not-verifiable/absent
@@ -48,7 +52,7 @@ export type { LaunchDeps, LaunchResult } from "./launch";
 export { launch } from "./launch";
 
 export type { ListDeps } from "./list";
-export { listBackgroundSessions } from "./list";
+export { listBackgroundSessions, isHerdrPaneId } from "./list";
 
 export type { StopDeps, StopResult } from "./stop";
 export { stopSession } from "./stop";

@@ -3,8 +3,8 @@
 // both ways an agent enters a directory — `bakr create` and adopt — persist
 // that claim durably before the agent record, and that a fresh daemon (new
 // DaemonState, empty claude listing: what a reboot looks like to bakr)
-// restores the agent from disk alone. No real claude/systemd-run here; the
-// fake runCommand mirrors daemon.test.ts's.
+// restores the agent from disk alone. No real claude/herdr here; the fake is
+// test/support/fake-host.ts, as in daemon.test.ts.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -20,6 +20,7 @@ import { runCli, type CliDeps } from "../../src/cli/main";
 import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
 import { realOrphanProbeDeps, realResolveInputs } from "../../src/paths";
 import type { CommandResult, RunCommandOptions } from "../../src/spawn";
+import { makeFakeHost } from "../support/fake-host";
 
 const cleanupDirs: string[] = [];
 afterEach(async () => { while (cleanupDirs.length) await rm(cleanupDirs.pop()!, { recursive: true, force: true }); });
@@ -30,27 +31,22 @@ async function makeTempDir(prefix: string): Promise<string> {
   return dir;
 }
 
-/** systemd-run mints a listed session; respawn relists the same short id with a live pid; stop is a falsifier. `reboot()` empties the listing. */
+/**
+ * The shared herdr + legacy-claude fake: a launch starts a listed pane with a
+ * live pid; a restore resumes its session in a new pane; a stop is a
+ * falsifier (recovery never stops anything). `reboot()` ends every session.
+ */
 function makeFakeClaude() {
-  let listing: Array<{ id: string; sessionId: string; cwd: string; startedAt: number; kind: string; pid?: number }> = [];
-  let nextShortId = 0;
-  const respawnCalls: string[] = [];
+  const fake = makeFakeHost();
   async function runCommand(argv: string[], opts: RunCommandOptions): Promise<CommandResult> {
-    if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: JSON.stringify(listing), stderr: "" };
-    if (argv[0] === "claude" && argv[1] === "respawn") {
-      const shortId = argv[2] as string;
-      respawnCalls.push(shortId);
-      listing.push({ id: shortId, sessionId: `respawned-${shortId}`, cwd: "", startedAt: 1, kind: "background", pid: process.pid });
-      return { exitCode: 0, stdout: `respawned ${shortId}\n`, stderr: "" };
+    if ((argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "close") || (argv[0] === "claude" && argv[1] === "stop")) {
+      throw new Error(`FALSIFIER TRIPPED: recovery must never stop a session — got ${JSON.stringify(argv)}`);
     }
-    if (argv[0] === "systemd-run") {
-      const shortId = `short-${nextShortId++}`;
-      listing.push({ id: shortId, sessionId: `session-${shortId}`, cwd: opts.cwd ?? "", startedAt: 1, kind: "background", pid: process.pid });
-      return { exitCode: 0, stdout: `backgrounded · ${shortId} (idle — send a prompt to start)\n`, stderr: "" };
-    }
-    throw new Error(`fake runCommand: unexpected argv ${JSON.stringify(argv)}`);
+    return fake.runCommand(argv, opts);
   }
-  return { runCommand, respawnCalls, reboot: () => { listing = []; } };
+  /** The session id each restore resumed (`--resume <id>`), in order. */
+  const resumedSessions = (): string[] => fake.starts().filter((a) => a.includes("--resume")).map((a) => a[a.indexOf("--resume") + 1]!);
+  return { runCommand, panes: fake.panes, resumedSessions, reboot: () => { fake.panes.length = 0; fake.legacy.length = 0; } };
 }
 
 function paths(storeDir: string) {
@@ -147,12 +143,16 @@ describe("restart recovery follows the claim", () => {
     const workspace = await makeTempDir("bakr-claim-recovery-ws-");
     const fake = makeFakeClaude();
     expect(await runCli(["create"], cliDeps(storeDir, workspace, fake.runCommand).deps)).toBe(0);
+    const created = fake.panes.map((p) => p.sessionId);
+    expect(created).toHaveLength(1);
 
     const result = await rebootAndReconcile(storeDir, fake);
     expect(result.claimDegraded).toBe(false);
     expect(result.restored).toHaveLength(1);
     expect(result.restored[0]?.key).toBe(workspace as ClaimKey);
-    expect(fake.respawnCalls).toEqual(["short-0"]);
+    // The session `create` started is the one resumed, in the claimed directory.
+    expect(fake.resumedSessions()).toEqual(created);
+    expect(fake.panes.map((p) => p.cwd)).toEqual([workspace]);
   });
 
   test("NEGATIVE CONTROL: the same on agent in an UNCLAIMED directory is not restored — the claim is what recovery depends on", async () => {
@@ -164,7 +164,7 @@ describe("restart recovery follows the claim", () => {
 
     const result = await rebootAndReconcile(storeDir, fake);
     expect(result.restored).toEqual([]);
-    expect(fake.respawnCalls).toEqual([]);
+    expect(fake.resumedSessions()).toEqual([]);
   });
 
   test("an adopted agent is respawned in its destination by a fresh daemon after a reboot", async () => {
@@ -193,6 +193,7 @@ describe("restart recovery follows the claim", () => {
     fake.reboot();
     const result = await runReconcileCycle(initialDaemonState(), daemonDeps(storeDir, fake.runCommand));
     expect(result.restored).toEqual([{ agentId: "@a1", key: destination as ClaimKey, sessionId: "durable-x" }]);
-    expect(fake.respawnCalls).toEqual(["durable-x"]);
+    expect(fake.resumedSessions()).toEqual(["durable-x"]);
+    expect(fake.panes.map((p) => p.cwd)).toEqual([destination]); // resumed in its DESTINATION, not the vanished source
   });
 });

@@ -5,7 +5,9 @@ export async function attachInPlace(shortId: string, deps: { stdinIsTTY: boolean
   return { ok: true, exitCode: await deps.spawn(shortId) };
 }
 
+/** A herdr pane (`w1:p1`) is attached with `herdr agent attach`; a legacy background session with `claude attach`. */
 export async function spawnClaudeAttach(shortId: string): Promise<number> {
-  const child = Bun.spawn(["claude", "attach", shortId], { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+  const argv = shortId.includes(":") ? ["herdr", "agent", "attach", shortId] : ["claude", "attach", shortId];
+  const child = Bun.spawn(argv, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
   return child.exited;
 }
