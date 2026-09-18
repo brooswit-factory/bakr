@@ -7,6 +7,7 @@ import type { ResolveInputs } from "./claim-key-resolve";
 import type { OrphanProbeDeps } from "./orphan-probe";
 import type { TranscriptProbeDeps } from "./transcript-probe";
 import type { LaunchConfigDeps } from "./launch-config";
+import { lastCwdIn, type ResumeCwdDeps } from "./resume-cwd";
 import { formatLogLine } from "./log";
 
 // The impure seams for this ticket's two real-filesystem dependencies:
@@ -94,6 +95,30 @@ export const realTranscriptProbeDeps: TranscriptProbeDeps = {
 };
 
 /** The real access behind `claudeLaunchArgs` (launch-config.ts): reads a directory's own `.mcp.json` (absent or unreadable resolves to `undefined` — configuration this cannot read must never fail a launch), writes approvals through drovr's own settings IO, and reports what it could not do on stderr. */
+/** The real reader behind `resumeCwdFor` (resume-cwd.ts): finds a session's transcript under `~/.claude/projects/*` and reads its last recorded cwd. Never throws. */
+export const realResumeCwdDeps: ResumeCwdDeps = {
+  lastRecordedCwd: async (sessionId: string) => {
+    try {
+      const root = join(homedir(), ".claude", "projects");
+      for (const dir of await readdir(root)) {
+        const path = join(root, dir, `${sessionId}.jsonl`);
+        const text = await readFile(path, "utf8").catch(() => undefined);
+        if (text !== undefined) return lastCwdIn(text);
+      }
+    } catch {
+      // No projects root, or unreadable: resume in the agent's own directory, as before.
+    }
+    return undefined;
+  },
+  isDirectory: async (path: string) => {
+    try {
+      return (await stat(path)).isDirectory();
+    } catch {
+      return false;
+    }
+  },
+};
+
 export const realLaunchConfigDeps: LaunchConfigDeps = {
   readConfigFile: async (path: string) => {
     try {

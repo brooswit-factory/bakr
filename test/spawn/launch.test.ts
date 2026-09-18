@@ -52,4 +52,34 @@ describe("launch (herdr)", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("herdr server is not running");
   });
+
+  // The 2026-09-18 incident: every pane was started under the fixed herdr agent name "claude", so while one bakr
+  // pane was open every other start was refused ("agent name claude is already used") — after its predecessor had
+  // been stopped. The fake enforces herdr's own name rules, so this fails on the old fixed name.
+  test("several agents run side by side, each pane under its own valid herdr agent name", async () => {
+    const host = makeFakeHost();
+    const a = await launch("/d/a", [], { runCommand: host.runCommand, label: "@n0y45b5r4f2ydey7nc", ...instant() });
+    const b = await launch("/d/b", [], { runCommand: host.runCommand, label: "@tmbqd7bkew6d3xf6p4", ...instant() });
+    const c = await launch("/d/c", [], { runCommand: host.runCommand, label: "@n0y45b5r4f2ydey7nc", ...instant() });
+    expect([a.ok, b.ok, c.ok]).toEqual([true, true, true]);
+    const names = host.panes.map((p) => p.name);
+    expect(new Set(names).size).toBe(3);
+    for (const name of names) expect(name).toMatch(/^[a-z][a-z0-9_-]{0,31}$/);
+  });
+
+  test("a fresh workspace whose shell is not ready yet is started once it is, not abandoned", async () => {
+    const host = makeFakeHost({ shellNotReadyTimes: 2 });
+    const r = await launch(DIR, [], { runCommand: host.runCommand, label: "@a", ...instant() });
+    expect(r.ok).toBe(true);
+    expect(host.calls.filter((c) => c[1] === "agent" && c[2] === "start")).toHaveLength(3);
+    expect(host.stops()).toEqual([]);
+  });
+
+  test("a shell that never becomes ready gives up with herdr's reason and closes the workspace", async () => {
+    const host = makeFakeHost({ shellNotReadyTimes: 1_000 });
+    const r = await launch(DIR, [], { runCommand: host.runCommand, label: "@a", ...instant() });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("not an available shell");
+    expect(host.panes).toEqual([]);
+  });
 });

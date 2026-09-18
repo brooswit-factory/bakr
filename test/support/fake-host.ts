@@ -8,6 +8,8 @@ import type { CommandResult, RunCommandOptions } from "../../src/spawn";
 export interface FakePane {
   paneId: string;
   workspaceId: string;
+  /** The herdr agent name the pane was started under. */
+  name?: string;
   cwd: string;
   sessionId: string;
   /** The claude argv the pane was started with (after `--`). */
@@ -40,6 +42,8 @@ export interface FakeHostOptions {
   pidFor?: (paneId: string) => number | undefined;
   /** Mints session ids for fresh launches and forks. */
   mintSessionId?: () => string;
+  /** The first N `agent start`s find the pane's shell not ready yet, as herdr reports for a fresh workspace. */
+  shellNotReadyTimes?: number;
 }
 
 const reply = (result: unknown): CommandResult => ({ exitCode: 0, stdout: JSON.stringify({ result }), stderr: "" });
@@ -52,6 +56,7 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
   const calls: string[][] = [];
   let workspace = 0;
   let minted = 0;
+  let shellNotReady = opts.shellNotReadyTimes ?? 0;
   const mint = opts.mintSessionId ?? (() => `session-${minted++}`);
   const failing = () => typeof opts.failListing === "function" ? opts.failListing() : opts.failListing === true;
 
@@ -103,6 +108,16 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
       const pane = paneFor(paneId);
       if (!pane) return refuse("pane_not_found", `no pane ${paneId}`);
       if (opts.failStart) return refuse("start_failed", opts.failStart);
+      // herdr 0.8.2's own rules, as measured: a valid, server-unique agent name, and a pane at its shell prompt.
+      const name = argv[3]!;
+      if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name)) return refuse("invalid_agent_name", "agent name must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_' (1-32 characters)");
+      const holder = panes.find((p) => p.name === name && p.paneId !== paneId);
+      if (holder) return refuse("agent_name_in_use", `agent name ${name} is already used; candidates: pane_id=${holder.paneId}`);
+      if (shellNotReady > 0) {
+        shellNotReady -= 1;
+        return refuse("pane_not_shell", `agent target pane ${paneId} is not an available shell`);
+      }
+      pane.name = name;
       const args = argv.slice(argv.indexOf("--") + 1);
       const resume = args.indexOf("--resume");
       const named = args.indexOf("--session-id");

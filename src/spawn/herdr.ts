@@ -25,6 +25,7 @@ const HERDR_TIMEOUT_MS = 15_000;
 const AGENT_START_TIMEOUT_MS = 60_000;
 const READY_TIMEOUT_MS = 90_000;
 const READY_POLL_MS = 1_000;
+const SHELL_READY_TIMEOUT_MS = 15_000;
 
 /** The label every bakr-hosted workspace carries, so a listing can tell bakr's panes from anyone else's. */
 export const workspaceLabel = (label: string): string => `bakr ${label}`;
@@ -32,8 +33,27 @@ export const workspaceLabel = (label: string): string => `bakr ${label}`;
 export const buildWorkspaceCreateArgv = (cwd: string, label: string): string[] =>
   ["herdr", "workspace", "create", "--cwd", cwd, "--label", workspaceLabel(label), "--no-focus"];
 
-export const buildAgentStartArgv = (paneId: string, claudeArgs: readonly string[]): string[] =>
-  ["herdr", "agent", "start", "claude", "--kind", "claude", "--pane", paneId, "--timeout", String(AGENT_START_TIMEOUT_MS), "--", ...claudeArgs];
+/**
+ * The herdr agent name for one pane. herdr requires agent names to be unique
+ * across the server: a fixed name let only ONE bakr pane exist at a time, and
+ * every later start was refused ("agent name claude is already used") after
+ * its predecessor had already been stopped. The workspace id makes the name
+ * unique even when a stale pane of the same agent is still open. herdr's own
+ * rule (measured, 0.8.2): a lowercase letter first, then only lowercase
+ * letters, digits, `-` or `_`, 1-32 characters — and workspace ids such as
+ * `wE` are not lowercase, so both parts are folded.
+ */
+export const agentNameFor = (label: string, workspaceId: string): string => {
+  const clean = (text: string) => text.toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  const suffix = `-${clean(workspaceId) || "w"}`;
+  return `bakr-${clean(label) || "agent"}`.slice(0, 32 - suffix.length) + suffix;
+};
+
+/** herdr 0.8.2's rule for an agent name. */
+export const HERDR_AGENT_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+
+export const buildAgentStartArgv = (paneId: string, claudeArgs: readonly string[], name = "claude"): string[] =>
+  ["herdr", "agent", "start", name, "--kind", "claude", "--pane", paneId, "--timeout", String(AGENT_START_TIMEOUT_MS), "--", ...claudeArgs];
 
 /**
  * A fresh launch names its own session (`--session-id <uuid>`), so the id is
@@ -161,7 +181,15 @@ export async function herdrLaunch(dir: string, claudeArgs: readonly string[], la
   };
 
   const { args, sessionId } = withSessionId(claudeArgs, deps.mintSessionId);
-  const started = await herdr(deps, buildAgentStartArgv(paneId, args), AGENT_START_TIMEOUT_MS + HERDR_TIMEOUT_MS);
+  const name = agentNameFor(label, workspaceId ?? paneId);
+  // A fresh workspace's shell may not be at its prompt yet; herdr then refuses the start with
+  // "is not an available shell" (measured) and nothing has run, so the start is simply retried.
+  const shellBy = now() + SHELL_READY_TIMEOUT_MS;
+  let started = await herdr(deps, buildAgentStartArgv(paneId, args, name), AGENT_START_TIMEOUT_MS + HERDR_TIMEOUT_MS);
+  while (!started.ok && /not an available shell/.test(started.message) && now() < shellBy) {
+    await sleep(READY_POLL_MS);
+    started = await herdr(deps, buildAgentStartArgv(paneId, args, name), AGENT_START_TIMEOUT_MS + HERDR_TIMEOUT_MS);
+  }
   if (!started.ok && started.code !== "agent_not_ready") return abandon(`claude did not start in pane ${paneId}: ${started.message}`);
 
   const readyBy = now() + READY_TIMEOUT_MS;
