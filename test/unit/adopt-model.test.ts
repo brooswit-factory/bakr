@@ -119,32 +119,28 @@ describe("agent-not-in-source (covers BOTH 'never was in source' and the concurr
   });
 });
 
-describe("name-collision", () => {
-  test("refused when a named agent's name is already held by a DIFFERENT agent in the destination", () => {
+// BAKR-34/BAKR-42 R9: custom names (and the per-directory name-collision
+// check that used to run here) are retired — an agent's name is derived
+// from its directory now (R1/R3), so there is no custom-name value left for
+// two agents to collide over. Adopting into a directory that already holds
+// a non-archived agent is not refused by adopt.ts (see adopt-model.ts's own
+// module comment: R6's one-per-directory line is drawn at `create` /
+// `bakr <real path>` create, not at adopt) — the destination simply ends up
+// with more than one non-archived agent, the identical legacy shape R6
+// already requires the store to keep loading and resolving through
+// (AMBIGUOUS by name, both reachable by @id).
+describe("adopting into an already-occupied destination (R9/R6)", () => {
+  test("a stale legacy `name` on the moved agent is no longer checked against the destination at all — adopt succeeds regardless", () => {
     let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: SOURCE, name: "worker" }));
     agentState = putAgent(agentState, makeAgent({ id: "@holder", directory: DEST, name: "worker" }));
     const result = validateAdopt(baseInputs({ agentState, agentIds: ["@a1"] }));
-    expect(result.ok).toBe(false);
-    if (!result.ok && result.reason === "name-collision") {
-      expect(result.conflicts).toEqual([{ agentId: "@a1", name: "worker", heldBy: "@holder" }]);
-    } else {
-      throw new Error(`expected name-collision, got ${JSON.stringify(result)}`);
-    }
+    expect(result.ok).toBe(true);
   });
 
-  test("an ARCHIVED agent in the destination still holds its name (B4) — collision still fires", () => {
-    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: SOURCE, name: "worker" }));
-    agentState = putAgent(agentState, makeAgent({ id: "@holder", directory: DEST, name: "worker", state: "archived" }));
+  test("adopting a non-archived agent into a destination that already holds one succeeds — the resulting directory becomes the same legacy-ambiguous shape R6 already tolerates, not an adopt-time refusal", () => {
+    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: SOURCE }));
+    agentState = putAgent(agentState, makeAgent({ id: "@resident", directory: DEST }));
     const result = validateAdopt(baseInputs({ agentState, agentIds: ["@a1"] }));
-    expect(result.ok).toBe(false);
-    expect(!result.ok && result.reason).toBe("name-collision");
-  });
-
-  test("CONTROL: an unnamed agent never collides (nothing to conflict), and a named agent with a genuinely free name passes", () => {
-    let agentState = putAgent(emptyAgentStore(), makeAgent({ id: "@a1", directory: SOURCE, name: "worker" }));
-    agentState = putAgent(agentState, makeAgent({ id: "@a2", directory: SOURCE })); // unnamed
-    agentState = putAgent(agentState, makeAgent({ id: "@unrelated", directory: DEST, name: "someone-else" }));
-    const result = validateAdopt(baseInputs({ agentState, agentIds: ["@a1", "@a2"] }));
     expect(result.ok).toBe(true);
   });
 });

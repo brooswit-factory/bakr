@@ -151,7 +151,7 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
       // plan that has nothing to check liveness against — see this file's
       // own note on the concurrency fixture for the same behavior.
       const host = makeFakeHost();
-      const result = await on(actionDeps(dir, host.runCommand), KEY, agent.id);
+      const result = await on(actionDeps(dir, host.runCommand), { kind: "id", ref: agent.id });
       expect(result.ok).toBe(true);
       if (result.ok && "launchWedgeCleared" in result) {
         expect(result.launchWedgeCleared).toBe(true); // REPORTED, not silent (B13 point 1)
@@ -196,7 +196,7 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
 
       // The recovery restore resumes the agent's own session (`--resume <sessionId>`, never a fork) in a new herdr pane.
       const host = makeFakeHost();
-      const result = await on(actionDeps(dir, host.runCommand), KEY, agent.id);
+      const result = await on(actionDeps(dir, host.runCommand), { kind: "id", ref: agent.id });
       // EXACTLY one start, and exactly this argv (B8/argv-exactness): no MCP is configured for this directory, so no flags follow.
       expect(host.starts()).toEqual([["--resume", "durable-1"]]);
       expect(result.ok).toBe(true);
@@ -225,7 +225,7 @@ describe("Criterion 11: a genuinely wedged launch record is cleared by `on`, rep
         if (isListing(argv)) return host.runCommand(argv, opts); // BAKR-22: on() always lists first
         throw new Error(`FALSIFIER TRIPPED: must never call launch for an in-flight record — got ${JSON.stringify(argv)}`);
       };
-      const result = await on(actionDeps(dir, runCommand), KEY, agent.id);
+      const result = await on(actionDeps(dir, runCommand), { kind: "id", ref: agent.id });
       expect(result.ok).toBe(true);
       if (result.ok && "launchWedgeCleared" in result) {
         expect(result.launchWedgeCleared).toBe(false);

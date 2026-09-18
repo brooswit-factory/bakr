@@ -55,7 +55,7 @@ describe("on() when the up-front listing THROWS (BAKR-23's direct question)", ()
     await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), agentWithRestoreTarget()));
     const host = makeFakeHost({ failListing: true });
 
-    const result = await on(depsFor(dir, host), KEY, AGENT_ID);
+    const result = await on(depsFor(dir, host), { kind: "id", ref: AGENT_ID });
 
     const listingCalled = host.calls.some((c) => c[0] === "herdr" && c[1] === "agent" && c[2] === "list");
     expect(listingCalled).toBe(true); // the instrument fired — this isn't a vacuous "never called anything"
@@ -70,7 +70,7 @@ describe("on() when the up-front listing THROWS (BAKR-23's direct question)", ()
     await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), agentWithRestoreTarget()));
     const host = makeFakeHost();
 
-    const result = await on(depsFor(dir, host), KEY, AGENT_ID);
+    const result = await on(depsFor(dir, host), { kind: "id", ref: AGENT_ID });
     expect(result.ok).toBe(true);
     // The restore: the agent's own session resumed in a new pane.
     expect(host.starts().map((args) => args.slice(0, 2))).toEqual([["--resume", "session-uuid"]]);
