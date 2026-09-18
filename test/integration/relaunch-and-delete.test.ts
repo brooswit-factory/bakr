@@ -64,6 +64,8 @@ function deps(dir: string, host: Pick<FakeHost, "runCommand">, extra: Partial<Ag
     transcriptProbeDeps: transcripts(true),
     sleep: async (ms) => { clock += ms; },
     isPidAlive: () => false,
+    // Pinned: the default reads this host's real transcripts.
+    resumeCwdDeps: { lastRecordedCwd: async () => undefined, isDirectory: async () => false },
     ...extra,
   };
 }
@@ -82,6 +84,19 @@ const stopsAndStarts = (host: FakeHost): string[] =>
         : []);
 
 describe("relaunch", () => {
+  test("a session that moved into a worktree is resumed there — claude refuses a resume from any other directory", async () => {
+    const dir = await setup({});
+    const host = makeFakeHost();
+    const worktree = `${KEY}/.claude/worktrees/first-slice`;
+    const r = await relaunch(deps(dir, host, {
+      resumeCwdDeps: { lastRecordedCwd: async (id) => id === OLD.sessionId ? worktree : undefined, isDirectory: async (p) => p === worktree },
+    }), KEY, "rocketr");
+    expect(r.ok).toBe(true);
+    const created = host.calls.find((c) => c[0] === "herdr" && c[2] === "create")!;
+    expect(created[created.indexOf("--cwd") + 1]).toBe(worktree);
+    expect(host.starts()[0]!.slice(0, 2)).toEqual(["--resume", OLD.sessionId]);
+  });
+
   test("moves a legacy background session into a herdr pane: stops it, resumes the SAME session with every server's channel, and the new pane becomes the restore target", async () => {
     const dir = await setup({});
     const host = makeFakeHost();

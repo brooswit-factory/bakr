@@ -510,10 +510,10 @@ export function isSupersededStaleCwdRespawnFailure(state: AgentStoreState, recor
 }
 
 /** See session-slots.ts's own doc for why this must be called unconditionally on every load — identical reasoning, ported. */
-export function promoteUnresolvableLaunches(state: AgentStoreState, reason: string): AgentStoreState {
+export function promoteUnresolvableLaunches(state: AgentStoreState, reason: string, attemptedAtOrBefore: number = Number.POSITIVE_INFINITY): AgentStoreState {
   let next = state;
   for (const record of state.launches) {
-    if (record.launchShortId === undefined && record.error === undefined) {
+    if (record.launchShortId === undefined && record.error === undefined && record.attemptedAt <= attemptedAtOrBefore) {
       next = markLaunchFailed(next, record.attemptId, reason);
     }
   }

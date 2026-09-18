@@ -51,7 +51,8 @@ import {
 import { claudeLaunchArgs, provisionMcpFor, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
 import { listBackgroundSessions, decideLiveness, checkLiveness, isPidAlive, launch, respawnSession, isRecognizedStaleCwdRefusal, detectStaleRegisteredCwdRefusal, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
-import { realTranscriptProbeDeps, realLaunchConfigDeps } from "./paths";
+import { realTranscriptProbeDeps, realLaunchConfigDeps, realResumeCwdDeps } from "./paths";
+import { resumeCwdFor, type ResumeCwdDeps } from "./resume-cwd";
 import type { ClaimKey } from "./claim-key-resolve";
 import { classifyDirectory, type OrphanVerdict } from "./orphan-model";
 import { probeDirectory, type OrphanProbeDeps } from "./orphan-probe";
@@ -74,6 +75,8 @@ export interface DaemonDeps {
   readonly transcriptProbeDeps?: TranscriptProbeDeps;
   /** How to read a directory's `.mcp.json` and write its MCP approval (launch-config.ts). Optional — defaults to the real filesystem (`realLaunchConfigDeps`, paths.ts), so every existing caller and test needs no change. */
   readonly launchConfigDeps?: LaunchConfigDeps;
+  /** Where a session last ran, so a restore resumes there (resume-cwd.ts). Defaults to reading its real transcript. */
+  readonly resumeCwdDeps?: ResumeCwdDeps;
   readonly acquireTimeoutMs?: number;
 }
 
@@ -182,18 +185,32 @@ export interface ReconcileResult {
   readonly orphanReportSignatures: Readonly<Record<string, string>>;
 }
 
-/** Promotes any launch record left wedged by a crash mid-`launch()` in a PRIOR run — see agent-model.ts's own `promoteUnresolvableLaunches` doc, ported unchanged in spirit, rekeyed to agent id. One locked mutation; a no-op save is skipped. */
+/**
+ * How old a launch record with no outcome must be before it counts as wedged.
+ * This check runs every cycle, and a record with no outcome yet is also what
+ * ANOTHER process's launch looks like while it is still in flight — a CLI
+ * `on`/`relaunch` waiting on its herdr pane (seconds, up to a few minutes
+ * with startup prompts). Measured: without a grace window the daemon marked
+ * butchr's in-flight restore "crashed" mid-launch (2026-09-18). A herdr
+ * launch gives up well inside this window, so an older record is genuinely
+ * abandoned.
+ */
+const WEDGED_LAUNCH_GRACE_MS = 10 * 60_000;
+
+/** Promotes any launch record left wedged by a crash mid-`launch()` — see agent-model.ts's own `promoteUnresolvableLaunches` doc, ported unchanged in spirit, rekeyed to agent id — but only once it is older than any launch could still be running. One locked mutation; a no-op save is skipped. */
 async function promoteWedgedLaunches(deps: DaemonDeps): Promise<{ malformed: boolean; error?: string }> {
+  const cutoff = deps.now() - WEDGED_LAUNCH_GRACE_MS;
   const result = await withAgentStoreLock(
     deps.agentsPath,
     (current) => {
-      const wedged = current.launches.filter((l) => l.launchShortId === undefined && l.error === undefined);
+      const wedged = current.launches.filter((l) => l.launchShortId === undefined && l.error === undefined && l.attemptedAt <= cutoff);
       if (wedged.length === 0) {
         return { state: current, result: [] as typeof wedged };
       }
       const next = promoteUnresolvableLaunches(
         current,
-        "the daemon process ended before this launch's outcome was recorded (crashed, or was killed, mid-launch) — cannot distinguish never-detached from detached-then-the-wrapper-failed (BAKR-8 Constraint 2)"
+        "the daemon process ended before this launch's outcome was recorded (crashed, or was killed, mid-launch) — cannot distinguish never-detached from detached-then-the-wrapper-failed (BAKR-8 Constraint 2)",
+        cutoff
       );
       return { state: next, result: wedged };
     },
@@ -446,9 +463,11 @@ async function dispatchRespawnForDaemon(deps: DaemonDeps, agentId: string, key: 
     return { kind: "refused", error };
   }
 
-  // A restore resumes the same session in a new pane, with the agent's CURRENT flags and approval.
+  // A restore resumes the same session in a new pane, with the agent's CURRENT flags and approval,
+  // in the directory the conversation last ran in (a worktree, say) — claude refuses a resume anywhere else.
   const args = await configuredLaunchArgs(deps, key, agentId);
-  const result = await respawnSession({ sessionId: restoreSessionId, directory: key, args }, { runCommand: deps.runCommand, label: agentId });
+  const where = await resumeCwdFor(restoreSessionId, key, deps.resumeCwdDeps ?? realResumeCwdDeps);
+  const result = await respawnSession({ sessionId: restoreSessionId, directory: where, args }, { runCommand: deps.runCommand, label: agentId });
   if (result.ok) {
     await withAgentStoreLock(deps.agentsPath, (current) => ({ state: resolveRespawnAttempt(current, attemptId, result.id), result: undefined }), lockOpts(deps));
     return { kind: "respawned" };

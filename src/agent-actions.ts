@@ -97,8 +97,9 @@ import {
 } from "./agent-lifecycle";
 import { launch, listBackgroundSessions, isHerdrPaneId, decideLiveness, isPidAlive, respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal, stopSession, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
-import { realTranscriptProbeDeps, realLaunchConfigDeps } from "./paths";
+import { realTranscriptProbeDeps, realLaunchConfigDeps, realResumeCwdDeps } from "./paths";
 import { claudeLaunchArgs, provisionMcpFor, resolveMcpAccess, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
+import { resumeCwdFor, type ResumeCwdDeps } from "./resume-cwd";
 import type { ClaimKey } from "./claim-key-resolve";
 
 export interface AgentActionDeps {
@@ -116,6 +117,8 @@ export interface AgentActionDeps {
   readonly sleep?: (ms: number) => Promise<void>;
   /** Whether a pid is still running (relaunch waits for the old session to exit). Defaults to the real probe. */
   readonly isPidAlive?: (pid: number) => boolean;
+  /** Where a session last ran, so a resume happens there (resume-cwd.ts). Defaults to reading its real transcript. */
+  readonly resumeCwdDeps?: ResumeCwdDeps;
 }
 
 /** The agent's own MCP declaration, read fresh so a change made since the caller's lock hold still applies; `undefined` (the default: every server its `.mcp.json` configures) when it has none or the store cannot be read. */
@@ -634,7 +637,8 @@ async function forkFromCurrentTarget(deps: AgentActionDeps, directory: ClaimKey,
  */
 async function dispatchRespawn(deps: AgentActionDeps, directory: ClaimKey, agentId: string, attemptId: string, _shortId: string, restoreSessionId: string): Promise<RespawnOutcome> {
   const args = await configuredLaunchArgs(deps, directory, agentId);
-  const result = await respawnSession({ sessionId: restoreSessionId, directory, args }, { runCommand: deps.runCommand, label: agentId });
+  const where = await resumeCwdFor(restoreSessionId, directory, deps.resumeCwdDeps ?? realResumeCwdDeps);
+  const result = await respawnSession({ sessionId: restoreSessionId, directory: where, args }, { runCommand: deps.runCommand, label: agentId });
   if (result.ok) {
     await withAgentStoreLock(deps.agentsPath, (current) => ({ state: resolveRespawnAttempt(current, attemptId, result.id), result: undefined }), lockOpts(deps));
     return { kind: "respawned" };
@@ -1046,7 +1050,9 @@ export async function relaunch(deps: AgentActionDeps, directory: ClaimKey, ref: 
   // Resume the SAME session, not a fork: in a pane it keeps its id and transcript with the new flags, and a fork that
   // is never prompted writes no transcript, so relaunching a relaunch could otherwise find no conversation to carry.
   const args = resumed ? ["--resume", target.sessionId, ...configured] : configured;
-  const launched = await launch(directory, args, { runCommand: deps.runCommand, label: agent.id });
+  // A resume must run where the conversation last ran (a worktree, say), or claude refuses it.
+  const where = resumed ? await resumeCwdFor(target.sessionId, directory, deps.resumeCwdDeps ?? realResumeCwdDeps) : directory;
+  const launched = await launch(where, args, { runCommand: deps.runCommand, label: agent.id });
   if (!launched.ok) {
     await withAgentStoreLock(deps.agentsPath, (current) => ({ state: markLaunchFailed(current, attemptId, launched.error), result: undefined }), lockOpts(deps));
     return fail("launch-failed", recover(`the replacement launch failed (${launched.error})`));
