@@ -60,7 +60,7 @@ function baseDeps(dir: string, runCommand: DaemonDeps["runCommand"]): DaemonDeps
     // Pinned rather than inherited: the default reads this HOST's own
     // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json`/`.bakr.json` files, which would make
     // what a reconcile launches depend on the machine running the test.
-    launchConfigDeps: { readConfigFile: async () => undefined, notificationServers: [] },
+    launchConfigDeps: { readConfigFile: async () => undefined },
   };
 }
 
@@ -290,7 +290,7 @@ describe("AC3: only 'on' is restored — off and archived are NEVER launched, wi
   });
 });
 
-describe("a reconcile's own fresh launch carries the host's configured MCP subscriptions", () => {
+describe("a reconcile's own fresh launch carries a channel for every server the directory configures", () => {
   test("an agent whose directory configures a requested server is launched subscribed to it", async () => {
     const dir = await makeTempDir();
     const key = "/claimed/dir" as ClaimKey;
@@ -304,7 +304,6 @@ describe("a reconcile's own fresh launch carries the host's configured MCP subsc
     const result = await runReconcileCycle(initialDaemonState(), {
       ...baseDeps(dir, async (argv, opts) => { seen.push(argv); events.push(argv[0]!); return fake.runCommand(argv, opts); }),
       launchConfigDeps: {
-        notificationServers: ["yappr"],
         readConfigFile: async (path) => path === `${key}/.mcp.json`
           ? JSON.stringify({ mcpServers: { yappr: { type: "stdio", command: "bun" } } })
           : undefined,
@@ -352,7 +351,6 @@ describe("a respawn carries no flags, but its agent's MCP approval is in place f
         throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
       }),
       launchConfigDeps: {
-        notificationServers: ["yappr"],
         readConfigFile: async () => JSON.stringify({ mcpServers: { rocketr: {}, yappr: {} } }),
         settingsIo,
       },

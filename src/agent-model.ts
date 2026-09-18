@@ -83,7 +83,8 @@ export interface AgentRecord {
   /**
    * The MCP servers this agent may use, and which it must hear notifications
    * from — bakr's own declaration, rendered per vendor by drovr at every start
-   * (launch-config.ts). Absent means "this host's default", which is not the
+   * (launch-config.ts). Absent means the default — every server the
+   * directory's `.mcp.json` configures, each subscribed to — which is not the
    * same as an empty declaration: `[]` is an agent that uses no MCP at all.
    */
   readonly mcp?: readonly McpServerDeclaration[];
@@ -240,7 +241,7 @@ export function mintUniqueAgentId(state: AgentStoreState, randomBytes: (byteLeng
 // --- Name rules (B4, B5, B11) -------------------------------------------
 
 /** B5: a deliberate superset. If you add a word, say so in the PR — do not widen this list quietly. */
-export const RESERVED_NAMES: readonly string[] = ["create", "attach", "on", "off", "name", "rename", "archive", "unarchive", "delete", "list", "adopt"];
+export const RESERVED_NAMES: readonly string[] = ["create", "attach", "on", "off", "name", "rename", "archive", "unarchive", "delete", "list", "adopt", "relaunch"];
 
 /** B11: every refusal is typed and carries a message a surface can show verbatim. */
 export type NameSyntaxResult =
@@ -320,7 +321,7 @@ export function putAgent(state: AgentStoreState, agent: AgentRecord): AgentStore
   return { ...state, agents: { ...state.agents, [agent.id]: agent } };
 }
 
-/** Replaces an agent's MCP declaration; `undefined` returns it to this host's default. A no-op when `agentId` names no agent. */
+/** Replaces an agent's MCP declaration; `undefined` returns it to the default (every server its `.mcp.json` configures). A no-op when `agentId` names no agent. */
 export function setAgentMcp(state: AgentStoreState, agentId: string, mcp: readonly McpServerDeclaration[] | undefined): AgentStoreState {
   const agent = state.agents[agentId];
   if (agent === undefined) return state;
@@ -767,8 +768,8 @@ interface PersistedAgentRecord {
   readonly createdAt: number;
   readonly birthSessionId: string | null;
   readonly restoreTarget: PersistedRestoreTarget | null;
-  /** Written only when declared, so a store without declarations serializes exactly as before. */
-  readonly mcp?: readonly McpServerDeclaration[];
+  /** Written only when declared, so a store without declarations serializes exactly as before. See `persistMcp`. */
+  readonly mcp?: readonly PersistedMcpServer[];
 }
 
 interface PersistedLaunchRecord {
@@ -831,10 +832,30 @@ function isValidPersistedAgentRecord(value: unknown): value is PersistedAgentRec
   );
 }
 
-function isValidMcpDeclaration(value: unknown): value is readonly McpServerDeclaration[] {
-  return Array.isArray(value) && value.every((server) =>
-    isPlainObject(server) && typeof server["name"] === "string" && typeof server["notifications"] === "boolean");
+/**
+ * One declared server as stored. `notifications` is always written, because
+ * builds from before channels were on by default require it and read it
+ * correctly. But in THIS build only `quiet` opts a server out: under the old
+ * syntax a stored `notifications: false` meant "never asked for +notify", not
+ * "opted out", and channels are now on for every server unless opted out.
+ */
+interface PersistedMcpServer {
+  readonly name: string;
+  readonly notifications: boolean;
+  readonly quiet?: boolean;
 }
+
+function isValidMcpDeclaration(value: unknown): value is readonly PersistedMcpServer[] {
+  return Array.isArray(value) && value.every((server) =>
+    isPlainObject(server) && typeof server["name"] === "string" && typeof server["notifications"] === "boolean" &&
+    (server["quiet"] === undefined || typeof server["quiet"] === "boolean"));
+}
+
+const persistMcp = (servers: readonly McpServerDeclaration[]): PersistedMcpServer[] =>
+  servers.map((server) => ({ name: server.name, notifications: server.notifications, ...(server.notifications ? {} : { quiet: true }) }));
+
+const reviveMcp = (servers: readonly PersistedMcpServer[]): McpServerDeclaration[] =>
+  servers.map((server) => ({ name: server.name, notifications: server.quiet !== true }));
 
 function isValidPersistedLaunchRecord(value: unknown): value is PersistedLaunchRecord {
   return (
@@ -894,7 +915,7 @@ export function serializeAgentStoreState(state: AgentStoreState): string {
       createdAt: a.createdAt,
       birthSessionId: a.birthSessionId ?? null,
       restoreTarget: a.restoreTarget ?? null,
-      ...(a.mcp === undefined ? {} : { mcp: a.mcp.map((server) => ({ name: server.name, notifications: server.notifications })) }),
+      ...(a.mcp === undefined ? {} : { mcp: persistMcp(a.mcp) }),
     };
   }
   const launches: PersistedLaunchRecord[] = state.launches.map((l) => ({
@@ -1133,7 +1154,7 @@ export function parseAgentStoreState(source: string): ParseResult {
       createdAt: rawValue.createdAt,
       birthSessionId: rawValue.birthSessionId ?? undefined,
       restoreTarget: rawValue.restoreTarget ?? undefined,
-      ...(rawValue.mcp === undefined ? {} : { mcp: rawValue.mcp.map((server) => ({ name: server.name, notifications: server.notifications })) }),
+      ...(rawValue.mcp === undefined ? {} : { mcp: reviveMcp(rawValue.mcp) }),
     };
   }
 

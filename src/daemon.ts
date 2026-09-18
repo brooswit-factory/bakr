@@ -72,12 +72,12 @@ export interface DaemonDeps {
   readonly probeDeps: OrphanProbeDeps;
   /** BAKR-22: read-only access to Claude Code's own `~/.claude/projects/` tree, for the never-spoken-to-then-moved check. Optional — defaults to the real filesystem (`realTranscriptProbeDeps`, paths.ts). */
   readonly transcriptProbeDeps?: TranscriptProbeDeps;
-  /** Which MCP servers a launched session must hear from, which declaration an agent without its own falls back to, and how to read a directory's `.mcp.json` and write its approval (launch-config.ts). Optional — defaults to the real filesystem and this host's own environment (`realLaunchConfigDeps`, paths.ts), so a host that configures nothing reconciles exactly as before. */
+  /** How to read a directory's `.mcp.json` and write its MCP approval (launch-config.ts). Optional — defaults to the real filesystem (`realLaunchConfigDeps`, paths.ts), so every existing caller and test needs no change. */
   readonly launchConfigDeps?: LaunchConfigDeps;
   readonly acquireTimeoutMs?: number;
 }
 
-/** The agent's own MCP declaration, read fresh from the store; `undefined` (this host's default) when it has none or the store cannot be read. */
+/** The agent's own MCP declaration, read fresh from the store; `undefined` (the default: every server its `.mcp.json` configures) when it has none or the store cannot be read. */
 async function declaredMcp(deps: DaemonDeps, agentId: string): Promise<readonly McpServerDeclaration[] | undefined> {
   const loaded = await loadAgents(deps.agentsPath);
   return loaded.status === "loaded" ? loaded.state.agents[agentId]?.mcp : undefined;

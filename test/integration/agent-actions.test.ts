@@ -107,9 +107,9 @@ function baseDeps(dir: string, runCommand: AgentActionDeps["runCommand"]): Agent
     agentsPath: join(dir, "agents.json"),
     runCommand,
     // Pinned rather than inherited: the default reads this HOST's own
-    // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json` files, which would make
+    // `.mcp.json` files, which would make
     // every launch-argv assertion below depend on the machine running it.
-    launchConfigDeps: { readConfigFile: async () => undefined, notificationServers: [] },
+    launchConfigDeps: { readConfigFile: async () => undefined },
     now: () => 1_700_000_000_000,
     generateAttemptId: () => `attempt-${counter++}`,
     randomBytes: (n: number) => {
@@ -155,7 +155,6 @@ describe("create", () => {
     const result = await create({
       ...baseDeps(dir, fake.runCommand),
       launchConfigDeps: {
-        notificationServers: ["yappr"],
         readConfigFile: async (path) => path === `${KEY}/.mcp.json`
           ? JSON.stringify({ mcpServers: { yappr: { type: "stdio", command: "bun" } } })
           : undefined,
@@ -177,16 +176,28 @@ describe("create", () => {
     ]);
   });
 
-  test("a directory that does not configure the requested server still launches with no args", async () => {
+  test("channels are on by default: every server the directory configures is subscribed, with no opt-in", async () => {
     const dir = await makeTempDir();
     const fake = makeFakeClaude();
     await create({
       ...baseDeps(dir, fake.runCommand),
       launchConfigDeps: {
-        notificationServers: ["yappr"],
         readConfigFile: async () => JSON.stringify({ mcpServers: { atlassian: {} } }),
+        settingsIo: memorySettings(),
       },
     }, KEY);
+    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
+    expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([
+      "--mcp-config", `${KEY}/.mcp.json`,
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["atlassian"] }),
+      "--dangerously-load-development-channels=server:atlassian",
+    ]);
+  });
+
+  test("a directory with no .mcp.json still launches with no args", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaude();
+    await create(baseDeps(dir, fake.runCommand), KEY);
     const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
     expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([]);
   });
@@ -197,7 +208,7 @@ describe("create", () => {
     const settingsIo = memorySettings();
     const deps = {
       ...baseDeps(dir, fake.runCommand),
-      launchConfigDeps: { notificationServers: ["yappr"], readConfigFile: async () => ROCKETR_MCP, settingsIo },
+      launchConfigDeps: { readConfigFile: async () => ROCKETR_MCP, settingsIo },
     };
     const result = await create(deps, KEY, "rocketr", [{ name: "rocketr", notifications: true }, { name: "yappr", notifications: false }]);
     expect(result.ok).toBe(true);
@@ -853,12 +864,12 @@ describe("a malformed agents.json is refused, never overwritten, by every verb",
 });
 
 describe("mcp", () => {
-  test("shows the host default for an agent with no declaration, replaces it, and returns it to the default", async () => {
+  test("shows every server as the default for an agent with no declaration, replaces it, and returns it to the default", async () => {
     const dir = await makeTempDir();
     const settingsIo = memorySettings();
     const deps = {
       ...baseDeps(dir, makeFakeClaude().runCommand),
-      launchConfigDeps: { notificationServers: ["yappr"], readConfigFile: async () => ROCKETR_MCP, settingsIo },
+      launchConfigDeps: { readConfigFile: async () => ROCKETR_MCP, settingsIo },
     };
     const created = await create(deps, KEY, "rocketr");
     if (!created.ok) throw new Error("create failed");
@@ -867,13 +878,14 @@ describe("mcp", () => {
     const shown = await mcp(deps, KEY, "rocketr");
     if (!shown.ok) throw new Error(shown.message);
     expect(shown.agent.mcp).toBeUndefined();
-    expect(shown.hostDefault).toEqual([{ name: "yappr", notifications: true }]);
+    expect(shown.effective).toEqual([{ name: "rocketr", notifications: true }, { name: "yappr", notifications: true }]);
     expect(shown.changed).toBe(false);
 
     const set = await mcp(deps, KEY, "rocketr", [{ name: "rocketr", notifications: true }]);
     if (!set.ok) throw new Error(set.message);
     expect(set.changed).toBe(true);
     expect(set.agent.mcp).toEqual([{ name: "rocketr", notifications: true }]);
+    expect(set.effective).toEqual([{ name: "rocketr", notifications: true }]);
     // The approval is written at once, ahead of the agent's next start.
     expect(approvalIn(settingsIo, KEY)).toEqual(["rocketr"]);
 
@@ -890,7 +902,7 @@ describe("mcp", () => {
   test("refused for an agent that is not in this directory, and nothing is written", async () => {
     const dir = await makeTempDir();
     const settingsIo = memorySettings();
-    const deps = { ...baseDeps(dir, makeFakeClaude().runCommand), launchConfigDeps: { notificationServers: [], readConfigFile: async () => ROCKETR_MCP, settingsIo } };
+    const deps = { ...baseDeps(dir, makeFakeClaude().runCommand), launchConfigDeps: { readConfigFile: async () => ROCKETR_MCP, settingsIo } };
     const result = await mcp(deps, KEY, "nobody", [{ name: "rocketr", notifications: true }]);
     expect(result.ok).toBe(false);
     expect(settingsIo.files).toEqual({});

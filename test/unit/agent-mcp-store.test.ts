@@ -41,10 +41,25 @@ describe("an agent's MCP declaration in the store", () => {
     ["not an array", { name: "yappr", notifications: true }],
     ["an entry without notifications", [{ name: "yappr" }]],
     ["an entry with a non-string name", [{ name: 7, notifications: true }]],
+    ["an entry whose quiet is not a boolean", [{ name: "yappr", notifications: false, quiet: "yes" }]],
   ])("a declaration that is %s makes the store malformed rather than guessed at", (_label, mcp) => {
     const json = JSON.parse(serializeAgentStoreState(putAgent(emptyAgentStore(), agent)));
     json.agents[agent.id].mcp = mcp;
     expect(parseAgentStoreState(JSON.stringify(json)).ok).toBe(false);
+  });
+
+  test("an opt-out is stored as quiet, and still reads as unsubscribed to builds that only know notifications", () => {
+    const state = setAgentMcp(putAgent(emptyAgentStore(), agent), agent.id, [{ name: "yappr", notifications: false }]);
+    const json = JSON.parse(serializeAgentStoreState(state));
+    expect(json.agents[agent.id].mcp).toEqual([{ name: "yappr", notifications: false, quiet: true }]);
+    expect(roundTrip(JSON.stringify(json)).agents[agent.id]!.mcp).toEqual([{ name: "yappr", notifications: false }]);
+  });
+
+  test("a declaration written before channels were on by default subscribes every server", () => {
+    // Old syntax: `yappr` without +notify stored notifications:false, meaning "never opted in", not "opted out".
+    const json = JSON.parse(serializeAgentStoreState(putAgent(emptyAgentStore(), agent)));
+    json.agents[agent.id].mcp = [{ name: "rocketr", notifications: true }, { name: "yappr", notifications: false }];
+    expect(roundTrip(JSON.stringify(json)).agents[agent.id]!.mcp).toEqual([{ name: "rocketr", notifications: true }, { name: "yappr", notifications: true }]);
   });
 
   test("setting it on an unknown agent changes nothing", () => {

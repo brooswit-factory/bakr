@@ -71,6 +71,7 @@ import {
   clearFailedForkFromRecordsForCurrentTarget,
   markLaunchStarted,
   markLaunchFailed,
+  resolveLaunch,
   resolveRespawnAttempt,
   putAgent,
   removeAndRetireAgent,
@@ -78,6 +79,7 @@ import {
   type AgentRecord,
   type AgentStoreState,
   type AttemptKey,
+  type LaunchRecord,
 } from "./agent-model";
 import { load, withAgentStoreLock } from "./agent-store-io";
 import {
@@ -95,7 +97,7 @@ import {
 import { launch, listBackgroundSessions, decideLiveness, isPidAlive, respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal, stopSession, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
 import { realTranscriptProbeDeps, realLaunchConfigDeps } from "./paths";
-import { claudeLaunchArgs, hostDefaultDeclaration, provisionMcpFor, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
+import { claudeLaunchArgs, provisionMcpFor, resolveMcpAccess, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
 import type { ClaimKey } from "./claim-key-resolve";
 
 export interface AgentActionDeps {
@@ -107,11 +109,15 @@ export interface AgentActionDeps {
   readonly acquireTimeoutMs?: number;
   /** BAKR-22: read-only access to Claude Code's own `~/.claude/projects/` tree, for the never-spoken-to-then-moved check (`probeResumableTranscript`). Optional — defaults to the real filesystem (`realTranscriptProbeDeps`, paths.ts) — so every existing caller/test that never exercises the moved-directory escape needs no change. */
   readonly transcriptProbeDeps?: TranscriptProbeDeps;
-  /** Which MCP servers a launched session must hear from, which declaration an agent without its own falls back to, and how to read a directory's `.mcp.json` and write its approval (launch-config.ts). Optional — defaults to the real filesystem and this host's own environment (`realLaunchConfigDeps`, paths.ts) — so every existing caller and test needs no change, and a host that configures nothing launches exactly as before. */
+  /** How to read a directory's `.mcp.json` and write its MCP approval (launch-config.ts). Optional — defaults to the real filesystem (`realLaunchConfigDeps`, paths.ts), so every existing caller and test needs no change. */
   readonly launchConfigDeps?: LaunchConfigDeps;
+  /** Waits between polls (relaunch). Defaults to a real timer; tests pass an instant one. */
+  readonly sleep?: (ms: number) => Promise<void>;
+  /** Whether a pid is still running (relaunch waits for the old session to exit). Defaults to the real probe. */
+  readonly isPidAlive?: (pid: number) => boolean;
 }
 
-/** The agent's own MCP declaration, read fresh so a change made since the caller's lock hold still applies; `undefined` (this host's default) when it has none or the store cannot be read. */
+/** The agent's own MCP declaration, read fresh so a change made since the caller's lock hold still applies; `undefined` (the default: every server its `.mcp.json` configures) when it has none or the store cannot be read. */
 async function declaredMcp(deps: AgentActionDeps, agentId: string): Promise<readonly McpServerDeclaration[] | undefined> {
   const loaded = await load(deps.agentsPath);
   return loaded.status === "loaded" ? loaded.state.agents[agentId]?.mcp : undefined;
@@ -141,7 +147,42 @@ export type StopOutcome =
   | { readonly kind: "already-gone" }
   | { readonly kind: "stopped"; readonly shortId: string }
   | { readonly kind: "stop-failed"; readonly shortId: string; readonly error: string }
-  | { readonly kind: "listing-failed"; readonly error: string };
+  | { readonly kind: "listing-failed"; readonly error: string }
+  /** The agent never resolved a session, and every launch it recorded is accounted for: claude lists each as ended (failed, stopped or done), or it failed before printing an id. */
+  | { readonly kind: "launches-ended"; readonly shortIds: readonly string[] };
+
+/** States `claude agents --json --all` reports for a background session that is no longer running. */
+const ENDED_STATES: ReadonlySet<string> = new Set(["failed", "stopped", "done"]);
+
+/**
+ * For an agent with no restore target — `stopLiveSession` has nothing to stop
+ * — whether every launch it recorded has ended. Such an agent is exactly one
+ * whose launch crashed before resolving (e.g. the "daemon binary was deleted"
+ * outage): claude lists that session as `failed` under `--all`, yet `delete`
+ * used to park it forever as "nothing to stop". A live one is stopped here by
+ * its own recorded short id — it is this agent's launch, never a guess by
+ * directory. Anything this cannot account for (a launch still in flight with
+ * no id, an id no listing shows) stays `nothing-to-stop`, which parks.
+ */
+async function settleUnresolvedLaunches(deps: AgentActionDeps, launches: readonly { readonly launchShortId: string | undefined; readonly error: string | undefined }[]): Promise<StopOutcome> {
+  if (launches.some((l) => l.launchShortId === undefined && l.error === undefined)) return { kind: "nothing-to-stop" };
+  const ids = launches.flatMap((l) => l.launchShortId === undefined ? [] : [l.launchShortId]);
+  if (ids.length === 0) return { kind: "launches-ended", shortIds: [] };
+  let sessions;
+  try {
+    sessions = await listBackgroundSessions({ runCommand: deps.runCommand }, { includeAll: true });
+  } catch (err) {
+    return { kind: "listing-failed", error: err instanceof Error ? err.message : String(err) };
+  }
+  for (const id of ids) {
+    const entry = sessions.find((s) => s.id === id);
+    if (entry === undefined) return { kind: "nothing-to-stop" };
+    if (entry.state !== undefined && ENDED_STATES.has(entry.state)) continue;
+    const stopped = await stopSession(id, { runCommand: deps.runCommand });
+    if (!stopped.ok) return { kind: "stop-failed", shortId: id, error: stopped.error };
+  }
+  return { kind: "launches-ended", shortIds: ids };
+}
 
 /**
  * THE ONE FUNCTION `off`, `archive` and `delete` all call to stop a session
@@ -752,22 +793,35 @@ export const name = rename;
 export type McpResult =
   | StoreMalformed
   | ResolutionRefusal
-  | { readonly ok: true; readonly agent: AgentRecord; readonly changed: boolean; readonly hostDefault: readonly McpServerDeclaration[] };
+  | {
+      readonly ok: true;
+      readonly agent: AgentRecord;
+      readonly changed: boolean;
+      /** What the agent's next start carries: its declaration (or every server its `.mcp.json` configures), kept to what that file configures. */
+      readonly effective: readonly McpServerDeclaration[];
+      /** Declared servers its `.mcp.json` does not configure. */
+      readonly missing: readonly string[];
+    };
 
 /**
  * Shows (`mcp` omitted) or replaces an agent's MCP declaration; `null`
- * returns it to this host's default. A change writes the vendor approval at
- * once, so it is in place before the agent's next start — which is when a
- * running session reads it. Never starts or stops anything.
+ * returns it to the default (every server its `.mcp.json` configures, each
+ * subscribed to). A change writes the vendor approval at once, so it is in
+ * place before the agent's next start — which is when a running session reads
+ * it. Never starts or stops anything; `relaunch` carries a changed
+ * subscription into a running agent.
  */
 export async function mcp(deps: AgentActionDeps, directory: ClaimKey, ref: string, declaration?: readonly McpServerDeclaration[] | null): Promise<McpResult> {
   const launchDeps = deps.launchConfigDeps ?? realLaunchConfigDeps;
-  const hostDefault = hostDefaultDeclaration(launchDeps);
+  const describe = async (agent: AgentRecord) => {
+    const access = await resolveMcpAccess(agent.directory, launchDeps, agent.mcp);
+    return { effective: access.servers, missing: access.missing };
+  };
   if (declaration === undefined) {
     const loaded = await load(deps.agentsPath);
     if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
     const resolved = resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), directory, ref);
-    return resolved.ok ? { ok: true, agent: resolved.agent, changed: false, hostDefault } : resolved;
+    return resolved.ok ? { ok: true, agent: resolved.agent, changed: false, ...(await describe(resolved.agent)) } : resolved;
   }
   const next = declaration ?? undefined;
   const decided = await withAgentStoreLock<ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord; readonly changed: boolean }>(
@@ -785,7 +839,7 @@ export async function mcp(deps: AgentActionDeps, directory: ClaimKey, ref: strin
   const result = decided.result;
   if (!result.ok) return result;
   await provisionMcpFor(result.agent.directory, launchDeps, result.agent.mcp);
-  return { ...result, hostDefault };
+  return { ...result, ...(await describe(result.agent)) };
 }
 
 // --- delete --------------------------------------------------------------
@@ -813,7 +867,7 @@ export type DeleteResult =
  * them; only bakr's own record of the agent is removed.
  */
 export async function deleteAgent(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<DeleteResult> {
-  const recorded = await withAgentStoreLock<ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined }>(
+  const recorded = await withAgentStoreLock<ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined; readonly launches: readonly LaunchRecord[] }>(
     deps.agentsPath,
     (current) => {
       const decision = decideDelete(current, directory, ref);
@@ -821,7 +875,8 @@ export async function deleteAgent(deps: AgentActionDeps, directory: ClaimKey, re
         return { state: current, result: decision };
       }
       const parked: AgentRecord = { ...decision.agent, state: "archived" };
-      return { state: putAgent(current, parked), result: decision };
+      const launches = current.launches.filter((l) => l.agentId === decision.agent.id);
+      return { state: putAgent(current, parked), result: { ...decision, launches } };
     },
     lockOpts(deps)
   );
@@ -829,9 +884,10 @@ export async function deleteAgent(deps: AgentActionDeps, directory: ClaimKey, re
   const decision = recorded.result;
   if (!decision.ok) return decision;
 
-  const stop = await stopLiveSession(deps, decision.restoreSessionId);
+  const direct = await stopLiveSession(deps, decision.restoreSessionId);
+  const stop = direct.kind === "nothing-to-stop" ? await settleUnresolvedLaunches(deps, decision.launches) : direct;
 
-  if (stop.kind !== "stopped" && stop.kind !== "already-gone") {
+  if (stop.kind !== "stopped" && stop.kind !== "already-gone" && stop.kind !== "launches-ended") {
     return {
       ok: true,
       kind: "parked",
@@ -845,12 +901,181 @@ export async function deleteAgent(deps: AgentActionDeps, directory: ClaimKey, re
     deps.agentsPath,
     (current) => {
       if (!(decision.agent.id in current.agents)) return { state: current, result: undefined };
-      return { state: removeAndRetireAgent(current, decision.agent.id), result: undefined };
+      // Its launch records go with it: nothing can resolve them to an agent that no longer exists.
+      const retired = removeAndRetireAgent(current, decision.agent.id);
+      return { state: { ...retired, launches: retired.launches.filter((l) => l.agentId !== decision.agent.id) }, result: undefined };
     },
     lockOpts(deps)
   );
 
   return { ok: true, kind: "deleted", agentId: decision.agent.id, stop };
+}
+
+// --- relaunch --------------------------------------------------------------
+
+export type RelaunchRefusalReason =
+  | "not-on" | "no-session" | "launch-in-flight" | "self" | "busy" | "listing-failed" | "could-not-tell" | "stop-failed";
+
+export type RelaunchResult =
+  | StoreMalformed
+  | ResolutionRefusal
+  /** Nothing was changed: the agent is exactly as it was. */
+  | { readonly ok: false; readonly reason: RelaunchRefusalReason; readonly message: string; readonly agent?: AgentRecord }
+  /** The old session was stopped but its replacement did not come up; the agent is left `off` so no daemon restores behind the operator's back. `message` says how to recover. */
+  | { readonly ok: false; readonly reason: "launch-failed" | "unlisted"; readonly message: string; readonly agent: AgentRecord; readonly launchShortId?: string }
+  | {
+      readonly ok: true;
+      readonly agent: AgentRecord;
+      readonly previous: { readonly shortId: string; readonly sessionId: string };
+      readonly next: { readonly shortId: string; readonly sessionId: string };
+      /** True when the conversation was carried over by forking; false when the old session had no transcript to carry (it was never prompted), so a fresh launch replaced it. */
+      readonly forked: boolean;
+      readonly args: readonly string[];
+    };
+
+const RELAUNCH_EXIT_TIMEOUT_MS = 15_000;
+const RELAUNCH_LIST_TIMEOUT_MS = 45_000;
+const RELAUNCH_POLL_MS = 500;
+
+/**
+ * Stops an `on` agent's session and FORKS it (`--resume <session>
+ * --fork-session`) with the MCP access it has now — so a changed channel or
+ * approval reaches a running agent without losing its conversation, which
+ * `off`/`on` cannot do: a respawn comes back with the flags its session was
+ * first launched with. The fork becomes the agent's restore target.
+ *
+ * The agent is `off` for the duration. Every daemon build skips `off`
+ * agents, so none can respawn the old session in the window between stopping
+ * it and the fork being listed — the pending forkFrom record alone would not
+ * stop a daemon, whose guard keys on the respawn attempt. The old session's
+ * process is waited out before the fork starts, because a single-holder MCP
+ * identity (yappr) still held by it would leave the fork without that
+ * server. If the fork fails or never lists, the agent stays `off` and the
+ * result says how to recover; nothing is guessed.
+ *
+ * Refuses, changing nothing, when the agent is not `on`, has no session yet,
+ * has a launch in flight, is mid-turn (`working` — typed input would be cut
+ * off), or is the caller's own session (`selfSessionId`: relaunching it would
+ * kill the process asking).
+ */
+export async function relaunch(deps: AgentActionDeps, directory: ClaimKey, ref: string, opts: { readonly selfSessionId?: string } = {}): Promise<RelaunchResult> {
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const pidAlive = deps.isPidAlive ?? isPidAlive;
+
+  const loaded = await load(deps.agentsPath);
+  if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
+  const found = resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), directory, ref);
+  if (!found.ok) return found;
+  const agent = found.agent;
+  const target = agent.restoreTarget;
+  if (agent.state !== "on") return { ok: false, reason: "not-on", message: `agent ${agent.id} is ${agent.state}; relaunch only replaces a running agent's session (use "on")`, agent };
+  if (target === undefined) return { ok: false, reason: "no-session", message: `agent ${agent.id} has no session yet; nothing to relaunch`, agent };
+  if (opts.selfSessionId !== undefined && opts.selfSessionId === target.sessionId) {
+    return { ok: false, reason: "self", message: `agent ${agent.id} is the session running this command; relaunching it would kill the caller — relaunch it from another session`, agent };
+  }
+
+  let sessions: BackgroundSessionInfo[];
+  try {
+    sessions = await listBackgroundSessions({ runCommand: deps.runCommand });
+  } catch (err) {
+    return { ok: false, reason: "listing-failed", message: err instanceof Error ? err.message : String(err), agent };
+  }
+  const live = sessions.find((session) => session.sessionId === target.sessionId);
+  if (live?.state === "working") return { ok: false, reason: "busy", message: `agent ${agent.id}'s session ${live.id} is mid-turn; relaunch when it is idle`, agent };
+
+  const probe = await probeResumableTranscript(target.sessionId, deps.transcriptProbeDeps ?? realTranscriptProbeDeps);
+  if (probe.status === "could-not-tell") return { ok: false, reason: "could-not-tell", message: `could not tell whether session ${target.sessionId} has a transcript to fork (${probe.reason}); nothing was changed`, agent };
+  const forked = probe.status === "has-transcript";
+
+  const attemptId = deps.generateAttemptId();
+  const attemptKey: AttemptKey = { kind: "forkFrom", sessionId: target.sessionId };
+  const begun = await withAgentStoreLock<{ readonly ok: true } | { readonly ok: false; readonly reason: RelaunchRefusalReason; readonly message: string }>(
+    deps.agentsPath,
+    (current) => {
+      const now = current.agents[agent.id];
+      if (now === undefined || now.state !== "on" || now.restoreTarget?.sessionId !== target.sessionId) {
+        return { state: current, result: { ok: false, reason: "not-on", message: `agent ${agent.id} changed while relaunch was deciding; nothing was changed` } };
+      }
+      if (current.launches.some((l) => l.agentId === agent.id && l.error === undefined)) {
+        return { state: current, result: { ok: false, reason: "launch-in-flight", message: `agent ${agent.id} already has a launch in flight; nothing was changed` } };
+      }
+      const parked = putAgent(current, { ...now, state: "off" });
+      return { state: beginLaunch(parked, agent.id, directory, attemptKey, attemptId, deps.now()), result: { ok: true } };
+    },
+    lockOpts(deps)
+  );
+  if (begun.status === "malformed") return { ok: false, reason: "store-malformed", message: begun.error };
+  if (!begun.result.ok) return { ...begun.result, agent };
+
+  const recover = (why: string) => `${why}; agent ${agent.id} is left off. "bakr ${agent.name ?? agent.id} on" brings back session ${target.shortId} with its conversation`;
+  const fail = async (reason: "launch-failed" | "unlisted", message: string, launchShortId?: string): Promise<RelaunchResult> => {
+    await withAgentStoreLock(deps.agentsPath, (current) => ({
+      state: launchShortId === undefined ? { ...current, launches: current.launches.filter((l) => l.attemptId !== attemptId) } : current,
+      result: undefined,
+    }), lockOpts(deps));
+    const after = await load(deps.agentsPath);
+    const latest = after.status === "loaded" ? after.state.agents[agent.id] ?? agent : agent;
+    return { ok: false, reason, message, agent: latest, ...(launchShortId === undefined ? {} : { launchShortId }) };
+  };
+
+  if (live !== undefined) {
+    const stopped = await stopSession(live.id, { runCommand: deps.runCommand });
+    if (!stopped.ok) {
+      // The old session is still running, so undo everything: the agent is back exactly as it was.
+      await withAgentStoreLock(deps.agentsPath, (current) => {
+        const now = current.agents[agent.id];
+        const cleared = { ...current, launches: current.launches.filter((l) => l.attemptId !== attemptId) };
+        return { state: now === undefined ? cleared : putAgent(cleared, { ...now, state: "on" }), result: undefined };
+      }, lockOpts(deps));
+      return { ok: false, reason: "stop-failed", message: `could not stop session ${live.id} (${stopped.error}); nothing was changed`, agent };
+    }
+    if (live.pid !== undefined) {
+      const until = deps.now() + RELAUNCH_EXIT_TIMEOUT_MS;
+      while (pidAlive(live.pid) && deps.now() < until) await sleep(RELAUNCH_POLL_MS);
+    }
+  }
+
+  const configured = await configuredLaunchArgs(deps, directory, agent.id);
+  const args = forked ? ["--resume", target.sessionId, "--fork-session", ...configured] : configured;
+  const launched = await launch(directory, args, { runCommand: deps.runCommand });
+  if (!launched.ok) {
+    await withAgentStoreLock(deps.agentsPath, (current) => ({ state: markLaunchFailed(current, attemptId, launched.error), result: undefined }), lockOpts(deps));
+    return fail("launch-failed", recover(`the replacement launch failed (${launched.error})`));
+  }
+  await withAgentStoreLock(deps.agentsPath, (current) => ({ state: markLaunchStarted(current, attemptId, launched.id), result: undefined }), lockOpts(deps));
+
+  let sessionId: string | undefined;
+  const listedBy = deps.now() + RELAUNCH_LIST_TIMEOUT_MS;
+  while (sessionId === undefined) {
+    try {
+      sessionId = (await listBackgroundSessions({ runCommand: deps.runCommand })).find((session) => session.id === launched.id)?.sessionId;
+    } catch {
+      // A failed listing is retried until the deadline, like an absent entry.
+    }
+    if (sessionId !== undefined || deps.now() >= listedBy) break;
+    await sleep(RELAUNCH_POLL_MS);
+  }
+  if (sessionId === undefined) {
+    return fail("unlisted", `${recover(`replacement session ${launched.id} was launched but never listed`)}; once it lists, the daemon resolves it and "on" brings it back instead`, launched.id);
+  }
+
+  const resolvedId = sessionId;
+  const done = await withAgentStoreLock(deps.agentsPath, (current) => {
+    let next = resolveLaunch(current, launched.id, resolvedId);
+    const now = next.agents[agent.id];
+    if (now !== undefined) next = putAgent(next, { ...now, state: "on" });
+    return { state: next, result: next.agents[agent.id] };
+  }, lockOpts(deps));
+  const finalAgent = done.status === "malformed" ? agent : done.result ?? agent;
+  return { ok: true, agent: finalAgent, previous: { shortId: target.shortId, sessionId: target.sessionId }, next: { shortId: launched.id, sessionId: resolvedId }, forked, args };
+}
+
+/** Every `on` agent on this host with a session, for `relaunch --all`: `[directory, name-or-id]` pairs in store order. */
+export async function relaunchCandidates(deps: AgentActionDeps): Promise<readonly AgentRecord[] | StoreMalformed> {
+  const loaded = await load(deps.agentsPath);
+  if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
+  if (loaded.status !== "loaded") return [];
+  return Object.values(loaded.state.agents).filter((a) => a.state === "on" && a.restoreTarget !== undefined);
 }
 
 // --- list ------------------------------------------------------------------

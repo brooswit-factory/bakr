@@ -15,4 +15,5 @@ runCli(process.argv.slice(2),{
   claimsPath:claimsPath(),resolveInputs:realResolveInputs,probeDeps:realOrphanProbeDeps,cwd:process.cwd(),...(process.env.HOME === undefined ? {} : {home:process.env.HOME}),
   stdinIsTTY:process.stdin.isTTY===true,stdoutIsTTY:process.stdout.isTTY===true,
   stdout:s=>process.stdout.write(s),stderr:s=>process.stderr.write(s),prompt,spawnAttach:spawnClaudeAttach,messenger:createResidentAgentMessenger(),
+  ...(process.env.CLAUDE_CODE_SESSION_ID ? {selfSessionId:process.env.CLAUDE_CODE_SESSION_ID} : {}),
 }).then(code=>{process.exitCode=code;});
