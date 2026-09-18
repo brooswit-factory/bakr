@@ -48,9 +48,10 @@ import {
   resetRestoreAttempts,
   planRestore,
 } from "./agent-model";
+import { claudeLaunchArgs, provisionMcpFor, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
 import { listBackgroundSessions, decideLiveness, checkLiveness, isPidAlive, launch, respawnSession, isRecognizedStaleCwdRefusal, detectStaleRegisteredCwdRefusal, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
-import { realTranscriptProbeDeps } from "./paths";
+import { realTranscriptProbeDeps, realLaunchConfigDeps } from "./paths";
 import type { ClaimKey } from "./claim-key-resolve";
 import { classifyDirectory, type OrphanVerdict } from "./orphan-model";
 import { probeDirectory, type OrphanProbeDeps } from "./orphan-probe";
@@ -71,8 +72,20 @@ export interface DaemonDeps {
   readonly probeDeps: OrphanProbeDeps;
   /** BAKR-22: read-only access to Claude Code's own `~/.claude/projects/` tree, for the never-spoken-to-then-moved check. Optional — defaults to the real filesystem (`realTranscriptProbeDeps`, paths.ts). */
   readonly transcriptProbeDeps?: TranscriptProbeDeps;
+  /** Which MCP servers a launched session must hear from, which declaration an agent without its own falls back to, and how to read a directory's `.mcp.json` and write its approval (launch-config.ts). Optional — defaults to the real filesystem and this host's own environment (`realLaunchConfigDeps`, paths.ts), so a host that configures nothing reconciles exactly as before. */
+  readonly launchConfigDeps?: LaunchConfigDeps;
   readonly acquireTimeoutMs?: number;
 }
+
+/** The agent's own MCP declaration, read fresh from the store; `undefined` (this host's default) when it has none or the store cannot be read. */
+async function declaredMcp(deps: DaemonDeps, agentId: string): Promise<readonly McpServerDeclaration[] | undefined> {
+  const loaded = await loadAgents(deps.agentsPath);
+  return loaded.status === "loaded" ? loaded.state.agents[agentId]?.mcp : undefined;
+}
+
+/** Every `launch()` in this loop carries this, after its MCP approval is written; `respawnSession` deliberately carries no flags (see launch-config.ts's module comment). */
+const configuredLaunchArgs = async (deps: DaemonDeps, directory: string, agentId: string): Promise<string[]> =>
+  claudeLaunchArgs(directory, deps.launchConfigDeps ?? realLaunchConfigDeps, await declaredMcp(deps, agentId));
 
 export interface DaemonState {
   readonly claimDegraded: boolean;
@@ -431,6 +444,8 @@ async function dispatchRespawnForDaemon(deps: DaemonDeps, agentId: string, key: 
     return { kind: "refused", error };
   }
 
+  // A respawn takes no flags, but still needs the agent's MCP approval in place before its process starts.
+  await provisionMcpFor(key, deps.launchConfigDeps ?? realLaunchConfigDeps, await declaredMcp(deps, agentId));
   const result = await respawnSession(shortId, { runCommand: deps.runCommand });
   if (result.ok) {
     await withAgentStoreLock(deps.agentsPath, (current) => ({ state: resolveRespawnAttempt(current, attemptId), result: undefined }), lockOpts(deps));
@@ -453,7 +468,10 @@ async function dispatchRespawnForDaemon(deps: DaemonDeps, agentId: string, key: 
       return { kind: "refused", error };
     }
     const canForkFrom = probe.status === "has-transcript";
-    const forkResult = canForkFrom ? await launch(key, ["--resume", restoreSessionId, "--fork-session"], { runCommand: deps.runCommand }) : await launch(key, [], { runCommand: deps.runCommand });
+    const configured = await configuredLaunchArgs(deps, key, agentId);
+    const forkResult = canForkFrom
+      ? await launch(key, ["--resume", restoreSessionId, "--fork-session", ...configured], { runCommand: deps.runCommand })
+      : await launch(key, configured, { runCommand: deps.runCommand });
     await withAgentStoreLock(
       deps.agentsPath,
       (current) => {
@@ -679,7 +697,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       }
 
       // begin-fresh-launch only from here on.
-      const launchResult = await launch(key, [], { runCommand: deps.runCommand });
+      const launchResult = await launch(key, await configuredLaunchArgs(deps, key, agent.id), { runCommand: deps.runCommand });
       if (launchResult.ok) {
         await recordLaunchOutcome(deps, decision.attemptId, launchResult);
         log("info", `agent ${agent.id} in "${key}": fresh launch issued -> short id ${launchResult.id}; awaiting a future listing to learn its session id`);

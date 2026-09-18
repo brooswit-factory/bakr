@@ -41,6 +41,18 @@ export interface LaunchInvocation {
  * The target directory travels as the child process's `cwd` (see
  * `LaunchInvocation.cwd`, consumed by the injected RunCommand), never as an
  * argv element — `claude --bg` takes no directory flag of its own.
+ *
+ * `claudeArgs` go BEFORE `--bg`, and the order is load-bearing: `claude --bg`
+ * does not parse options placed after it, it swallows the remaining argv as
+ * the session's prompt. Measured on claude 2.1.275 —
+ * `claude --bg --definitely-not-a-real-flag xyz` does not error, it
+ * backgrounds a session *named* "xyz", while the same unknown option without
+ * `--bg` fails with "unknown option". So an appended flag is silently
+ * demoted to prompt text: launching with the development-channels flag after
+ * `--bg` produced sessions named "server:yappr" that blocked with no
+ * subscription, which is the bug this ordering fixes. Before `--bg` the flag
+ * consumes its value properly (`--dangerously-load-development-channels
+ * server:yappr --bg 'NAME'` yields a session named "NAME").
  */
 export function buildLaunchInvocation(
   dir: string,
@@ -58,8 +70,8 @@ export function buildLaunchInvocation(
       ...(opts.pinExpandEnvironment === false ? [] : ["--expand-environment=no"]),
       "--",
       "claude",
-      "--bg",
       ...claudeArgs,
+      "--bg",
     ],
     cwd: dir,
     timeoutMs: LAUNCH_TIMEOUT_MS,

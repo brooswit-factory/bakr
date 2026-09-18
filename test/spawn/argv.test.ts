@@ -28,10 +28,15 @@ describe("buildLaunchInvocation", () => {
     expect(invocation.argv).not.toContain("/home/op/project");
   });
 
-  test("extra claude args are appended after --bg, each as its own argv element", () => {
+  test("extra claude args go before --bg, each as its own argv element", () => {
     const invocation = buildLaunchInvocation("/x", "u", ["--append-system-prompt", "watch this repo"]);
+    const claudeIndex = invocation.argv.indexOf("claude");
     const bgIndex = invocation.argv.indexOf("--bg");
-    expect(invocation.argv.slice(bgIndex + 1)).toEqual(["--append-system-prompt", "watch this repo"]);
+    expect(invocation.argv.slice(claudeIndex + 1, bgIndex)).toEqual(["--append-system-prompt", "watch this repo"]);
+    // FALSIFIER: --bg last. `claude --bg` does not parse options after it, it
+    // takes the rest of argv as the session prompt, so anything appended here
+    // is silently demoted to prompt text and its flag never takes effect.
+    expect(bgIndex).toBe(invocation.argv.length - 1);
   });
 
   test("a value containing shell metacharacters survives as a single argv element, unescaped", () => {

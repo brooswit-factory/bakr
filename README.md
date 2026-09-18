@@ -30,12 +30,16 @@ not create or launch an agent. This differs from candlestix, whose bare
 command creates: a bakr directory already has meaning, so spending a launch
 on first discovery would be surprising.
 
+`create` and `adopt` also claim the directory, durably and before the agent
+record is written, because the daemon only restores agents in claimed
+directories — that claim is what brings an agent back after a reboot.
+
 | Command | Meaning |
 |---|---|
 | `bakr` | Claim and discover the current directory |
 | `bakr list [--archived]` | List this directory's agents |
-| `bakr create [--name <name>]` | Create without auto-attaching |
-| `bakr adopt <@id> [<@id> ...]` | Explicitly adopt offered orphans here |
+| `bakr create [--name <name>]` | Claim the current directory, then create without auto-attaching |
+| `bakr adopt <@id> [<@id> ...]` | Claim the current directory, then explicitly adopt offered orphans here |
 | `bakr <id\|name>` | Attach in the current terminal |
 | `bakr <id\|name> on\|off\|archive\|unarchive` | Change lifecycle state |
 | `bakr <id\|name> name\|rename <new>` | Rename |
@@ -95,6 +99,53 @@ a timer, an agent lifecycle action set, and the CLI described above.
 systemctl --user start bakr.service
 journalctl --user -u bakr.service   # NOT the system-level journalctl — see below
 ```
+
+### Which MCP servers an agent gets
+
+An agent's MCP access used to be spread over three places, and each gap
+failed silently in its own way: `.mcp.json` defines a server, but without
+Claude's `enabledMcpjsonServers` approval a fresh session sits `blocked` on an
+approval prompt nobody can answer, and without the server's development
+channel at launch it never hears a notification. bakr now owns one
+declaration per agent, stored in its own agent store, and drovr renders it
+for the vendor: the approval is written before every start (respawns
+included), and the channel flags go on every fresh launch or fork.
+
+```
+bakr create --name rocketr --mcp rocketr+notify --mcp yappr
+bakr rocketr mcp                         # show it
+bakr rocketr mcp rocketr+notify yappr    # replace it (writes the approval now)
+bakr rocketr mcp default                 # back to the host default
+```
+
+`<server>` allows the agent to use a server; `<server>+notify` also launches
+it subscribed to that server's notifications. The servers themselves are
+still defined in the directory's `.mcp.json`; a declared server it does not
+configure is dropped from the start and reported.
+
+An agent with no declaration uses the host default, each server allowed and
+subscribed to:
+
+```
+BAKR_MCP_NOTIFICATION_SERVERS=yappr      # commas or spaces separate several
+```
+
+Set it with an `Environment=` line in `systemd/bakr.service` before
+`./scripts/install.sh`, then
+`systemctl --user daemon-reload && systemctl --user restart bakr.service`. It
+is read from each process's own environment — the unit's for the daemon, the
+caller's shell for the CLI — so an agent that must get the same access
+whichever of them starts it should declare its own.
+
+When a change reaches a running session: the approval, at its next start. A
+changed `+notify`, only at a fresh launch: `claude respawn` takes no flags
+from bakr (BAKR-22) and reuses the channels the session was first launched
+with.
+
+bakr decides *which servers*; it never spells a vendor flag or settings key.
+drovr's `applyMcpAccess` and `buildProviderLaunchArgs` do, so the provider
+contract lives in one place for every substrate that launches one. See
+`src/launch-config.ts`.
 
 `scripts/install.sh` is a **bash** script (already executable in this repo,
 `chmod 755`) — `bun run scripts/install.sh` does NOT work: `bun run` hands a

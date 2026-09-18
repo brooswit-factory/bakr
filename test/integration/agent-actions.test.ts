@@ -16,6 +16,7 @@ import {
   create,
   deleteAgent,
   list,
+  mcp,
   name as nameVerb,
   off,
   on,
@@ -26,6 +27,16 @@ import {
 } from "../../src/agent-actions";
 import type { ClaimKey } from "../../src/claim-key-resolve";
 import type { CommandResult, RunCommandOptions } from "../../src/spawn";
+import type { McpSettingsIo } from "@brooswit/drovr";
+
+/** In-memory vendor settings, so no test writes a real `.claude/settings.local.json`. */
+function memorySettings(): McpSettingsIo & { files: Record<string, string> } {
+  const files: Record<string, string> = {};
+  return { files, readSettings: async (path) => files[path], writeSettings: async (path, contents) => { files[path] = contents; } };
+}
+const approvalIn = (io: { files: Record<string, string> }, dir: string): unknown =>
+  JSON.parse(io.files[`${dir}/.claude/settings.local.json`] ?? "{}").enabledMcpjsonServers;
+const ROCKETR_MCP = JSON.stringify({ mcpServers: { rocketr: { type: "http" }, yappr: { type: "stdio" } } });
 
 const KEY = "/claimed/dir" as ClaimKey;
 const OTHER_KEY = "/claimed/other" as ClaimKey;
@@ -95,6 +106,10 @@ function baseDeps(dir: string, runCommand: AgentActionDeps["runCommand"]): Agent
   return {
     agentsPath: join(dir, "agents.json"),
     runCommand,
+    // Pinned rather than inherited: the default reads this HOST's own
+    // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json` files, which would make
+    // every launch-argv assertion below depend on the machine running it.
+    launchConfigDeps: { readConfigFile: async () => undefined, notificationServers: [] },
     now: () => 1_700_000_000_000,
     generateAttemptId: () => `attempt-${counter++}`,
     randomBytes: (n: number) => {
@@ -127,9 +142,75 @@ describe("create", () => {
     expect(result.launch.ok).toBe(true);
 
     const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    const dashIdx = systemdCall.indexOf("--");
-    const claudeArgs = systemdCall.slice(dashIdx + 3); // after "--", "claude", "--bg"
+    // Between "claude" and the trailing "--bg": options must precede --bg,
+    // which does not parse anything placed after it.
+    const claudeArgs = systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"));
     expect(claudeArgs).toEqual([]); // FALSIFIER: any extra argv element here is a B8 violation
+  });
+
+  test("a session whose directory configures a requested MCP server launches subscribed to it", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaude();
+    const settingsIo = memorySettings();
+    const result = await create({
+      ...baseDeps(dir, fake.runCommand),
+      launchConfigDeps: {
+        notificationServers: ["yappr"],
+        readConfigFile: async (path) => path === `${KEY}/.mcp.json`
+          ? JSON.stringify({ mcpServers: { yappr: { type: "stdio", command: "bun" } } })
+          : undefined,
+        settingsIo,
+      },
+    }, KEY);
+    expect(result.ok).toBe(true);
+    // Approved before the launch, or the session sits blocked on an approval prompt.
+    expect(approvalIn(settingsIo, KEY)).toEqual(["yappr"]);
+
+    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
+    const claudeArgs = systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"));
+    // FALSIFIER: this is the whole point — MCP configured but never subscribed
+    // to is the bug. The flag spellings come from drovr, never from this repo.
+    expect(claudeArgs).toEqual([
+      "--mcp-config", `${KEY}/.mcp.json`,
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["yappr"] }),
+      "--dangerously-load-development-channels=server:yappr",
+    ]);
+  });
+
+  test("a directory that does not configure the requested server still launches with no args", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaude();
+    await create({
+      ...baseDeps(dir, fake.runCommand),
+      launchConfigDeps: {
+        notificationServers: ["yappr"],
+        readConfigFile: async () => JSON.stringify({ mcpServers: { atlassian: {} } }),
+      },
+    }, KEY);
+    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
+    expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([]);
+  });
+
+  test("with an MCP declaration: the agent keeps it, and its launch is approved and subscribed per it", async () => {
+    const dir = await makeTempDir();
+    const fake = makeFakeClaude();
+    const settingsIo = memorySettings();
+    const deps = {
+      ...baseDeps(dir, fake.runCommand),
+      launchConfigDeps: { notificationServers: ["yappr"], readConfigFile: async () => ROCKETR_MCP, settingsIo },
+    };
+    const result = await create(deps, KEY, "rocketr", [{ name: "rocketr", notifications: true }, { name: "yappr", notifications: false }]);
+    expect(result.ok).toBe(true);
+    const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
+    expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([
+      "--mcp-config", `${KEY}/.mcp.json`,
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["rocketr", "yappr"] }),
+      "--dangerously-load-development-channels=server:rocketr",
+    ]);
+    expect(approvalIn(settingsIo, KEY)).toEqual(["rocketr", "yappr"]);
+    const stored = await loadAgents(join(dir, "agents.json"));
+    if (stored.status !== "loaded" || !result.ok) throw new Error("store not loaded");
+    expect(stored.state.agents[result.agent.id]!.mcp).toEqual([{ name: "rocketr", notifications: true }, { name: "yappr", notifications: false }]);
   });
 
   test("with a name: the agent holds it", async () => {
@@ -768,5 +849,50 @@ describe("a malformed agents.json is refused, never overwritten, by every verb",
 
     const raw = await readFile(agentsPath, "utf8");
     expect(raw).toBe("{ not json"); // byte-for-byte unchanged — never overwritten
+  });
+});
+
+describe("mcp", () => {
+  test("shows the host default for an agent with no declaration, replaces it, and returns it to the default", async () => {
+    const dir = await makeTempDir();
+    const settingsIo = memorySettings();
+    const deps = {
+      ...baseDeps(dir, makeFakeClaude().runCommand),
+      launchConfigDeps: { notificationServers: ["yappr"], readConfigFile: async () => ROCKETR_MCP, settingsIo },
+    };
+    const created = await create(deps, KEY, "rocketr");
+    if (!created.ok) throw new Error("create failed");
+    for (const path of Object.keys(settingsIo.files)) delete settingsIo.files[path];
+
+    const shown = await mcp(deps, KEY, "rocketr");
+    if (!shown.ok) throw new Error(shown.message);
+    expect(shown.agent.mcp).toBeUndefined();
+    expect(shown.hostDefault).toEqual([{ name: "yappr", notifications: true }]);
+    expect(shown.changed).toBe(false);
+
+    const set = await mcp(deps, KEY, "rocketr", [{ name: "rocketr", notifications: true }]);
+    if (!set.ok) throw new Error(set.message);
+    expect(set.changed).toBe(true);
+    expect(set.agent.mcp).toEqual([{ name: "rocketr", notifications: true }]);
+    // The approval is written at once, ahead of the agent's next start.
+    expect(approvalIn(settingsIo, KEY)).toEqual(["rocketr"]);
+
+    const again = await mcp(deps, KEY, "rocketr", [{ name: "rocketr", notifications: true }]);
+    if (!again.ok) throw new Error(again.message);
+    expect(again.changed).toBe(false);
+
+    const reset = await mcp(deps, KEY, "rocketr", null);
+    if (!reset.ok) throw new Error(reset.message);
+    expect(reset.changed).toBe(true);
+    expect(reset.agent.mcp).toBeUndefined();
+  });
+
+  test("refused for an agent that is not in this directory, and nothing is written", async () => {
+    const dir = await makeTempDir();
+    const settingsIo = memorySettings();
+    const deps = { ...baseDeps(dir, makeFakeClaude().runCommand), launchConfigDeps: { notificationServers: [], readConfigFile: async () => ROCKETR_MCP, settingsIo } };
+    const result = await mcp(deps, KEY, "nobody", [{ name: "rocketr", notifications: true }]);
+    expect(result.ok).toBe(false);
+    expect(settingsIo.files).toEqual({});
   });
 });

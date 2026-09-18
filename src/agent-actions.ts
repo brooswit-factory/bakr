@@ -74,6 +74,7 @@ import {
   resolveRespawnAttempt,
   putAgent,
   removeAndRetireAgent,
+  setAgentMcp,
   type AgentRecord,
   type AgentStoreState,
   type AttemptKey,
@@ -88,11 +89,13 @@ import {
   decideOn,
   decideRename,
   decideUnarchive,
+  resolveOrRefuse,
   type ResolutionRefusal,
 } from "./agent-lifecycle";
 import { launch, listBackgroundSessions, decideLiveness, isPidAlive, respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal, stopSession, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
-import { realTranscriptProbeDeps } from "./paths";
+import { realTranscriptProbeDeps, realLaunchConfigDeps } from "./paths";
+import { claudeLaunchArgs, hostDefaultDeclaration, provisionMcpFor, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
 import type { ClaimKey } from "./claim-key-resolve";
 
 export interface AgentActionDeps {
@@ -104,7 +107,23 @@ export interface AgentActionDeps {
   readonly acquireTimeoutMs?: number;
   /** BAKR-22: read-only access to Claude Code's own `~/.claude/projects/` tree, for the never-spoken-to-then-moved check (`probeResumableTranscript`). Optional — defaults to the real filesystem (`realTranscriptProbeDeps`, paths.ts) — so every existing caller/test that never exercises the moved-directory escape needs no change. */
   readonly transcriptProbeDeps?: TranscriptProbeDeps;
+  /** Which MCP servers a launched session must hear from, which declaration an agent without its own falls back to, and how to read a directory's `.mcp.json` and write its approval (launch-config.ts). Optional — defaults to the real filesystem and this host's own environment (`realLaunchConfigDeps`, paths.ts) — so every existing caller and test needs no change, and a host that configures nothing launches exactly as before. */
+  readonly launchConfigDeps?: LaunchConfigDeps;
 }
+
+/** The agent's own MCP declaration, read fresh so a change made since the caller's lock hold still applies; `undefined` (this host's default) when it has none or the store cannot be read. */
+async function declaredMcp(deps: AgentActionDeps, agentId: string): Promise<readonly McpServerDeclaration[] | undefined> {
+  const loaded = await load(deps.agentsPath);
+  return loaded.status === "loaded" ? loaded.state.agents[agentId]?.mcp : undefined;
+}
+
+/** Every `launch()` below carries this, after its MCP approval is written; `claude respawn` deliberately carries no flags (see launch-config.ts's module comment). */
+const configuredLaunchArgs = async (deps: AgentActionDeps, directory: string, agentId: string): Promise<string[]> =>
+  claudeLaunchArgs(directory, deps.launchConfigDeps ?? realLaunchConfigDeps, await declaredMcp(deps, agentId));
+
+/** A respawn takes no flags, but still needs the agent's MCP approval in place before its process starts. */
+const prepareRespawnFor = async (deps: AgentActionDeps, directory: string, agentId: string): Promise<void> =>
+  provisionMcpFor(directory, deps.launchConfigDeps ?? realLaunchConfigDeps, await declaredMcp(deps, agentId));
 
 function lockOpts(deps: AgentActionDeps): { acquireTimeoutMs?: number } {
   const opts: { acquireTimeoutMs?: number } = {};
@@ -196,7 +215,7 @@ type CreateLockResult =
  * resolving it). The returned `launch.launchShortId` is honest about
  * exactly that much and no more.
  */
-export async function create(deps: AgentActionDeps, directory: ClaimKey, name?: string): Promise<CreateResult> {
+export async function create(deps: AgentActionDeps, directory: ClaimKey, name?: string, mcp?: readonly McpServerDeclaration[]): Promise<CreateResult> {
   const decided = await withAgentStoreLock<CreateLockResult>(
     deps.agentsPath,
     (current) => {
@@ -205,7 +224,7 @@ export async function create(deps: AgentActionDeps, directory: ClaimKey, name?: 
         return { state: current, result: nameCheck };
       }
       const id = mintUniqueAgentId(current, deps.randomBytes);
-      const agent: AgentRecord = { id, name, directory, state: "on", createdAt: deps.now(), birthSessionId: undefined, restoreTarget: undefined };
+      const agent: AgentRecord = { id, name, directory, state: "on", createdAt: deps.now(), birthSessionId: undefined, restoreTarget: undefined, ...(mcp === undefined ? {} : { mcp }) };
       let next = putAgent(current, agent);
       const attemptId = deps.generateAttemptId();
       next = beginLaunch(next, id, directory, undefined, attemptId, deps.now());
@@ -218,7 +237,7 @@ export async function create(deps: AgentActionDeps, directory: ClaimKey, name?: 
   const result = decided.result;
   if (!result.ok) return result;
 
-  const launchResult = await launch(directory, [], { runCommand: deps.runCommand });
+  const launchResult = await launch(directory, await configuredLaunchArgs(deps, directory, result.agent.id), { runCommand: deps.runCommand });
   await withAgentStoreLock(
     deps.agentsPath,
     (current) => ({
@@ -453,7 +472,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
   if (!result.ok) return result;
   if (result.launch.kind === "issue-fresh") {
     const { attemptId } = result.launch;
-    const launchResult = await launch(directory, [], { runCommand: deps.runCommand });
+    const launchResult = await launch(directory, await configuredLaunchArgs(deps, directory, result.agent.id), { runCommand: deps.runCommand });
     await withAgentStoreLock(
       deps.agentsPath,
       (current) => ({
@@ -518,7 +537,10 @@ async function forkFromCurrentTarget(deps: AgentActionDeps, directory: ClaimKey,
   }
 
   const canForkFrom = probe.status === "has-transcript";
-  const forkResult = canForkFrom ? await launch(directory, ["--resume", restoreSessionId, "--fork-session"], { runCommand: deps.runCommand }) : await launch(directory, [], { runCommand: deps.runCommand });
+  const configured = await configuredLaunchArgs(deps, directory, agentId);
+  const forkResult = canForkFrom
+    ? await launch(directory, ["--resume", restoreSessionId, "--fork-session", ...configured], { runCommand: deps.runCommand })
+    : await launch(directory, configured, { runCommand: deps.runCommand });
   await withAgentStoreLock(
     deps.agentsPath,
     (current) => {
@@ -567,6 +589,7 @@ async function forkFromCurrentTarget(deps: AgentActionDeps, directory: ClaimKey,
  * mint a new one.
  */
 async function dispatchRespawn(deps: AgentActionDeps, directory: ClaimKey, agentId: string, attemptId: string, shortId: string, restoreSessionId: string): Promise<RespawnOutcome> {
+  await prepareRespawnFor(deps, directory, agentId);
   const result = await respawnSession(shortId, { runCommand: deps.runCommand });
   if (result.ok) {
     await withAgentStoreLock(deps.agentsPath, (current) => ({ state: resolveRespawnAttempt(current, attemptId), result: undefined }), lockOpts(deps));
@@ -723,6 +746,47 @@ export async function rename(deps: AgentActionDeps, directory: ClaimKey, ref: st
 
 /** Alias for `rename`, for a caller naming a previously-unnamed agent — see `rename`'s own doc for why this is not a second implementation. */
 export const name = rename;
+
+// --- mcp -------------------------------------------------------------------
+
+export type McpResult =
+  | StoreMalformed
+  | ResolutionRefusal
+  | { readonly ok: true; readonly agent: AgentRecord; readonly changed: boolean; readonly hostDefault: readonly McpServerDeclaration[] };
+
+/**
+ * Shows (`mcp` omitted) or replaces an agent's MCP declaration; `null`
+ * returns it to this host's default. A change writes the vendor approval at
+ * once, so it is in place before the agent's next start — which is when a
+ * running session reads it. Never starts or stops anything.
+ */
+export async function mcp(deps: AgentActionDeps, directory: ClaimKey, ref: string, declaration?: readonly McpServerDeclaration[] | null): Promise<McpResult> {
+  const launchDeps = deps.launchConfigDeps ?? realLaunchConfigDeps;
+  const hostDefault = hostDefaultDeclaration(launchDeps);
+  if (declaration === undefined) {
+    const loaded = await load(deps.agentsPath);
+    if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
+    const resolved = resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), directory, ref);
+    return resolved.ok ? { ok: true, agent: resolved.agent, changed: false, hostDefault } : resolved;
+  }
+  const next = declaration ?? undefined;
+  const decided = await withAgentStoreLock<ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord; readonly changed: boolean }>(
+    deps.agentsPath,
+    (current) => {
+      const resolved = resolveOrRefuse(current, directory, ref);
+      if (!resolved.ok) return { state: current, result: resolved };
+      const changed = JSON.stringify(resolved.agent.mcp) !== JSON.stringify(next);
+      const updated = setAgentMcp(current, resolved.agent.id, next);
+      return { state: changed ? updated : current, result: { ok: true, agent: updated.agents[resolved.agent.id]!, changed } };
+    },
+    lockOpts(deps)
+  );
+  if (decided.status === "malformed") return { ok: false, reason: "store-malformed", message: decided.error };
+  const result = decided.result;
+  if (!result.ok) return result;
+  await provisionMcpFor(result.agent.directory, launchDeps, result.agent.mcp);
+  return { ...result, hostDefault };
+}
 
 // --- delete --------------------------------------------------------------
 

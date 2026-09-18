@@ -25,6 +25,8 @@
 // using `validateNameSyntax`/`checkNameAvailability` below).
 
 import type { ClaimKey } from "./claim-key-resolve";
+import type { McpServerDeclaration } from "./launch-config";
+import { stripAnsi } from "./spawn/parse";
 
 export type AgentLifecycleState = "on" | "off" | "archived";
 
@@ -78,6 +80,13 @@ export interface AgentRecord {
   readonly birthSessionId: string | undefined;
   /** See `RestoreTarget`'s own doc. `undefined` only before this agent's first launch has resolved a session at all. */
   readonly restoreTarget: RestoreTarget | undefined;
+  /**
+   * The MCP servers this agent may use, and which it must hear notifications
+   * from — bakr's own declaration, rendered per vendor by drovr at every start
+   * (launch-config.ts). Absent means "this host's default", which is not the
+   * same as an empty declaration: `[]` is an agent that uses no MCP at all.
+   */
+  readonly mcp?: readonly McpServerDeclaration[];
 }
 
 /**
@@ -309,6 +318,14 @@ export function lookupAgentById(state: AgentStoreState, id: string): AgentRecord
 /** Raw, unvalidated insert/replace — the primitive a migration or a future validated verb builds on. Performs no name/reserved-word/availability check of its own; see the module comment. */
 export function putAgent(state: AgentStoreState, agent: AgentRecord): AgentStoreState {
   return { ...state, agents: { ...state.agents, [agent.id]: agent } };
+}
+
+/** Replaces an agent's MCP declaration; `undefined` returns it to this host's default. A no-op when `agentId` names no agent. */
+export function setAgentMcp(state: AgentStoreState, agentId: string, mcp: readonly McpServerDeclaration[] | undefined): AgentStoreState {
+  const agent = state.agents[agentId];
+  if (agent === undefined) return state;
+  const { mcp: _previous, ...rest } = agent;
+  return putAgent(state, mcp === undefined ? rest : { ...rest, mcp });
 }
 
 /**
@@ -750,6 +767,8 @@ interface PersistedAgentRecord {
   readonly createdAt: number;
   readonly birthSessionId: string | null;
   readonly restoreTarget: PersistedRestoreTarget | null;
+  /** Written only when declared, so a store without declarations serializes exactly as before. */
+  readonly mcp?: readonly McpServerDeclaration[];
 }
 
 interface PersistedLaunchRecord {
@@ -807,8 +826,14 @@ function isValidPersistedAgentRecord(value: unknown): value is PersistedAgentRec
     LIFECYCLE_STATES.includes(value["state"] as AgentLifecycleState) &&
     typeof value["createdAt"] === "number" &&
     (value["birthSessionId"] === null || typeof value["birthSessionId"] === "string") &&
-    (value["restoreTarget"] === null || isValidPersistedRestoreTarget(value["restoreTarget"]))
+    (value["restoreTarget"] === null || isValidPersistedRestoreTarget(value["restoreTarget"])) &&
+    (value["mcp"] === undefined || isValidMcpDeclaration(value["mcp"]))
   );
+}
+
+function isValidMcpDeclaration(value: unknown): value is readonly McpServerDeclaration[] {
+  return Array.isArray(value) && value.every((server) =>
+    isPlainObject(server) && typeof server["name"] === "string" && typeof server["notifications"] === "boolean");
 }
 
 function isValidPersistedLaunchRecord(value: unknown): value is PersistedLaunchRecord {
@@ -869,6 +894,7 @@ export function serializeAgentStoreState(state: AgentStoreState): string {
       createdAt: a.createdAt,
       birthSessionId: a.birthSessionId ?? null,
       restoreTarget: a.restoreTarget ?? null,
+      ...(a.mcp === undefined ? {} : { mcp: a.mcp.map((server) => ({ name: server.name, notifications: server.notifications })) }),
     };
   }
   const launches: PersistedLaunchRecord[] = state.launches.map((l) => ({
@@ -1035,6 +1061,18 @@ function migrateV1LaunchRecord(v1: PersistedLaunchRecordV1): PersistedLaunchReco
  * store that fails validation even after recognizing its version, is
  * malformed — never silently coerced.
  */
+/**
+ * A launch short id as recorded, with any terminal escapes removed. Builds
+ * before the FORCE_COLOR fix (spawn/parse.ts's `stripAnsi`) recorded ids
+ * such as `\x1b[36m52155a5f\x1b[39m\x1b[2m`, which no listing ever matches,
+ * leaving the launch pending and its agent "on — not listed" forever.
+ * Repairing on load resolves such a record against the listing like any
+ * other, with no migration step; a clean id is returned unchanged.
+ */
+function repairStoredShortId<T extends string | undefined>(id: T): T {
+  return (id === undefined ? id : stripAnsi(id)) as T;
+}
+
 export function parseAgentStoreState(source: string): ParseResult {
   let parsed: unknown;
   try {
@@ -1095,6 +1133,7 @@ export function parseAgentStoreState(source: string): ParseResult {
       createdAt: rawValue.createdAt,
       birthSessionId: rawValue.birthSessionId ?? undefined,
       restoreTarget: rawValue.restoreTarget ?? undefined,
+      ...(rawValue.mcp === undefined ? {} : { mcp: rawValue.mcp.map((server) => ({ name: server.name, notifications: server.notifications })) }),
     };
   }
 
@@ -1111,7 +1150,7 @@ export function parseAgentStoreState(source: string): ParseResult {
         key: value.key as ClaimKey,
         attemptKey: reviveAttemptKey(value.attemptKey),
         attemptedAt: value.attemptedAt,
-        launchShortId: value.launchShortId ?? undefined,
+        launchShortId: repairStoredShortId(value.launchShortId ?? undefined),
         error: value.error ?? undefined,
       });
       continue;
@@ -1125,7 +1164,7 @@ export function parseAgentStoreState(source: string): ParseResult {
       key: rawValue.key as ClaimKey,
       attemptKey: reviveAttemptKey(rawValue.attemptKey),
       attemptedAt: rawValue.attemptedAt,
-      launchShortId: rawValue.launchShortId ?? undefined,
+      launchShortId: repairStoredShortId(rawValue.launchShortId ?? undefined),
       error: rawValue.error ?? undefined,
     });
   }
@@ -1135,7 +1174,7 @@ export function parseAgentStoreState(source: string): ParseResult {
     if (!isValidPersistedPendingCreationRecord(value)) {
       return { ok: false, error: `a pendingCreations entry in the agent store does not have the expected shape: ${JSON.stringify(value)}` };
     }
-    pendingCreations.push({ attemptId: value.attemptId, key: value.key as ClaimKey, launchShortId: value.launchShortId, attemptedAt: value.attemptedAt });
+    pendingCreations.push({ attemptId: value.attemptId, key: value.key as ClaimKey, launchShortId: repairStoredShortId(value.launchShortId), attemptedAt: value.attemptedAt });
   }
 
   return {

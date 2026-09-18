@@ -9,7 +9,7 @@ import * as actions from "../agent-actions";
 import { adopt } from "../adopt";
 import { probeDirectory } from "../orphan-probe";
 import { classifyClaims, buildOffers, applyDestinationHint } from "../orphan-model";
-import { listBackgroundSessions } from "../spawn";
+import { listBackgroundSessions, type BackgroundSessionInfo } from "../spawn";
 import type { AdoptDeps } from "../adopt";
 import type { AgentActionDeps } from "../agent-actions";
 import type { ResolveInputs } from "../claim-key-resolve";
@@ -17,8 +17,9 @@ import type { OrphanProbeDeps } from "../orphan-probe";
 import { parseArgv, type ParsedCommand } from "./grammar";
 import { attachInPlace } from "./attach";
 import { confirmDelete } from "./confirm";
-import { residentRefusal, type ResidentMessenger } from "./send";
+import { residentRefusal, resolveResidentCwd, type ResidentMessenger } from "./send";
 import { EXIT_FAILURE, EXIT_REFUSAL, EXIT_SUCCESS, EXIT_USAGE } from "./exit-codes";
+import { formatMcpSpec, parseMcpSpec, type McpServerDeclaration } from "../launch-config";
 
 export interface CliDeps {
   actions: AgentActionDeps;
@@ -37,10 +38,31 @@ export interface CliDeps {
   messenger: ResidentMessenger;
 }
 
-const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n`;
+const help = `usage:\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[+notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> mcp [<server>[+notify] ... | default]\n`;
+
+/** Parses every spec, or returns the first refusal; duplicates keep their last spelling. */
+function parseMcpSpecs(specs: readonly string[]): McpServerDeclaration[] | string {
+  const byName = new Map<string, McpServerDeclaration>();
+  for (const spec of specs) {
+    const parsed = parseMcpSpec(spec);
+    if (typeof parsed === "string") return parsed;
+    byName.set(parsed.name, parsed);
+  }
+  return [...byName.values()];
+}
+
+const describeMcp = (servers: readonly McpServerDeclaration[]): string => servers.length === 0 ? "none" : servers.map(formatMcpSpec).join(" ");
 const label = (a: AgentRecord) => `${a.id}${a.name === undefined ? "" : ` \"${a.name}\"`}`;
 const refusalCode = (reason: string) => reason === "store-malformed" || reason === "listing-failed" || reason === "store-degraded" ? EXIT_FAILURE : EXIT_REFUSAL;
 export const isAttachJobListed = (restoreSessionId:string, sessions:readonly {sessionId:string}[]):boolean => sessions.some(session => session.sessionId === restoreSessionId);
+
+// Same exact-id + in-directory rule `send` delivers on, so list never reports an agent as reachable that send would refuse.
+function availability(agent: AgentRecord, sessions: readonly BackgroundSessionInfo[]): string {
+  if (!agent.restoreTarget) return "not listed";
+  const r = resolveResidentCwd(agent.directory, agent.restoreTarget.sessionId, sessions);
+  if (r.ok) return r.cwd === agent.directory ? "listed by claude" : `listed by claude in ${r.cwd.slice(agent.directory.length + 1)}`;
+  return r.reason === "not-running" ? "not listed" : `listed by claude, not sendable (${r.reason})`;
+}
 
 function refuse(result: { reason: string; message: string }, d: CliDeps): number {
   d.stderr(`${result.reason}: ${result.message}\n`);
@@ -73,13 +95,13 @@ async function claimDirectory(directory: ClaimKey, d: CliDeps): Promise<boolean>
 async function renderList(directory: ClaimKey, showArchived: boolean, d: CliDeps, emptyDiscovery = false): Promise<number> {
   const result = await actions.list(d.actions, directory);
   if (!result.ok) return refuse(result, d);
-  let listed: readonly AgentRecord[] = [];
+  let sessions: readonly BackgroundSessionInfo[] = [];
   let listingFailed: string | undefined;
-  try { listed = (await listBackgroundSessions({ runCommand: d.actions.runCommand })).map(s => ({ id: s.sessionId } as unknown as AgentRecord)); }
+  try { sessions = await listBackgroundSessions({ runCommand: d.actions.runCommand }); }
   catch (e) { listingFailed = e instanceof Error ? e.message : String(e); }
   const agents = result.agents.filter(a => showArchived || a.state !== "archived");
   if (!agents.length) d.stdout(emptyDiscovery ? "no agents yet — `bakr create` makes one\n" : "no agents\n");
-  else for (const agent of agents) d.stdout(`${label(agent)} — ${agent.state} — ${listingFailed ? "could not list" : listed.some(x => x.id === agent.restoreTarget?.sessionId) ? "listed by claude" : "not listed"}\n`);
+  else for (const agent of agents) d.stdout(`${label(agent)} — ${agent.state} — ${listingFailed ? "could not list" : availability(agent, sessions)}\n`);
   return EXIT_SUCCESS;
 }
 
@@ -106,7 +128,15 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
   if (command.kind === "discover") return discover(directory, d);
   if (command.kind === "list") return renderList(directory, command.showArchived, d);
   if (command.kind === "create") {
-    const r = await actions.create(d.actions, directory, command.name); if (!r.ok) return refuse(r,d);
+    // Claim BEFORE the agent record exists, mirroring adopt.ts's Q6 order:
+    // the daemon restores only agents in CLAIMED directories, so an `on`
+    // agent written into an unclaimed one would never come back after a
+    // reboot. The claim is idempotent and saved atomically under its lock,
+    // so a crash in between leaves at worst a harmless empty claim.
+    const mcp = command.mcp === undefined ? undefined : parseMcpSpecs(command.mcp);
+    if (typeof mcp === "string") { d.stderr(`bakr: usage error: ${mcp}\n`); return EXIT_USAGE; }
+    if (!(await claimDirectory(directory, d))) return EXIT_FAILURE;
+    const r = await actions.create(d.actions, directory, command.name, mcp); if (!r.ok) return refuse(r,d);
     d.stdout(`created ${label(r.agent)}\nattach with: bakr ${r.agent.id}\n`);
     if (!r.launch.ok) { d.stderr(`launch-failed: ${r.launch.error}\n`); return EXIT_FAILURE; }
     return 0;
@@ -128,8 +158,13 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
   }
   if (command.kind === "send") {
     const r = await actions.attachTarget(d.actions, directory, command.ref); if (!r.ok) return refuse(r,d);
+    let sessions;
+    try { sessions = await listBackgroundSessions({ runCommand: d.actions.runCommand }); }
+    catch (e) { return refuse({ reason: "listing-failed", message: `cannot find agent ${r.agent.id}'s session without a successful claude listing: ${e instanceof Error ? e.message : String(e)}` }, d); }
+    const where = resolveResidentCwd(r.agent.directory, r.restoreSessionId, sessions);
+    if (!where.ok) return refuse({ reason: where.reason, message: `agent ${r.agent.id} is on in bakr's store but ${where.message} — nothing was sent${where.reason === "not-running" ? `; the daemon restores it, or run \`bakr ${command.ref} on\`` : ""}` }, d);
     let result;
-    try { result = await d.messenger.message({ provider: "claude", sessionId: r.restoreSessionId, cwd: r.agent.directory }, command.message); }
+    try { result = await d.messenger.message({ provider: "claude", sessionId: r.restoreSessionId, cwd: where.cwd }, command.message); }
     catch (e) {
       const refusal = residentRefusal(e); if (!refusal) throw e;
       d.stderr(`${refusal.reason}: ${refusal.message}\n`);
@@ -154,6 +189,19 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
     const r=await actions.deleteAgent(d.actions,directory,command.ref); if(!r.ok)return refuse(r,d);
     if(!renderStop(r.stop,d)) return 3;
     if(r.kind==="parked"){d.stderr(`parked: agent was NOT deleted: ${r.message}\n`);return 1;} d.stdout(`deleted ${r.agentId}\n`);return 0;
+  }
+  if (command.kind === "mcp") {
+    const specs = command.specs;
+    const declaration = specs === undefined ? undefined : specs[0] === "default" ? null : parseMcpSpecs(specs);
+    if (typeof declaration === "string") { d.stderr(`bakr: usage error: ${declaration}\n`); return EXIT_USAGE; }
+    const r = await actions.mcp(d.actions, directory, command.ref, declaration); if (!r.ok) return refuse(r, d);
+    const own = r.agent.mcp;
+    d.stdout(own === undefined ? `${label(r.agent)} mcp: host default (${describeMcp(r.hostDefault)})\n` : `${label(r.agent)} mcp: ${describeMcp(own)}\n`);
+    if (r.changed) {
+      d.stdout("approval written; a running session picks it up at its next start.\n");
+      d.stdout("a changed +notify reaches a running session only through a fresh launch: claude respawn reuses the channels the session was first launched with.\n");
+    }
+    return 0;
   }
   if (command.kind === "rename") { const r=await actions.rename(d.actions,directory,command.ref,command.newName);if(!r.ok)return refuse(r,d);d.stdout(`renamed ${label(r.agent)}\n`);return 0; }
   if (command.kind === "on") {

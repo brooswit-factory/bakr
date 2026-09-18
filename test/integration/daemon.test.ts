@@ -12,6 +12,17 @@ import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../sr
 import type { ClaimKey } from "../../src/claim-key-resolve";
 import type { RunCommandOptions, CommandResult } from "../../src/spawn";
 import type { OrphanProbeDeps } from "../../src/orphan-probe";
+import type { McpSettingsIo } from "@brooswit/drovr";
+
+/** In-memory vendor settings that also record when each write happened, relative to the commands run. */
+function memorySettings(events: string[]): McpSettingsIo & { files: Record<string, string> } {
+  const files: Record<string, string> = {};
+  return {
+    files,
+    readSettings: async (path) => files[path],
+    writeSettings: async (path, contents) => { files[path] = contents; events.push(`write ${path}`); },
+  };
+}
 
 /** These tests use symbolic paths like "/claimed/dir" that do not exist on the real filesystem — a real `stat` would classify every one of them as orphaned. This fake always reports "exists", preserving the pre-BAKR-24 behaviour (every claimed directory is `present`) for every test that isn't specifically exercising Q4's orphan-reporting behaviour (see the dedicated "BAKR-24" describe block below, which builds its own real-directory fixtures instead). */
 export const alwaysPresentProbeDeps: OrphanProbeDeps = { stat: async () => ({ dev: 1, ino: 1, isDirectory: () => true }) };
@@ -46,6 +57,10 @@ function baseDeps(dir: string, runCommand: DaemonDeps["runCommand"]): DaemonDeps
       return new Uint8Array(n).fill(randomCounter & 0xff);
     },
     probeDeps: alwaysPresentProbeDeps,
+    // Pinned rather than inherited: the default reads this HOST's own
+    // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json`/`.bakr.json` files, which would make
+    // what a reconcile launches depend on the machine running the test.
+    launchConfigDeps: { readConfigFile: async () => undefined, notificationServers: [] },
   };
 }
 
@@ -272,6 +287,82 @@ describe("AC3: only 'on' is restored — off and archived are NEVER launched, wi
       // NEGATIVE CONTROL: the on-agent DID get launched — proves the run can observe a launch at all.
       expect(final.state.agents["@on-agent"]?.birthSessionId).toBeDefined();
     }
+  });
+});
+
+describe("a reconcile's own fresh launch carries the host's configured MCP subscriptions", () => {
+  test("an agent whose directory configures a requested server is launched subscribed to it", async () => {
+    const dir = await makeTempDir();
+    const key = "/claimed/dir" as ClaimKey;
+    await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
+    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), makeAgent({ id: "@coordinator", directory: key, state: "on", restoreTarget: undefined })));
+
+    const fake = makeFakeClaude();
+    const seen: string[][] = [];
+    const events: string[] = [];
+    const settingsIo = memorySettings(events);
+    const result = await runReconcileCycle(initialDaemonState(), {
+      ...baseDeps(dir, async (argv, opts) => { seen.push(argv); events.push(argv[0]!); return fake.runCommand(argv, opts); }),
+      launchConfigDeps: {
+        notificationServers: ["yappr"],
+        readConfigFile: async (path) => path === `${key}/.mcp.json`
+          ? JSON.stringify({ mcpServers: { yappr: { type: "stdio", command: "bun" } } })
+          : undefined,
+        settingsIo,
+      },
+    });
+    expect(result.restored).toHaveLength(1);
+    // Approved BEFORE the launch: Claude reads it at process start.
+    const approval = `${key}/.claude/settings.local.json`;
+    expect(JSON.parse(settingsIo.files[approval]!).enabledMcpjsonServers).toEqual(["yappr"]);
+    expect(events.indexOf(`write ${approval}`)).toBeLessThan(events.indexOf("systemd-run"));
+
+    const systemdCall = seen.find((c) => c[0] === "systemd-run") as string[];
+    // FALSIFIER: the daemon is what keeps these sessions alive, so a launch it
+    // issues without the channel is the reported bug, not a lesser version of it.
+    expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([
+      "--mcp-config", `${key}/.mcp.json`,
+      "--settings", JSON.stringify({ enabledMcpjsonServers: ["yappr"] }),
+      "--dangerously-load-development-channels=server:yappr",
+    ]);
+  });
+});
+
+describe("a respawn carries no flags, but its agent's MCP approval is in place first", () => {
+  test("an agent's own declaration is approved before `claude respawn`, whose argv stays exactly bare", async () => {
+    const dir = await makeTempDir();
+    const key = "/claimed/dir" as ClaimKey;
+    await saveClaims(join(dir, "claims.json"), claim(emptyStore(), key, 1).state);
+    await saveAgents(join(dir, "agents.json"), putAgent(emptyAgentStore(), {
+      ...makeAgent({ id: "@rocketr", directory: key, state: "on", restoreTarget: { sessionId: "old-session-id", shortId: "old-sess" } }),
+      mcp: [{ name: "rocketr", notifications: true }],
+    }));
+
+    const events: string[] = [];
+    const settingsIo = memorySettings(events);
+    const respawnArgvs: string[][] = [];
+    const result = await runReconcileCycle(initialDaemonState(), {
+      ...baseDeps(dir, async (argv) => {
+        if (argv[0] === "claude" && argv[1] === "agents") return { exitCode: 0, stdout: "[]", stderr: "" };
+        if (argv[0] === "claude" && argv[1] === "respawn") {
+          respawnArgvs.push(argv);
+          events.push("respawn");
+          return { exitCode: 0, stdout: `respawned ${argv[2]}\n`, stderr: "" };
+        }
+        throw new Error(`unexpected argv: ${JSON.stringify(argv)}`);
+      }),
+      launchConfigDeps: {
+        notificationServers: ["yappr"],
+        readConfigFile: async () => JSON.stringify({ mcpServers: { rocketr: {}, yappr: {} } }),
+        settingsIo,
+      },
+    });
+    expect(result.restored).toHaveLength(1);
+    expect(respawnArgvs).toEqual([["claude", "respawn", "old-sess"]]);
+    const approval = `${key}/.claude/settings.local.json`;
+    // The agent's declaration, not the host default.
+    expect(JSON.parse(settingsIo.files[approval]!).enabledMcpjsonServers).toEqual(["rocketr"]);
+    expect(events).toEqual([`write ${approval}`, "respawn"]);
   });
 });
 
