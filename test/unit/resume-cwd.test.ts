@@ -25,6 +25,34 @@ describe("where a session resumes", () => {
   });
 });
 
+describe("the transcript's project folder decides, not a shell cd", () => {
+  const withKey = (cwd: string, key: string, dirs: string[]): ResumeCwdDeps => ({
+    lastRecordedCwd: async () => cwd,
+    transcriptProjectKey: async () => key,
+    isDirectory: async (path) => dirs.includes(path),
+  });
+
+  test("a session that last cd'd into a separate repo inside its directory resumes in its own directory", async () => {
+    // Measured 2026-09-18: the manager's last cwd was ~/code/brooswit-factory/bakr, its transcript under -home-op-code-brooswit-factory.
+    const MANAGER = "/home/op/code/brooswit-factory";
+    const deps = withKey(`${MANAGER}/bakr`, "-home-op-code-brooswit-factory", [MANAGER, `${MANAGER}/bakr`]);
+    // FALSIFIER: the old rule resumed in bakr/, loading bakr's project memory and settings.
+    expect(await resumeCwdFor("s", MANAGER, deps)).toBe(MANAGER);
+  });
+
+  test("a session that entered a worktree resumes there: its transcript moved to the worktree's folder", async () => {
+    expect(await resumeCwdFor("s", AGENT, withKey(WORKTREE, "-home-op-code-factory-dashboard--claude-worktrees-first-slice", [WORKTREE]))).toBe(WORKTREE);
+  });
+
+  test("a cd below a worktree resumes in the worktree, the nearest ancestor with the transcript's folder", async () => {
+    expect(await resumeCwdFor("s", AGENT, withKey(`${WORKTREE}/src/deep`, "-home-op-code-factory-dashboard--claude-worktrees-first-slice", [WORKTREE, `${WORKTREE}/src/deep`]))).toBe(WORKTREE);
+  });
+
+  test("a transcript folder matching no directory between the cwd and the agent's falls back to the agent directory", async () => {
+    expect(await resumeCwdFor("s", AGENT, withKey(`${AGENT}/sub`, "-somewhere-else", [`${AGENT}/sub`]))).toBe(AGENT);
+  });
+});
+
 describe("reading a transcript's last cwd", () => {
   test("the latest record with a cwd wins; partial or foreign lines are skipped", () => {
     const text = [

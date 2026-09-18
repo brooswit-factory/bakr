@@ -124,6 +124,17 @@ export const realResumeCwdDeps: ResumeCwdDeps = {
     }
     return undefined;
   },
+  transcriptProjectKey: async (sessionId: string) => {
+    try {
+      const root = join(homedir(), ".claude", "projects");
+      for (const dir of await readdir(root)) {
+        if (await stat(join(root, dir, `${sessionId}.jsonl`)).then(() => true, () => false)) return dir;
+      }
+    } catch {
+      // No projects root, or unreadable: the caller falls back to the recorded cwd.
+    }
+    return undefined;
+  },
   isDirectory: async (path: string) => {
     try {
       return (await stat(path)).isDirectory();
