@@ -96,9 +96,9 @@ function baseDeps(dir: string, runCommand: AgentActionDeps["runCommand"]): Agent
     agentsPath: join(dir, "agents.json"),
     runCommand,
     // Pinned rather than inherited: the default reads this HOST's own
-    // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json` files, which would make
+    // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json`/`.bakr.json` files, which would make
     // every launch-argv assertion below depend on the machine running it.
-    launchConfigDeps: { readMcpConfig: async () => undefined, notificationServers: [] },
+    launchConfigDeps: { readConfigFile: async () => undefined, notificationServers: [] },
     now: () => 1_700_000_000_000,
     generateAttemptId: () => `attempt-${counter++}`,
     randomBytes: (n: number) => {
@@ -144,7 +144,7 @@ describe("create", () => {
       ...baseDeps(dir, fake.runCommand),
       launchConfigDeps: {
         notificationServers: ["yappr"],
-        readMcpConfig: async (path) => path === `${KEY}/.mcp.json`
+        readConfigFile: async (path) => path === `${KEY}/.mcp.json`
           ? JSON.stringify({ mcpServers: { yappr: { type: "stdio", command: "bun" } } })
           : undefined,
       },
@@ -168,7 +168,7 @@ describe("create", () => {
       ...baseDeps(dir, fake.runCommand),
       launchConfigDeps: {
         notificationServers: ["yappr"],
-        readMcpConfig: async () => JSON.stringify({ mcpServers: { atlassian: {} } }),
+        readConfigFile: async () => JSON.stringify({ mcpServers: { atlassian: {} } }),
       },
     }, KEY);
     const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];

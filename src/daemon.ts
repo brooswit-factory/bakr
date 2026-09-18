@@ -72,7 +72,7 @@ export interface DaemonDeps {
   readonly probeDeps: OrphanProbeDeps;
   /** BAKR-22: read-only access to Claude Code's own `~/.claude/projects/` tree, for the never-spoken-to-then-moved check. Optional — defaults to the real filesystem (`realTranscriptProbeDeps`, paths.ts). */
   readonly transcriptProbeDeps?: TranscriptProbeDeps;
-  /** Which MCP servers a launched session must hear from, and how to read a directory's own `.mcp.json` (launch-config.ts). Optional — defaults to the real filesystem and this host's own environment (`realLaunchConfigDeps`, paths.ts), so a host that configures nothing reconciles exactly as before. */
+  /** Which MCP servers a launched session must hear from, and how to read a directory's own `.mcp.json` and `.bakr.json` (launch-config.ts). Optional — defaults to the real filesystem and this host's own environment (`realLaunchConfigDeps`, paths.ts), so a host that configures nothing reconciles exactly as before. */
   readonly launchConfigDeps?: LaunchConfigDeps;
   readonly acquireTimeoutMs?: number;
 }

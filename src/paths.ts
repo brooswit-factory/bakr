@@ -96,15 +96,16 @@ export const realTranscriptProbeDeps: TranscriptProbeDeps = {
  * The MCP servers this host wants every session it launches to hear from,
  * read once from the environment (`BAKR_MCP_NOTIFICATION_SERVERS`, e.g.
  * `yappr`) — unset means none, which is this substrate's own prior behaviour.
- * Naming a server here never affects a directory whose `.mcp.json` does not
- * configure it (see launch-config.ts's `resolveLaunchInputs`).
+ * A directory adds its own through `.bakr.json`. Naming a server here never
+ * affects a directory whose `.mcp.json` does not configure it (see
+ * launch-config.ts's `resolveLaunchInputs`).
  */
 export const notificationServersFromEnv = (): string[] =>
   parseNotificationServers(process.env["BAKR_MCP_NOTIFICATION_SERVERS"]);
 
-/** The real read-only access to a directory's own `.mcp.json`, for `claudeLaunchArgs` (launch-config.ts). Absent or unreadable configuration resolves to `undefined` rather than throwing: configuration this cannot read must never fail a launch. */
+/** The real read-only access to a directory's own `.mcp.json` and `.bakr.json`, for `claudeLaunchArgs` (launch-config.ts). Absent or unreadable configuration resolves to `undefined` rather than throwing: configuration this cannot read must never fail a launch. */
 export const realLaunchConfigDeps: LaunchConfigDeps = {
-  readMcpConfig: async (path: string) => {
+  readConfigFile: async (path: string) => {
     try {
       return await readFile(path, "utf8");
     } catch {

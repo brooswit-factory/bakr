@@ -47,9 +47,9 @@ function baseDeps(dir: string, runCommand: DaemonDeps["runCommand"]): DaemonDeps
     },
     probeDeps: alwaysPresentProbeDeps,
     // Pinned rather than inherited: the default reads this HOST's own
-    // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json` files, which would make
+    // `BAKR_MCP_NOTIFICATION_SERVERS` and `.mcp.json`/`.bakr.json` files, which would make
     // what a reconcile launches depend on the machine running the test.
-    launchConfigDeps: { readMcpConfig: async () => undefined, notificationServers: [] },
+    launchConfigDeps: { readConfigFile: async () => undefined, notificationServers: [] },
   };
 }
 
@@ -292,7 +292,7 @@ describe("a reconcile's own fresh launch carries the host's configured MCP subsc
       ...baseDeps(dir, async (argv, opts) => { seen.push(argv); return fake.runCommand(argv, opts); }),
       launchConfigDeps: {
         notificationServers: ["yappr"],
-        readMcpConfig: async (path) => path === `${key}/.mcp.json`
+        readConfigFile: async (path) => path === `${key}/.mcp.json`
           ? JSON.stringify({ mcpServers: { yappr: { type: "stdio", command: "bun" } } })
           : undefined,
       },

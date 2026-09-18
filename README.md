@@ -121,6 +121,20 @@ that do not use it. To set it for the daemon, add an `Environment=` line to
 `systemd/bakr.service` before `./scripts/install.sh`, then
 `systemctl --user daemon-reload && systemctl --user restart bakr.service`.
 
+A directory that needs a channel the host does not name opts in itself, with
+a `.bakr.json` beside its `.mcp.json`:
+
+```json
+{ "channels": ["rocketr"] }
+```
+
+A launch there asks for the host's servers plus the directory's, still only
+those its `.mcp.json` configures. bakr reads `.bakr.json` afresh at every
+launch, so adding or changing one needs no unit edit and no restart.
+Configuring a server in `.mcp.json` is never enough on its own: a development
+channel lets that server push messages into the session, so subscribing to
+one is always an explicit opt-in, by the host or by the directory.
+
 bakr decides *which servers*; it never spells a `claude` flag. The translation
 from "this session must hear from yappr" into `--mcp-config` and
 `--dangerously-load-development-channels server:yappr` belongs to drovr
