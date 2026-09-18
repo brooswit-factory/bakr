@@ -47,6 +47,7 @@ async function setup(specs: AgentSpec[], opts: { failListing?: boolean } = {}) {
     prompt: async () => { throw new Error("must not prompt"); }, spawnAttach: async () => { throw new Error("must not attach"); },
     messenger: { message: async () => { throw new Error("must not send"); } },
     permissions: herdrPermissions(runCommand),
+    permissionAuditPath: join(root, "permission-approvals.jsonl"),
   };
   return { root, deps, out, err, commands, host, panes };
 }

@@ -46,6 +46,7 @@ directories — that claim is what brings an agent back after a reboot.
 | `bakr <id\|name> delete [--yes]` | Delete, with confirmation |
 | `bakr <id\|name> send <message>` | Message the running agent and print its reply |
 | `bakr <id\|name> permissions` | List the tool-permission prompts waiting on that agent's pane |
+| `bakr <id\|name> approve <promptId> [--always] [--as <operator>]` | Approve one of those prompts, recorded in a 0600 audit |
 
 Help is flag-only (`bakr --help`); `help` remains available as an agent
 reference. Attach requires TTY stdin and stdout, inherits all three streams,
@@ -81,6 +82,39 @@ prompt prints its pane, tool, request, options (`>` marks the cursor) and a
 with a note saying so. A legacy `claude --bg` session has no pane to read and
 is noted on stderr. An unknown agent is refused like any other verb (exit 1).
 A failed pane listing exits 3.
+
+`approve` answers one prompt `permissions` listed, through Drovr's
+`approvePermission`. The `<promptId>` must be pending on that agent's own
+pane, found by the same narrowing `permissions` uses. The pane approved is the
+one that prompt is on, so pasting another agent's promptId is refused and never
+reaches that agent's pane. Drovr then re-reads the pane and refuses a prompt
+that changed since, writes an audit record before any key, checks that the
+prompt left the screen, and never picks the option that switches the session
+to auto mode.
+
+- **Scope.** The default answers the plain "Yes", once. `--always` answers
+  the "Yes, and always allow … from this project" option, which stores a rule
+  that **outlives the session**. That option is only reachable through this
+  flag.
+- **Operator.** The operator is `$USER`, and `--as <operator>` overrides it
+  (usrr passes `--as`). With `$USER` unset or empty and no `--as`, the command
+  is a usage error (exit 2) before any pane is read.
+- **Audit.** Records go to `$XDG_STATE_HOME/bakr/permission-approvals.jsonl`
+  (`~/.local/state/bakr/` by default), beside `agents.json` and never in the
+  claimed directory. Each attempt writes an `approving` record before any
+  key, then its outcome; a refusal after the pane is re-read is recorded too.
+  The file is created mode 0600 by the same `open` that creates it, and
+  appending never changes its mode. A file already wider than 0600, or a
+  symlink, at that path is refused: that is `audit-failed`, and nothing is
+  pressed.
+- **Output.** On success it prints the tool, the request and the scope
+  (exit 0).
+- **Refusals.** Every refusal prints `<reason>: <detail>` with Drovr's detail,
+  and nothing further is pressed: no retry, and no fallback to another option.
+  - `prompt-changed`, `no-prompt`, `option-missing` and `invalid-operator`
+    exit 1.
+  - `audit-failed` and `not-cleared` exit 3; `not-cleared` means the keys
+    were sent but the prompt stayed on screen.
 
 | Exit | Meaning |
 |---:|---|

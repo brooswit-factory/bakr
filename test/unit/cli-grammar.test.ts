@@ -79,6 +79,49 @@ describe("bakr CLI grammar", () => {
     }
   });
 
+  test("approve: one promptId; once unless --always is typed; operator only when --as is typed", () => {
+    expect(ok(["alice","approve","20d2c5b2f8308147"])).toEqual({kind:"approve",ref:"alice",promptId:"20d2c5b2f8308147",always:false});
+    expect(ok(["@a1","approve","20d2c5b2f8308147","--always"])).toEqual({kind:"approve",ref:"@a1",promptId:"20d2c5b2f8308147",always:true});
+    expect(ok(["alice","approve","20d2c5b2f8308147","--as","usrr:carol"])).toEqual({kind:"approve",ref:"alice",promptId:"20d2c5b2f8308147",always:false,operator:"usrr:carol"});
+    expect(ok(["alice","--always","--as","carol","approve","abc"])).toEqual({kind:"approve",ref:"alice",promptId:"abc",always:true,operator:"carol"});
+    expect(ok(["approve"])).toEqual({kind:"attach",ref:"approve"});
+    for (const [argv, message] of [
+      [["alice","approve"], '"approve" requires exactly one promptId'],
+      [["alice","approve","a","b"], '"approve" requires exactly one promptId'],
+      [["alice","approve","abc","--as"], "--as requires an operator name"],
+      [["alice","approve","abc","--as","--always"], "--as requires an operator name"],
+      [["alice","approve","abc","--as",""], "--as requires a non-empty operator name"],
+      [["alice","approve","abc","--as","  "], "--as requires a non-empty operator name"],
+      [["alice","approve","abc","--yes"], '--yes/-y is not valid with "approve"'],
+      [["alice","approve","abc","--all"], '--all is not valid with "approve"'],
+      [["alice","approve","abc","--archived"], '--archived is not valid with "approve"'],
+      [["alice","approve","abc","--name","x"], '--name is not valid with "approve"'],
+      [["alice","approve","abc","--mcp","yappr"], '--mcp is not valid with "approve"'],
+      [["alice","approve","abc","--help"], "used alone"],
+      [["alice","approve","abc","--auto"], 'unrecognized flag "--auto"'],
+    ] as const) {
+      const r = parseArgv([...argv]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain(message);
+    }
+  });
+
+  test("--always and --as are refused on every verb but approve, and at the top level", () => {
+    const others: string[][] = [
+      [], ["list"], ["create"], ["adopt","@a1"], ["relaunch"], ["alice"], ["alice","on"], ["alice","off"], ["alice","archive"], ["alice","unarchive"],
+      ["alice","delete"], ["alice","rename","bob"], ["alice","relaunch"], ["alice","permissions"], ["alice","mcp"], ["alice","send","hi"],
+    ];
+    for (const words of others) {
+      for (const flag of [["--always"], ["--as","carol"]]) {
+        const r = parseArgv([...words, ...flag]);
+        expect(r.ok).toBe(false);
+        if (!r.ok) expect(r.message).toMatch(new RegExp(`^${flag[0]} is not valid with "`));
+      }
+    }
+    expect(parseArgv(["--always","--help"]).ok).toBe(false);
+    expect(parseArgv(["--as","carol","--help"]).ok).toBe(false);
+  });
+
   test("C3: every top-level dispatch word is reserved by the model", () => {
     for (const word of TOP_LEVEL_WORDS) expect(RESERVED_NAMES).toContain(word);
   });
