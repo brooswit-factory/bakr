@@ -21,6 +21,7 @@ import {
   resetRestoreAttempts,
   resolveAgent,
   resolveLaunch,
+  resolveRespawnAttempt,
   restoreAttemptCount,
   serializeAgentStoreState,
   unresolvedLaunches,
@@ -348,6 +349,53 @@ describe("resolveLaunch: attaches by AGENT id, never by directory arrival order 
     state = resolveLaunch(state, "short-1", "session-uuid-1");
     expect(pendingLaunches(state)).toEqual([]);
     expect(state.agents["@ghost-agent"]).toBeUndefined();
+  });
+});
+
+describe("BAKR-33: a successful resolution drops that SAME agent's other stale error records", () => {
+  test("resolveRespawnAttempt success drops an older FAILED record for the same agent under a DIFFERENT key, and leaves a sibling agent's failed record untouched", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A, restoreTarget: { sessionId: "durable-1", shortId: "old-short" } }));
+    state = putAgent(state, makeAgent({ id: "@a2", directory: DIR_A, restoreTarget: { sessionId: "durable-2", shortId: "other-short" } }));
+    // @a1's stale, already-given-up record from an earlier failed respawn attempt (a different shortId).
+    state = beginLaunch(state, "@a1", DIR_A, { kind: "respawn", shortId: "old-short" }, "stale-attempt", 1000);
+    state = markLaunchFailed(state, "stale-attempt", "respawn refused: TOCTOU re-check reported \"alive\"");
+    // @a2's own failed record — must survive @a1's resolution untouched.
+    state = beginLaunch(state, "@a2", DIR_A, { kind: "respawn", shortId: "other-short" }, "a2-failed", 1000);
+    state = markLaunchFailed(state, "a2-failed", "some unrelated refusal");
+
+    // @a1 is later relaunched successfully (a fresh attempt, new attemptId, same shortId key here for simplicity).
+    state = beginLaunch(state, "@a1", DIR_A, { kind: "respawn", shortId: "old-short" }, "new-attempt", 2000);
+    state = resolveRespawnAttempt(state, "new-attempt", "new-short");
+
+    expect(unresolvedLaunches(state).map((l) => l.attemptId)).toEqual(["a2-failed"]);
+    expect(state.launches.some((l) => l.attemptId === "stale-attempt")).toBe(false);
+    expect((state.agents["@a1"] as AgentRecord).restoreTarget?.shortId).toBe("new-short");
+  });
+
+  test("resolveRespawnAttempt never touches a still-PENDING record for the same agent (an in-flight launch is never stale)", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A, restoreTarget: { sessionId: "durable-1", shortId: "old-short" } }));
+    state = beginLaunch(state, "@a1", DIR_A, undefined, "pending-fresh", 1000); // a genuinely in-flight fresh launch, never resolved or failed
+    state = beginLaunch(state, "@a1", DIR_A, { kind: "respawn", shortId: "old-short" }, "resolving-now", 2000);
+
+    state = resolveRespawnAttempt(state, "resolving-now", "new-short");
+
+    expect(state.launches.map((l) => l.attemptId)).toEqual(["pending-fresh"]);
+  });
+
+  test("resolveLaunch (fresh/forkFrom success) also drops that agent's older failed records", () => {
+    let state = emptyAgentStore();
+    state = putAgent(state, makeAgent({ id: "@a1", directory: DIR_A, birthSessionId: undefined, restoreTarget: undefined }));
+    state = beginLaunch(state, "@a1", DIR_A, { kind: "respawn", shortId: "long-gone" }, "stale-attempt", 1000);
+    state = markLaunchFailed(state, "stale-attempt", "gave up after 3 consecutive restore attempts");
+
+    state = beginLaunch(state, "@a1", DIR_A, undefined, "fresh-attempt", 2000);
+    state = markLaunchStarted(state, "fresh-attempt", "short-1");
+    state = resolveLaunch(state, "short-1", "session-uuid-1");
+
+    expect(state.launches).toEqual([]);
+    expect((state.agents["@a1"] as AgentRecord).birthSessionId).toBe("session-uuid-1");
   });
 });
 

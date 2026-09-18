@@ -27,6 +27,7 @@ import { list as listClaims, emptyStore, type ClaimStoreState } from "./claim-mo
 import { loadOrMigrateAgentStore } from "./agent-store-migrate";
 import { load as loadAgents, withAgentStoreLock } from "./agent-store-io";
 import {
+  type AgentRecord,
   type AgentStoreState,
   type AttemptKey,
   emptyAgentStore,
@@ -597,14 +598,42 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   // longer exists at all (should not happen; no delete verb ships yet)
   // still logs unconditionally rather than going silently missing.
   //
-  // TWO suppressions guard this loop now, checked in this order: B13a
-  // (below, BAKR-27 — a recognised stale-cwd refusal whose escape has since
-  // succeeded) first, then Q4's directory classification above. Order
-  // between them does not matter for correctness (they never overlap: a
-  // B13a-superseded record's owning agent is, by construction, healthy and
-  // its directory `present`), but B13a is checked first since it is the
-  // cheaper, purely in-memory test.
+  // BAKR-33: true when `agent`'s CURRENT restore target independently
+  // verifies alive, right now, in THIS cycle's own listing — the identical
+  // OS-level check `decideAndBeginForAgent`'s own "alive" verdict is built
+  // on (`decideLiveness` + `isPidAlive`), reapplied here purely as a
+  // REPORTING classification, exactly like `isSupersededStaleCwdRespawnFailure`
+  // right below: nothing is cleared, written, or removed by this check.
+  // `unresolved`'s own key is irrelevant on purpose — a stale record under
+  // ANY key (an old shortId from a past failure, say) says nothing about
+  // whether the agent it names is fine RIGHT NOW; only the agent's CURRENT
+  // `restoreTarget` does. This is what stops a healthy agent's old failed
+  // launch from being re-logged as an ERROR on the very first cycle after a
+  // restart: restarting the small bakr process does not touch the agents'
+  // own long-running sessions, so most verify alive on cycle one, before
+  // any NEW respawn ever runs to trigger this ticket's other fix (dropping
+  // the record for good — see `resolveRespawnAttempt`/`resolveLaunch`'s own
+  // doc — once this agent's NEXT respawn/relaunch actually resolves).
+  const isVerifiedAliveNow = (agent: AgentRecord | undefined): boolean => {
+    const target = agent?.restoreTarget;
+    if (target === undefined) return false;
+    const entry = sessions.find((s) => s.sessionId === target.sessionId) ?? sessions.find((s) => s.id === target.shortId);
+    const pidVerifiedAlive = entry?.pid !== undefined && isPidAlive(entry.pid);
+    return decideLiveness(target.shortId, entry, pidVerifiedAlive).status === "alive";
+  };
+
+  // THREE suppressions guard this loop now, checked in this order: BAKR-33
+  // (just above — an agent independently verified alive right now) first
+  // since it is the next cheapest purely-in-memory-plus-this-cycle's-own-
+  // listing test, then B13a (below, BAKR-27 — a recognised stale-cwd
+  // refusal whose escape has since succeeded), then Q4's directory
+  // classification. Order between them does not matter for correctness
+  // (none overlap: a suppressed record's owning agent is, by construction,
+  // healthy and its directory `present`).
   for (const unresolved of unresolvedLaunches(peekedState)) {
+    if (isVerifiedAliveNow(peekedState.agents[unresolved.agentId])) {
+      continue;
+    }
     // B13a (BAKR-27): a recognised stale-cwd refusal whose escape has since
     // resolved is not an unresolved launch — it was already reported once,
     // loudly, by the stale-cwd log line this same loop emits at the point
