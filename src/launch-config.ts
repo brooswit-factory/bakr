@@ -118,6 +118,12 @@ export interface ResolvedMcpAccess {
    * — unless the agent's own declaration names it (`bakr <agent> mcp <name>`).
    */
   readonly inherited: readonly string[];
+  /**
+   * Servers bakr itself disabled as parent-only on an earlier start that the
+   * agent now defines or opts in to: the disable is lifted. One a person
+   * disabled (absent from bakr's record) is never lifted.
+   */
+  readonly reEnabled: readonly string[];
   readonly mcpConfigPath: string;
 }
 
@@ -132,6 +138,24 @@ export function parentDirsOf(directory: string): string[] {
 
 /** The workspace settings file Claude reads approvals and disables from. */
 export const localSettingsPathFor = (directory: string): string => join(directory, ".claude", "settings.local.json");
+
+/**
+ * bakr's record of the disables it wrote, beside the settings file: a JSON
+ * array of server names. Without it a disable bakr wrote for a parent-only
+ * server would be indistinguishable from a person's, and would outlive the
+ * agent gaining its own entry (thatch's review of #32).
+ */
+export const bakrDisabledPathFor = (directory: string): string => join(directory, ".claude", "bakr-disabled-mcp.json");
+
+function parseNameList(contents: string | undefined): string[] {
+  if (contents === undefined) return [];
+  try {
+    const names = JSON.parse(contents) as unknown;
+    return Array.isArray(names) ? names.filter((name): name is string => typeof name === "string") : [];
+  } catch {
+    return [];
+  }
+}
 
 /** The servers a settings file explicitly disables (`disabledMcpjsonServers`); `[]` for anything unreadable. */
 export function parseDisabledServers(contents: string | undefined): string[] {
@@ -158,13 +182,17 @@ export async function resolveMcpAccess(directory: string, deps: LaunchConfigDeps
   const mcpConfigPath = mcpConfigPathFor(directory);
   const configuredNames = parseMcpServerNames(await deps.readConfigFile(mcpConfigPath));
   const configured = new Set(configuredNames);
-  const disabled = new Set(parseDisabledServers(await (deps.settingsIo ?? realMcpSettingsIo).readSettings(localSettingsPathFor(directory)).catch(() => undefined)));
+  const io = deps.settingsIo ?? realMcpSettingsIo;
+  const disabledHere = parseDisabledServers(await io.readSettings(localSettingsPathFor(directory)).catch(() => undefined));
+  const bakrDisabled = new Set(parseNameList(await io.readSettings(bakrDisabledPathFor(directory)).catch(() => undefined)));
   const parentNames = new Set<string>();
   for (const parent of parentDirsOf(directory)) {
     for (const name of parseMcpServerNames(await deps.readConfigFile(mcpConfigPathFor(parent)))) parentNames.add(name);
   }
   const wanted = declared ?? configuredNames.map((name) => ({ name, notifications: true }));
   const optedIn = new Set(wanted.map((server) => server.name).filter((name) => !configured.has(name) && parentNames.has(name)));
+  const reEnabled = disabledHere.filter((name) => bakrDisabled.has(name) && (configured.has(name) || optedIn.has(name)));
+  const disabled = new Set(disabledHere.filter((name) => !reEnabled.includes(name)));
   const inherited = [...parentNames].filter((name) => !configured.has(name) && !disabled.has(name) && !optedIn.has(name));
   // An explicit disable in the workspace's own settings wins: such a server is neither approved nor subscribed.
   const servers = wanted.filter((server) => (configured.has(server.name) || optedIn.has(server.name)) && !disabled.has(server.name));
@@ -173,6 +201,7 @@ export async function resolveMcpAccess(directory: string, deps: LaunchConfigDeps
     fromParent: servers.map((server) => server.name).filter((name) => optedIn.has(name)),
     missing: wanted.filter((server) => !configured.has(server.name) && !optedIn.has(server.name)).map((server) => server.name),
     inherited,
+    reEnabled,
     mcpConfigPath,
   };
 }
@@ -206,7 +235,7 @@ export async function provisionMcpAccess(directory: string, access: ResolvedMcpA
   if (access.missing.length > 0) {
     deps.warn?.(`${directory}: MCP server(s) ${access.missing.join(", ")} are declared but not configured in ${access.mcpConfigPath}; the session starts without them`);
   }
-  if (access.inherited.length > 0) await disableInherited(directory, access.inherited, deps);
+  if (access.inherited.length > 0 || access.reEnabled.length > 0) await updateDisables(directory, access, deps);
   if (access.servers.length === 0) return;
   const servers: McpServerAccess[] = access.servers.map((server) => ({ name: server.name, notifications: server.notifications }));
   try {
@@ -217,24 +246,32 @@ export async function provisionMcpAccess(directory: string, access: ResolvedMcpA
 }
 
 /**
- * Adds `names` to the workspace's `disabledMcpjsonServers`, keeping every
- * other setting. Never throws: a settings file that cannot be read as a JSON
- * object is left alone and reported, since the start then stops at Claude's
- * prompt exactly as it would have before.
+ * Adds the parent-only servers to the workspace's `disabledMcpjsonServers`
+ * and lifts the ones bakr disabled that the agent now wants, keeping every
+ * other setting, and keeps bakr's record of its own disables in step. Never
+ * throws: a settings file that cannot be read as a JSON object is left alone
+ * and reported, since the start then stops at Claude's prompt exactly as it
+ * would have before.
  */
-async function disableInherited(directory: string, names: readonly string[], deps: LaunchConfigDeps): Promise<void> {
+async function updateDisables(directory: string, access: ResolvedMcpAccess, deps: LaunchConfigDeps): Promise<void> {
   const io = deps.settingsIo ?? realMcpSettingsIo;
   const path = localSettingsPathFor(directory);
+  const { inherited, reEnabled } = access;
   try {
     const raw = await io.readSettings(path);
     const settings = raw === undefined || raw.trim() === "" ? {} : JSON.parse(raw) as unknown;
     if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new Error(`${path} is not a JSON object`);
     const current = settings as Record<string, unknown>;
-    const disabled = [...new Set([...parseDisabledServers(JSON.stringify(current)), ...names])];
+    const disabled = [...new Set([...parseDisabledServers(JSON.stringify(current)), ...inherited])].filter((name) => !reEnabled.includes(name));
+    const recordPath = bakrDisabledPathFor(directory);
+    const record = [...new Set([...parseNameList(await io.readSettings(recordPath).catch(() => undefined)), ...inherited])].filter((name) => !reEnabled.includes(name));
+    // The record first: a crash between the two writes leaves the record naming a disable not yet written, which is harmless.
+    await io.writeSettings(recordPath, `${JSON.stringify(record)}\n`);
     await io.writeSettings(path, `${JSON.stringify({ ...current, disabledMcpjsonServers: disabled }, null, 2)}\n`);
-    deps.warn?.(`${directory}: disabled ${names.join(", ")} for this agent — defined only by a parent directory's .mcp.json (another agent's config); to use one, give this agent its own entry in ${mcpConfigPathFor(directory)}, or opt in by name with \`bakr <agent> mcp <name>\``);
+    if (inherited.length > 0) deps.warn?.(`${directory}: disabled ${inherited.join(", ")} for this agent — defined only by a parent directory's .mcp.json (another agent's config); to use one, give this agent its own entry in ${mcpConfigPathFor(directory)}, or opt in by name with \`bakr <agent> mcp <name>\``);
+    if (reEnabled.length > 0) deps.warn?.(`${directory}: re-enabled ${reEnabled.join(", ")}, which bakr had disabled as parent-only and this agent now defines or opts in to`);
   } catch (err) {
-    deps.warn?.(`${directory}: could not disable parent-defined MCP server(s) ${names.join(", ")} (${err instanceof Error ? err.message : String(err)}); the session may stop at an approval prompt`);
+    deps.warn?.(`${directory}: could not update disabled MCP server(s) (disable ${inherited.join(", ") || "none"}; re-enable ${reEnabled.join(", ") || "none"}) in ${path} (${err instanceof Error ? err.message : String(err)}); the session may stop at an approval prompt`);
   }
 }
 
