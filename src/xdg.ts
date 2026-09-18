@@ -76,3 +76,13 @@ export function sessionSlotsPath(inputs: XdgInputs): string {
 export function agentsPath(inputs: XdgInputs): string {
   return join(resolveStateHome(inputs), "bakr", "agents.json");
 }
+
+/**
+ * `$XDG_STATE_HOME/bakr/permission-approvals.jsonl` (BAKR-41) — the JSONL
+ * audit of every `bakr <agent> approve` attempt, one line per record drovr's
+ * approvePermission writes. Beside `agents.json`, never in a claimed
+ * directory. Its 0600 mode is set by the writer (paths.ts), not here.
+ */
+export function permissionAuditPath(inputs: XdgInputs): string {
+  return join(resolveStateHome(inputs), "bakr", "permission-approvals.jsonl");
+}

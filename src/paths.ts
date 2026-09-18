@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { lstat, readdir, readFile, readlink, stat } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readdir, readFile, readlink, stat } from "node:fs/promises";
 import { randomBytes as nodeRandomBytes } from "node:crypto";
 import * as xdg from "./xdg";
 import type { ResolveInputs } from "./claim-key-resolve";
@@ -40,6 +41,40 @@ export function currentXdgInputs(): xdg.XdgInputs {
 export const claimsPath = (): string => xdg.claimsPath(currentXdgInputs());
 export const sessionSlotsPath = (): string => xdg.sessionSlotsPath(currentXdgInputs());
 export const agentsPath = (): string => xdg.agentsPath(currentXdgInputs());
+export const permissionAuditPath = (): string => xdg.permissionAuditPath(currentXdgInputs());
+
+/**
+ * The real writer behind drovr's `appendAudit` for `bakr <agent> approve`
+ * (BAKR-41): appends one JSONL line to the permission audit.
+ *
+ * - 0600 from birth: the file is created by this same `open` (O_CREAT with
+ *   mode 0600), so there is no moment at which a wider-mode file exists and
+ *   no chmod afterwards to race. The umask can only narrow it further.
+ * - Appending never widens it: nothing here chmods. A file already wider
+ *   than 0600 — made by something else — is refused rather than appended
+ *   to, and that refusal is drovr's `audit-failed`: nothing is pressed.
+ * - O_NOFOLLOW: a symlink planted at the path is refused, never followed
+ *   to wherever it points.
+ * - A missing state directory is created 0700; an existing one (made by the
+ *   agent or claim store's first save) is left exactly as it is.
+ *
+ * Throws on any failure; drovr turns a throw before the keys into
+ * `audit-failed` and never presses a key without the `approving` record.
+ */
+export async function realAppendPermissionAudit(path: string, line: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const file = await open(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  try {
+    const st = await file.stat();
+    if (!st.isFile()) throw new Error(`${path} is not a regular file`);
+    const mode = st.mode & 0o777;
+    if ((mode & 0o077) !== 0) throw new Error(`${path} is mode ${mode.toString(8).padStart(4, "0")}, wider than 0600; refusing to append an approval record to it (chmod 600 it to continue)`);
+    await file.write(line);
+    await file.sync();
+  } finally {
+    await file.close();
+  }
+}
 
 /** The real `lstat`/`readlink`, for wiring into `resolveClaimKey` (see claim-key-resolve.ts). */
 export const realResolveInputs: ResolveInputs = {
