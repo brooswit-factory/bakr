@@ -59,6 +59,7 @@ function cliDeps(agentsPath: string, host: FakeHost, out: string[], err: string[
     actions: { agentsPath, runCommand: host.runCommand, now: () => CHECKED_AT, generateAttemptId: forbidden("generateAttemptId"), randomBytes: forbidden("randomBytes") },
     adopt: { claimsPath: "/must/not/exist/claims.json", agentsPath, now: forbidden("adopt.now"), resolveInputs: { lstat: forbidden("lstat"), readlink: forbidden("readlink") }, lexicalInputs: { cwd: "/nonexistent/cwd", home: "/nonexistent" }, probeDeps: { stat: forbidden("stat") } },
     claimsPath: "/must/not/exist/claims.json",
+    permissionAuditPath: "/must/not/exist/permission-approvals.jsonl",
     resolveInputs: { lstat: forbidden("lstat"), readlink: forbidden("readlink") },
     probeDeps: { stat: forbidden("stat") },
     cwd: "/nonexistent/cwd",

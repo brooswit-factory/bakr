@@ -5,7 +5,7 @@
 // keeps drovr's own `claude attach` transport until it is relaunched into
 // herdr. The same injected RunCommand as everywhere else runs every command.
 
-import { listClaudeBackgroundSessions, listPendingPermissions, openClaudeAttach, type ClaudeBackgroundListing, type ClaudeResidentDeps, type ResidentTerminal } from "@brooswit/drovr";
+import { approvePermission, listClaudeBackgroundSessions, listPendingPermissions, openClaudeAttach, type ClaudeBackgroundListing, type ClaudeResidentDeps, type PermissionApprovalDeps, type ResidentTerminal } from "@brooswit/drovr";
 import { isHerdrPaneId, listBackgroundSessions, type RunCommand } from "../spawn";
 import { parseHerdrReply } from "../spawn/herdr";
 import type { PermissionHost } from "./permissions";
@@ -71,7 +71,11 @@ export function herdrApprovalClient(runCommand: RunCommand): ApprovalClient {
     list: async () => (await herdrResult(runCommand, ["herdr", "agent", "list"])) as unknown as Awaited<ReturnType<AgentApi["list"]>>,
     get: async (target) => (await herdrResult(runCommand, ["herdr", "agent", "get", target])) as unknown as Awaited<ReturnType<AgentApi["get"]>>,
     read: async (p) => {
-      const argv = ["herdr", "agent", "read", p.target, "--source", p.source, ...(p.lines == null ? [] : ["--lines", String(p.lines)])];
+      // strip_ansi is mapped, never left to herdr's default output: drovr
+      // classifies the prompt from plain text, and a default that changed to
+      // ansi would make every blocked pane read as "no pending prompts".
+      const format = p.strip_ansi === undefined ? [] : ["--format", p.strip_ansi ? "text" : "ansi"];
+      const argv = ["herdr", "agent", "read", p.target, "--source", p.source, ...(p.lines == null ? [] : ["--lines", String(p.lines)]), ...format];
       const out = await runCommand(argv, { timeoutMs: HERDR_TIMEOUT_MS });
       if (out.exitCode !== 0) throw new Error(`herdr agent read ${p.target} exited ${out.exitCode}: ${out.stderr.trim()}`);
       return { type: "pane_read", read: { text: out.stdout, pane_id: p.target, source: p.source } } as unknown as Awaited<ReturnType<AgentApi["read"]>>;
@@ -81,10 +85,18 @@ export function herdrApprovalClient(runCommand: RunCommand): ApprovalClient {
   return { agent };
 }
 
-/** This host's permission prompts: every herdr pane running claude. Legacy `claude --bg` sessions have no pane to read. */
-export function herdrPermissions(runCommand: RunCommand): PermissionHost {
+/**
+ * This host's permission prompts: every herdr pane running claude. Legacy
+ * `claude --bg` sessions have no pane to read. `approve` is drovr's
+ * approvePermission over the same client; `overrides` is its deps seam
+ * (bakr's 0600 audit writer in bin.ts, a fake clock in tests).
+ */
+export function herdrPermissions(runCommand: RunCommand, overrides: Partial<PermissionApprovalDeps> = {}): PermissionHost {
   const client = herdrApprovalClient(runCommand);
-  return { list: () => listPendingPermissions(client) };
+  return {
+    list: () => listPendingPermissions(client),
+    approve: (request) => approvePermission(client, request, overrides),
+  };
 }
 
 // Re-exported so bin.ts wires one module; the legacy lister stays reachable for diagnostics.

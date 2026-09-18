@@ -19,6 +19,10 @@ export interface FakePane {
   label: string;
   /** What `herdr agent read` shows for this pane; defaults to the host's `blockedScreen`, else an idle input box. */
   screen?: string;
+  /** Every permission-prompt option `herdr agent send-keys` answered on this pane, in order. */
+  answered?: string[];
+  /** Keys reach the prompt but it stays on screen (drovr's `not-cleared`). */
+  stuck?: boolean;
 }
 
 export interface FakeLegacySession {
@@ -141,7 +145,11 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
       } });
     }
     if (group === "agent" && verb === "read") return { exitCode: 0, stdout: paneFor(argv[3]!)?.screen ?? opts.blockedScreen ?? "❯ ", stderr: "" };
-    if (group === "agent" && verb === "send-keys") return reply({ type: "ok" });
+    if (group === "agent" && verb === "send-keys") {
+      const pane = paneFor(argv[3]!);
+      if (pane) pressKeys(pane, argv.slice(4));
+      return reply({ type: "ok" });
+    }
     if (group === "pane" && verb === "process-info") {
       const pane = paneFor(argv[argv.indexOf("--pane") + 1]!);
       if (!pane) return refuse("pane_not_found", "no such pane");
@@ -150,10 +158,38 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
     throw new Error(`fake host: unexpected herdr argv ${JSON.stringify(argv)}`);
   }
 
+  /**
+   * Claude's permission dialog as the keys drive it: up/down move the cursor
+   * through the numbered options, enter answers the one under it — recorded
+   * in `answered` — and the dialog leaves the screen unless the pane is stuck.
+   */
+  function pressKeys(pane: FakePane, keys: string[]): void {
+    const lines = (pane.screen ?? "").split("\n");
+    const question = lines.findIndex((line) => /Do you want to .+\?/.test(line));
+    if (question < 0) return;
+    const options: string[] = [];
+    let cursor = -1;
+    for (const line of lines.slice(question + 1)) {
+      const m = /^\s*(❯\s*)?\d+\.\s+(.+?)\s*$/.exec(line);
+      if (!m) break;
+      if (m[1]) cursor = options.length;
+      options.push(m[2]!);
+    }
+    for (const key of keys) {
+      if (key === "down") cursor = Math.min(cursor + 1, options.length - 1);
+      else if (key === "up") cursor = Math.max(cursor - 1, 0);
+      else if (key === "enter") {
+        pane.answered = [...(pane.answered ?? []), options[cursor]!];
+        if (!pane.stuck) pane.screen = "❯ ";
+        return;
+      }
+    }
+  }
+
   /** Puts a pane into the fake as if an earlier launch had started it. */
-  function addPane(p: { cwd: string; sessionId: string; status?: FakePane["status"]; pid?: number; args?: string[]; screen?: string }): FakePane {
+  function addPane(p: { cwd: string; sessionId: string; status?: FakePane["status"]; pid?: number; args?: string[]; screen?: string; stuck?: boolean }): FakePane {
     workspace += 1;
-    const pane: FakePane = { paneId: `w${workspace}:p1`, workspaceId: `w${workspace}`, cwd: p.cwd, sessionId: p.sessionId, args: p.args ?? [], status: p.status ?? "idle", pid: p.pid ?? process.pid, label: "", ...(p.screen === undefined ? {} : { screen: p.screen }) };
+    const pane: FakePane = { paneId: `w${workspace}:p1`, workspaceId: `w${workspace}`, cwd: p.cwd, sessionId: p.sessionId, args: p.args ?? [], status: p.status ?? "idle", pid: p.pid ?? process.pid, label: "", ...(p.screen === undefined ? {} : { screen: p.screen }), ...(p.stuck ? { stuck: true } : {}) };
     panes.push(pane);
     return pane;
   }
@@ -168,8 +204,8 @@ export function makeFakeHost(opts: FakeHostOptions = {}) {
 
 export type FakeHost = ReturnType<typeof makeFakeHost>;
 
-/** Claude's tool-permission dialog as `herdr agent read` shows it (claude 2.1.277, as drovr measured it). */
-export function permissionScreen(tool: string, request: readonly string[], options: readonly string[] = ["Yes", "Yes, and always allow access to this directory from this project", "No"]): string {
+/** Claude's tool-permission dialog as `herdr agent read` shows it (claude 2.1.277, as drovr measured it), the cursor on option `cursor`. */
+export function permissionScreen(tool: string, request: readonly string[], options: readonly string[] = ["Yes", "Yes, and always allow access to this directory from this project", "No"], cursor = 0): string {
   return [
     "─".repeat(60),
     ` ${tool}`,
@@ -177,7 +213,7 @@ export function permissionScreen(tool: string, request: readonly string[], optio
     ...request.map((line) => `   ${line}`),
     "",
     " Do you want to proceed?",
-    ...options.map((option, i) => `${i === 0 ? " ❯" : "  "} ${i + 1}. ${option}`),
+    ...options.map((option, i) => `${i === cursor ? " ❯" : "  "} ${i + 1}. ${option}`),
     "",
     " Esc to cancel · Tab to amend",
     "",
