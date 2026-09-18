@@ -90,7 +90,7 @@ describe("launch", () => {
     expect(commands).toHaveLength(2);
     expect(commands[1]).not.toContain("--expand-environment=no");
     expect(commands[1]!.slice(0, 5)).toEqual(["systemd-run", "--user", "--scope", "--unit=bakr-launch-cafe0001", "--collect"]);
-    expect(commands[1]!.slice(commands[1]!.indexOf("--"))).toEqual(["--", "claude", "--bg", "--append-system-prompt", "p"]);
+    expect(commands[1]!.slice(commands[1]!.indexOf("--"))).toEqual(["--", "claude", "--append-system-prompt", "p", "--bg"]);
   });
 
   test("any other launch failure is not retried", async () => {

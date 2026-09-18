@@ -302,7 +302,7 @@ describe("a reconcile's own fresh launch carries the host's configured MCP subsc
     const systemdCall = seen.find((c) => c[0] === "systemd-run") as string[];
     // FALSIFIER: the daemon is what keeps these sessions alive, so a launch it
     // issues without the channel is the reported bug, not a lesser version of it.
-    expect(systemdCall.slice(systemdCall.indexOf("--") + 3)).toEqual([
+    expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([
       "--mcp-config", `${key}/.mcp.json`,
       "--dangerously-load-development-channels", "server:yappr",
     ]);

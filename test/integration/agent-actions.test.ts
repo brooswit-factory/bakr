@@ -131,8 +131,9 @@ describe("create", () => {
     expect(result.launch.ok).toBe(true);
 
     const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    const dashIdx = systemdCall.indexOf("--");
-    const claudeArgs = systemdCall.slice(dashIdx + 3); // after "--", "claude", "--bg"
+    // Between "claude" and the trailing "--bg": options must precede --bg,
+    // which does not parse anything placed after it.
+    const claudeArgs = systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"));
     expect(claudeArgs).toEqual([]); // FALSIFIER: any extra argv element here is a B8 violation
   });
 
@@ -151,7 +152,7 @@ describe("create", () => {
     expect(result.ok).toBe(true);
 
     const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    const claudeArgs = systemdCall.slice(systemdCall.indexOf("--") + 3);
+    const claudeArgs = systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"));
     // FALSIFIER: this is the whole point — MCP configured but never subscribed
     // to is the bug. The flag spellings come from drovr, never from this repo.
     expect(claudeArgs).toEqual([
@@ -171,7 +172,7 @@ describe("create", () => {
       },
     }, KEY);
     const systemdCall = fake.calls.find((c) => c[0] === "systemd-run") as string[];
-    expect(systemdCall.slice(systemdCall.indexOf("--") + 3)).toEqual([]);
+    expect(systemdCall.slice(systemdCall.indexOf("claude") + 1, systemdCall.indexOf("--bg"))).toEqual([]);
   });
 
   test("with a name: the agent holds it", async () => {
