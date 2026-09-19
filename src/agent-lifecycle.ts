@@ -15,15 +15,14 @@
 // (state, scope, ref, ...) -> a decision; nothing here ever touches a
 // session, a clock, or the filesystem.
 //
-// B2 (restated because this file leans on it constantly): `directory` is
-// the resolver's SCOPE, never an agent's identity. `resolveAgent` (imported
-// from agent-model.ts) is the only place a `ref` is turned into an agent,
-// and its `found-elsewhere` outcome gets its OWN refusal below rather than
-// being flattened into `not-found` (BAKR-17 doc's own addition to the
-// epic's list) — the resolver went to the trouble of distinguishing the
-// two; collapsing them here would throw that away and tell an operator
-// their id does not exist when it demonstrably does, just in another
-// directory.
+// B2 (restated because this file leans on it constantly): `directory` is an
+// agent's ATTRIBUTE, never its identity — an id is. `resolveAgent` (imported
+// from agent-model.ts) is the only place a `ref` is turned into an agent.
+// BAKR-34/BAKR-42 R4 removed `found-elsewhere` entirely: resolution is
+// global now (an id or a name resolves independent of any caller cwd), so
+// there is no longer a "found, but scoped elsewhere" outcome to distinguish
+// from `not-found` — see `ResolutionRefusal` and `resolveOrRefuse` below,
+// which only ever produce `not-found`, `ambiguous` (R6) or `renamed` (R8).
 
 import type { ClaimKey } from "./claim-key-resolve";
 import { type AgentRecord, type AgentStoreState, type RefClassification, type RestorePlan, planRestore, resolveAgent } from "./agent-model";

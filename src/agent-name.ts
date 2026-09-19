@@ -12,16 +12,16 @@
 // is that rule, spelled out once so no call site re-derives it.
 //
 // R3 — derivation: a directory's base name is its last two path segments
-// joined by "/"; a one-segment key derives that single segment; the root "/"
-// derives "/". When two or more directories share a base name, EVERY member
-// of that colliding group grows by one more leading segment, simultaneously,
-// repeating until every candidate in the group is unique — `deriveDirectoryNames`
-// implements that fixed-point. A directory that runs out of segments before
-// it is unique keeps its full absolute path (leading "/" included); that
-// representation can never collide with a still-growing candidate, since a
-// still-growing candidate never carries a leading "/" (see that function's
-// own comment for why this makes the fixed point well-defined without a
-// depth cap).
+// joined by "/"; a one-segment key derives that single segment (e.g. `/foo`
+// derives `foo`, never `/foo`); the root "/" derives "/". When two or more
+// directories share a base name, EVERY member of that colliding group grows
+// by one more leading segment, simultaneously, repeating until every
+// candidate in the group is unique — `deriveDirectoryNames` implements that
+// fixed-point. A directory that runs out of segments before it is unique
+// keeps its own full segment sequence (its full absolute path, minus the
+// leading "/") — see `deriveDirectoryNames`'s own comment for why that is
+// always already unique on its own, with no separate "ran out of segments"
+// shape needed to keep it from colliding with a still-growing candidate.
 //
 // Archived agents are excluded upstream, not here (R3: "computed over
 // non-archived agents only") — `computeAgentNames` is the one function in
@@ -43,18 +43,20 @@ function segmentsOf(directory: string): readonly string[] {
 }
 
 /**
- * The candidate name for one directory at a given leading-segment count.
- * `level >= segs.length` means "ran out of segments to grow with" — the
- * fallback is the full absolute path, leading "/" included, which is why it
- * is the one candidate shape here that can start with "/": every other
- * candidate is a bare join of trailing segments, and a real directory
- * segment can never itself contain "/", so the two shapes can never collide
- * (see `deriveDirectoryNames`'s own comment).
+ * The candidate name for one directory at a given leading-segment count: the
+ * trailing `level` segments, joined by "/" — clamped to the whole array once
+ * `level` reaches `segs.length` (a one-segment key at its base level, e.g.,
+ * derives its bare single segment, matching R3's own worked example: `/foo`
+ * derives `foo`, never `/foo`). `deriveDirectoryNames`'s growth loop never
+ * advances a directory's `level` past its own `segs.length` (see that
+ * function's guard), so `level` is always in `[0, segs.length]` here and this
+ * clamp is the only case that needs handling — there is no separate "ran out
+ * of segments" shape distinct from an ordinary bare join (see
+ * `deriveDirectoryNames`'s own comment for why one is never needed).
  */
 function candidateAtLevel(segs: readonly string[], level: number): string {
   if (segs.length === 0) return "/";
-  if (level >= segs.length) return `/${segs.join("/")}`;
-  return segs.slice(segs.length - level).join("/");
+  return segs.slice(Math.max(0, segs.length - level)).join("/");
 }
 
 /**
@@ -65,11 +67,20 @@ function candidateAtLevel(segs: readonly string[], level: number): string {
  * `min(2, segmentCount)`; a colliding group (2+ directories sharing a
  * candidate at their current levels) grows every member that still has
  * segments left, one at a time, and repeats until every candidate is
- * unique. Terminates because each directory's level is strictly bounded by
- * its own segment count, and once a directory reaches that bound its
- * candidate is a full absolute path (leading "/"), which — by construction
- * — can never match a still-growing candidate (no leading "/") and so can
- * never keep the loop going on its account again.
+ * unique. TERMINATION: each directory's level is capped at its own segment
+ * count (the `level < segs.length` guard below never grows it past that), so
+ * a directory that reaches its own cap simply stops changing — its candidate
+ * from then on is its FULL segment sequence joined by "/", which is a
+ * DIFFERENT distinct directory's candidate can only equal if that directory
+ * has the identical segment sequence, i.e. is the identical (already-deduped)
+ * directory. So two directories can never share an at-cap candidate forever;
+ * a colliding group where every member is capped is therefore impossible
+ * (for 2+ distinct directories), and any group that still has a growing
+ * member keeps shrinking on the next iteration. This is also why
+ * `candidateAtLevel` needs no separate "ran out of segments" shape distinct
+ * from an ordinary bare join (R3's own `/foo` -> `foo` example is exactly
+ * this: a one-segment directory reaches its cap immediately and is already
+ * unique on its own).
  */
 export function deriveDirectoryNames(directories: readonly string[]): ReadonlyMap<string, string> {
   const unique = [...new Set(directories)];

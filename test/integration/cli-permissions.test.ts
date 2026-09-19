@@ -57,7 +57,7 @@ const bobPrompt = permissionScreen("Write", ["/srv/bob/secrets.env"], ["Yes", "N
 
 test("an agent with one pending prompt gets its tool, request, options and promptId", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }]);
-  expect(await runCli(["alice", "permissions"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "permissions"], s.deps)).toBe(0);
   const pane = s.panes.get("@a1")!.paneId;
   const promptId = s.out.join("").match(/^promptId: ([0-9a-f]+)$/m)?.[1];
   expect(promptId).toMatch(/^[0-9a-f]{16}$/);
@@ -95,7 +95,7 @@ test("a pending prompt on a DIFFERENT agent's pane is not listed", async () => {
   ]);
   // bob's prompt really is pending, and visible to anyone reading every pane.
   expect((await s.deps.permissions.list()).map((p) => p.paneId)).toEqual([s.panes.get("@a2")!.paneId]);
-  expect(await runCli(["alice", "permissions"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "permissions"], s.deps)).toBe(0);
   expect(s.out.join("")).toBe("no pending prompts\n");
   expect(s.out.join("")).not.toContain("secrets.env");
   expect(s.out.join("")).not.toContain(s.panes.get("@a2")!.paneId);
@@ -106,12 +106,12 @@ test("with prompts on both panes, each agent sees only its own", async () => {
     { id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt },
     { id: "@a2", name: "bob", sessionId: "bob-session", screen: bobPrompt },
   ]);
-  expect(await runCli(["alice", "permissions"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "permissions"], s.deps)).toBe(0);
   expect(s.out.join("")).toContain("touch notes.txt");
   expect(s.out.join("")).not.toContain("secrets.env");
   expect(s.out.join("").match(/^promptId: /gm)).toHaveLength(1);
   s.out.length = 0;
-  expect(await runCli(["bob", "permissions"], s.deps)).toBe(0);
+  expect(await runCli(["@a2", "permissions"], s.deps)).toBe(0);
   expect(s.out.join("")).toContain("/srv/bob/secrets.env");
   expect(s.out.join("")).not.toContain("touch notes.txt");
 });
@@ -123,20 +123,20 @@ test("a pane carrying this agent's pane id but another session is not this agent
     { id: "@a1", name: "alice", sessionId: "alice-session", restoreTarget: { shortId: "w1:p1" } },
   ]);
   expect(s.panes.get("@a2")!.paneId).toBe("w1:p1");
-  expect(await runCli(["alice", "permissions"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "permissions"], s.deps)).toBe(0);
   expect(s.out.join("")).toBe("no pending prompts\n");
 });
 
 test("an unknown agent is refused like every other verb refuses it, before any pane is read", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }]);
   expect(await runCli(["carol", "permissions"], s.deps)).toBe(1);
-  expect(s.err.join("")).toBe(`not-found: no agent "carol" found in this directory\n`);
+  expect(s.err.join("")).toBe(`not-found: no agent "carol" found\n`);
   expect(s.out).toEqual([]);
   expect(s.commands).toEqual([]);
   // Same code `send` gives the same unknown ref.
   s.err.length = 0;
   expect(await runCli(["carol", "send", "hi"], s.deps)).toBe(1);
-  expect(s.err.join("")).toBe(`not-found: no agent "carol" found in this directory\n`);
+  expect(s.err.join("")).toBe(`not-found: no agent "carol" found\n`);
 });
 
 test("an agent that was never launched says so plainly instead of reading any pane", async () => {
@@ -144,21 +144,22 @@ test("an agent that was never launched says so plainly instead of reading any pa
     { id: "@a1", name: "alice", sessionId: "alice-session", restoreTarget: "none" },
     { id: "@a2", name: "bob", sessionId: "bob-session", screen: bobPrompt },
   ]);
-  expect(await runCli(["alice", "permissions"], s.deps)).toBe(0);
-  expect(s.out.join("")).toBe(`@a1 "alice" has never been launched, so it has no pane to prompt on: no pending prompts\n`);
+  expect(await runCli(["@a1", "permissions"], s.deps)).toBe(0);
+  // Two non-archived agents share this directory (R6: legacy-shaped, loadable, ambiguous by name) — neither gets a derived name, so the label is @id-only.
+  expect(s.out.join("")).toBe(`@a1 has never been launched, so it has no pane to prompt on: no pending prompts\n`);
   expect(s.commands).toEqual([]);
 });
 
 test("a failed pane listing is a failure, not an empty answer", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }], { failListing: true });
-  expect(await runCli(["alice", "permissions"], s.deps)).toBe(3);
+  expect(await runCli(["@a1", "permissions"], s.deps)).toBe(3);
   expect(s.out).toEqual([]);
   expect(s.err.join("")).toContain("listing-failed: cannot read agent @a1's pane: simulated listing failure");
 });
 
 test("an agent still on legacy `claude --bg` is told its prompts cannot be read there", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", restoreTarget: { shortId: "fullsess" } }]);
-  expect(await runCli(["alice", "permissions"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "permissions"], s.deps)).toBe(0);
   expect(s.out.join("")).toBe("no pending prompts\n");
   expect(s.err.join("")).toContain("note: agent @a1 still runs under legacy `claude --bg` (fullsess)");
 });
