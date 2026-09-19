@@ -105,7 +105,11 @@ describe("bakr CLI grammar", () => {
       [["alice","approve","abc","--yes"], '--yes/-y is not valid with "approve"'],
       [["alice","approve","abc","--all"], '--all is not valid with "approve"'],
       [["alice","approve","abc","--archived"], '--archived is not valid with "approve"'],
-      [["alice","approve","abc","--name","x"], '--name is not valid with "approve"'],
+      // BAKR-34/BAKR-42 R9: --name is retired outright (scan()'s own
+      // early-return), which supersedes the per-verb "not valid with" shape
+      // every other flag still uses — see the identical case for
+      // "permissions" above.
+      [["alice","approve","abc","--name","x"], "--name is retired"],
       [["alice","approve","abc","--mcp","yappr"], '--mcp is not valid with "approve"'],
       [["alice","approve","abc","--help"], "used alone"],
       [["alice","approve","abc","--auto"], 'unrecognized flag "--auto"'],

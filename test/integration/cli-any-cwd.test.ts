@@ -48,7 +48,8 @@ function cliDeps(storeDir: string, cwd: string, runCommand: (argv: string[], opt
     stdout: (s) => { out.push(s); }, stderr: (s) => { err.push(s); },
     prompt: async () => { throw new Error("must not prompt"); }, spawnAttach: async () => { throw new Error("must not attach"); },
     messenger: { message: async () => { throw new Error("must not send"); } },
-    permissions: { list: async () => { throw new Error("must not read permission prompts"); } },
+    permissions: { list: async () => { throw new Error("must not read permission prompts"); }, approve: async () => { throw new Error("must not approve a permission prompt"); } },
+    permissionAuditPath: join(storeDir, "permission-approvals.jsonl"),
   };
   return { deps, out, err };
 }

@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyPermissionPrompt } from "@brooswit/drovr";
 import { emptyAgentStore, putAgent, type AgentRecord } from "../../src/agent-model";
+import { deriveDirectoryNames } from "../../src/agent-name";
 import { save as saveAgents } from "../../src/agent-store-io";
 import type { ClaimKey } from "../../src/claim-key-resolve";
 import { runCli, type CliDeps } from "../../src/cli/main";
@@ -71,7 +72,13 @@ async function setup(specs: AgentSpec[], opts: SetupOpts = {}) {
   const keys = () => commands.filter(isSendKeys).map((c) => c.slice(3));
   const audit = async (): Promise<Record<string, unknown>[]> => (await readFile(auditPath, "utf8")).trimEnd().split("\n").map((line) => JSON.parse(line));
   const auditExists = () => stat(auditPath).then(() => true, () => false);
-  return { root, state, auditPath, deps, out, err, commands, host, panes, keys, audit, auditExists };
+  // BAKR-34/BAKR-42 R1/R3: the label shown for a SINGLE agent in `root` is
+  // its current derived name (agent-name.ts), never the legacy `name` field
+  // — computed the same way production does. Meaningless (and unused) when
+  // `specs` holds more than one agent: R6 makes a shared directory
+  // AMBIGUOUS, so neither agent gets a derived name at all.
+  const name = deriveDirectoryNames([root]).get(root)!;
+  return { root, state, auditPath, deps, out, err, commands, host, panes, keys, audit, auditExists, name };
 }
 
 const ALWAYS = "Yes, and always allow access to this directory from this project";
@@ -84,13 +91,13 @@ const idOf = (screen: string): string => classifyPermissionPrompt(screen)!.promp
 test("approve once: presses the plain Yes, prints what was approved, and audits approving then approved", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }]);
   const pane = s.panes.get("@a1")!;
-  expect(await runCli(["alice", "approve", idOf(alicePrompt)], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt)], s.deps)).toBe(0);
   expect(pane.answered).toEqual(["Yes"]);
   expect(s.keys()).toEqual([[pane.paneId, "enter"]]);
   const records = await s.audit();
   expect(records.map((r) => r.outcome)).toEqual(["approving", "approved"]);
   expect(s.out.join("")).toBe([
-    'approved Bash command for @a1 "alice" (once)',
+    `approved Bash command for @a1 "${s.name}" (once)`,
     "request:",
     "  touch notes.txt",
     "  Create an empty notes file",
@@ -107,10 +114,10 @@ test("approve once: presses the plain Yes, prints what was approved, and audits 
 test("approve --always: presses the stored-rule option, says so, and audits scope always", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }]);
   const pane = s.panes.get("@a1")!;
-  expect(await runCli(["alice", "approve", idOf(alicePrompt), "--always"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt), "--always"], s.deps)).toBe(0);
   expect(pane.answered).toEqual([ALWAYS]);
   expect(s.keys()).toEqual([[pane.paneId, "down", "enter"]]);
-  expect(s.out.join("")).toContain('approved Bash command for @a1 "alice" (always: a rule stored for this project, which outlives the session)');
+  expect(s.out.join("")).toContain(`approved Bash command for @a1 "${s.name}" (always: a rule stored for this project, which outlives the session)`);
   expect((await s.audit()).map((r) => [r.outcome, r.scope, r.option])).toEqual([["approving", "always", ALWAYS], ["approved", "always", ALWAYS]]);
 });
 
@@ -121,7 +128,7 @@ test("approve --always: presses the stored-rule option, says so, and audits scop
 test("--always is never chosen without the flag, even with the cursor already on it", async () => {
   const screen = permissionScreen("Bash command", request, ["Yes", ALWAYS, "No"], 1);
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen }]);
-  expect(await runCli(["alice", "approve", idOf(screen)], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "approve", idOf(screen)], s.deps)).toBe(0);
   expect(s.panes.get("@a1")!.answered).toEqual(["Yes"]);
   expect(s.keys()).toEqual([[s.panes.get("@a1")!.paneId, "up", "enter"]]);
   expect((await s.audit()).map((r) => r.scope)).toEqual(["once", "once"]);
@@ -137,18 +144,18 @@ test("the switch-to-auto-mode option is never selected", async () => {
   ] as const) {
     const screen = permissionScreen("Bash command", request, measured, cursor);
     const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen }]);
-    expect(await runCli(["alice", "approve", idOf(screen), ...argv], s.deps)).toBe(0);
+    expect(await runCli(["@a1", "approve", idOf(screen), ...argv], s.deps)).toBe(0);
     expect(s.panes.get("@a1")!.answered).toEqual([expected]);
   }
   // Auto mode listed BEFORE the stored-rule option, and a dialog whose only
   // "Yes, and …" is auto mode: --always must refuse, never fall back to it.
   const reordered = permissionScreen("Bash command", request, ["Yes", AUTO, ALWAYS, "No"]);
   const s1 = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: reordered }]);
-  expect(await runCli(["alice", "approve", idOf(reordered), "--always"], s1.deps)).toBe(0);
+  expect(await runCli(["@a1", "approve", idOf(reordered), "--always"], s1.deps)).toBe(0);
   expect(s1.panes.get("@a1")!.answered).toEqual([ALWAYS]);
   const autoOnly = permissionScreen("Bash command", request, ["Yes", AUTO, "No"]);
   const s2 = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: autoOnly }]);
-  expect(await runCli(["alice", "approve", idOf(autoOnly), "--always"], s2.deps)).toBe(1);
+  expect(await runCli(["@a1", "approve", idOf(autoOnly), "--always"], s2.deps)).toBe(1);
   expect(s2.err.join("")).toMatch(/^option-missing: the prompt offers no option for scope always \(attempt [0-9a-f-]+; not retried\)\n$/);
   expect(s2.keys()).toEqual([]);
   expect(s2.panes.get("@a1")!.answered).toBeUndefined();
@@ -163,8 +170,8 @@ test("the switch-to-auto-mode option is never selected", async () => {
 test("a stale promptId is refused with nothing pressed", async () => {
   const earlier = permissionScreen("Bash command", ["rm -rf build", "Clean the build"]);
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }]);
-  expect(await runCli(["alice", "approve", idOf(earlier)], s.deps)).toBe(1);
-  expect(s.err.join("")).toBe(`prompt-changed: ${idOf(earlier)} is not pending on @a1 "alice"'s pane, which shows ${idOf(alicePrompt)}; list again and approve that one; nothing was pressed\n`);
+  expect(await runCli(["@a1", "approve", idOf(earlier)], s.deps)).toBe(1);
+  expect(s.err.join("")).toBe(`prompt-changed: ${idOf(earlier)} is not pending on @a1 "${s.name}"'s pane, which shows ${idOf(alicePrompt)}; list again and approve that one; nothing was pressed\n`);
   expect(s.out).toEqual([]);
   expect(s.keys()).toEqual([]);
   expect(s.panes.get("@a1")!.answered).toBeUndefined();
@@ -180,7 +187,7 @@ test("a prompt that changes between the listing and the approval is refused by d
     afterFirstRead: (host) => { host.panes[0]!.screen = next; },
   });
   const pane = s.panes.get("@a1")!;
-  expect(await runCli(["alice", "approve", idOf(alicePrompt)], s.deps)).toBe(1);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt)], s.deps)).toBe(1);
   expect(s.err.join("")).toMatch(new RegExp(`^prompt-changed: pane ${pane.paneId} now shows a different prompt \\(${idOf(next)}\\); list again and approve that one \\(attempt [0-9a-f-]+; not retried\\)\\n$`));
   expect(s.keys()).toEqual([]);
   expect(pane.answered).toBeUndefined();
@@ -193,7 +200,7 @@ test("a prompt that changes between the listing and the approval is refused by d
 test("an unknown agent is refused before any pane is read, and nothing is audited", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }]);
   expect(await runCli(["carol", "approve", idOf(alicePrompt)], s.deps)).toBe(1);
-  expect(s.err.join("")).toBe(`not-found: no agent "carol" found in this directory\n`);
+  expect(s.err.join("")).toBe(`not-found: no agent "carol" found\n`);
   expect(s.out).toEqual([]);
   expect(s.commands).toEqual([]);
   expect(await s.auditExists()).toBe(false);
@@ -205,18 +212,20 @@ test("another agent's promptId is refused on this agent, and neither pane is pre
     { id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt },
     { id: "@a2", name: "bob", sessionId: "bob-session", screen: bobPrompt },
   ]);
-  expect(await runCli(["alice", "approve", idOf(bobPrompt)], s.deps)).toBe(1);
-  expect(s.err.join("")).toContain(`prompt-changed: ${idOf(bobPrompt)} is not pending on @a1 "alice"'s pane`);
+  expect(await runCli(["@a1", "approve", idOf(bobPrompt)], s.deps)).toBe(1);
+  // R6: @a1 and @a2 share `root` — a legacy-shaped, loadable, ambiguous
+  // directory — so neither gets a derived name; the label is @id-only.
+  expect(s.err.join("")).toContain(`prompt-changed: ${idOf(bobPrompt)} is not pending on @a1's pane`);
   s.err.length = 0;
   // …and with nothing pending on alice at all.
   s.panes.get("@a1")!.screen = "❯ ";
-  expect(await runCli(["alice", "approve", idOf(bobPrompt)], s.deps)).toBe(1);
-  expect(s.err.join("")).toBe(`no-prompt: @a1 "alice"'s pane shows no permission prompt, so ${idOf(bobPrompt)} is not pending there; nothing was pressed\n`);
+  expect(await runCli(["@a1", "approve", idOf(bobPrompt)], s.deps)).toBe(1);
+  expect(s.err.join("")).toBe(`no-prompt: @a1's pane shows no permission prompt, so ${idOf(bobPrompt)} is not pending there; nothing was pressed\n`);
   expect(s.keys()).toEqual([]);
   expect(s.panes.get("@a2")!.answered).toBeUndefined();
   expect(s.panes.get("@a2")!.screen).toBe(bobPrompt);
   // bob can still approve his own.
-  expect(await runCli(["bob", "approve", idOf(bobPrompt)], s.deps)).toBe(0);
+  expect(await runCli(["@a2", "approve", idOf(bobPrompt)], s.deps)).toBe(0);
   expect(s.panes.get("@a2")!.answered).toEqual(["Yes"]);
 });
 
@@ -226,20 +235,20 @@ test("a pane carrying this agent's stale pane id but another session is not appr
     { id: "@a1", name: "alice", sessionId: "alice-session", restoreTarget: { shortId: "w1:p1" } },
   ]);
   expect(s.panes.get("@a2")!.paneId).toBe("w1:p1");
-  expect(await runCli(["alice", "approve", idOf(bobPrompt)], s.deps)).toBe(1);
+  expect(await runCli(["@a1", "approve", idOf(bobPrompt)], s.deps)).toBe(1);
   expect(s.keys()).toEqual([]);
   expect(s.panes.get("@a2")!.answered).toBeUndefined();
 });
 
 test("the operator defaults to $USER, and --as overrides it", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }], { user: "carol" });
-  expect(await runCli(["alice", "approve", idOf(alicePrompt), "--as", "usrr:dana"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt), "--as", "usrr:dana"], s.deps)).toBe(0);
   expect((await s.audit()).map((r) => r.operator)).toEqual(["usrr:dana", "usrr:dana"]);
 });
 
 test.each([["unset", undefined], ["empty", ""], ["blank", "  "]] as const)("with $USER %s and no --as, approve is a usage error before anything is read or pressed", async (_, user) => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }], { user });
-  expect(await runCli(["alice", "approve", idOf(alicePrompt)], s.deps)).toBe(2);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt)], s.deps)).toBe(2);
   expect(s.err.join("")).toContain("bakr: usage error: approve needs an operator");
   expect(s.err.join("")).toContain("pass --as <operator>");
   expect(s.commands).toEqual([]);
@@ -250,7 +259,7 @@ test.each([["unset", undefined], ["empty", ""], ["blank", "  "]] as const)("with
 test("keys that leave the prompt on screen are not-cleared: a failure, pressed once, never retried, audited", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt, stuck: true }]);
   const pane = s.panes.get("@a1")!;
-  expect(await runCli(["alice", "approve", idOf(alicePrompt)], s.deps)).toBe(3);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt)], s.deps)).toBe(3);
   expect(s.err.join("")).toMatch(new RegExp(`^not-cleared: keys were sent but pane ${pane.paneId} still shows the prompt \\(attempt [0-9a-f-]+; not retried\\)\\n$`));
   expect(s.out).toEqual([]);
   expect(s.keys()).toEqual([[pane.paneId, "enter"]]);
@@ -263,7 +272,7 @@ test("an audit that cannot be written safely is audit-failed: a failure, and not
   await mkdir(join(s.state, "bakr"));
   await writeFile(s.auditPath, "someone else's\n");
   await chmod(s.auditPath, 0o644);
-  expect(await runCli(["alice", "approve", idOf(alicePrompt)], s.deps)).toBe(3);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt)], s.deps)).toBe(3);
   expect(s.err.join("")).toMatch(/^audit-failed: audit not written, nothing pressed: .*is mode 0644, wider than 0600.* \(attempt [0-9a-f-]+; not retried\)\n$/);
   expect(s.keys()).toEqual([]);
   expect(s.panes.get("@a1")!.answered).toBeUndefined();
@@ -274,22 +283,22 @@ test("an audit that cannot be written safely is audit-failed: a failure, and not
 test("a send-keys that throws is reported once, as a failure, and not retried", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }], { failSendKeys: true });
   const pane = s.panes.get("@a1")!;
-  expect(await runCli(["alice", "approve", idOf(alicePrompt)], s.deps)).toBe(3);
-  expect(s.err.join("")).toBe(`approve-failed: simulated send-keys failure; whether a key reached pane ${pane.paneId} is unknown and nothing was retried; \`bakr alice permissions\` shows what is on it now\n`);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt)], s.deps)).toBe(3);
+  expect(s.err.join("")).toBe(`approve-failed: simulated send-keys failure; whether a key reached pane ${pane.paneId} is unknown and nothing was retried; \`bakr @a1 permissions\` shows what is on it now\n`);
   expect(s.commands.filter(isSendKeys)).toHaveLength(1);
   expect((await s.audit()).map((r) => r.outcome)).toEqual(["approving"]);
 });
 
 test("an agent that was never launched has no pane to approve on", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", restoreTarget: "none" }]);
-  expect(await runCli(["alice", "approve", "0123456789abcdef"], s.deps)).toBe(1);
-  expect(s.err.join("")).toBe(`no-prompt: @a1 "alice" has never been launched, so it has no pane to prompt on; nothing was pressed\n`);
+  expect(await runCli(["@a1", "approve", "0123456789abcdef"], s.deps)).toBe(1);
+  expect(s.err.join("")).toBe(`no-prompt: @a1 "${s.name}" has never been launched, so it has no pane to prompt on; nothing was pressed\n`);
   expect(s.commands).toEqual([]);
 });
 
 test("a failed pane listing is a failure, and nothing is pressed", async () => {
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", screen: alicePrompt }], { failListing: true });
-  expect(await runCli(["alice", "approve", idOf(alicePrompt)], s.deps)).toBe(3);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt)], s.deps)).toBe(3);
   expect(s.err.join("")).toContain("listing-failed: cannot read agent @a1's pane: simulated listing failure; nothing was pressed");
   expect(s.keys()).toEqual([]);
 });
@@ -298,7 +307,7 @@ test("an agent still on legacy `claude --bg` is told why there is nothing to app
   const s = await setup([{ id: "@a1", name: "alice", sessionId: "alice-session", restoreTarget: { shortId: "fullsess" } }]);
   // Its session is on no herdr pane, so no pending prompt is its own.
   s.host.panes.length = 0;
-  expect(await runCli(["alice", "approve", "0123456789abcdef"], s.deps)).toBe(1);
+  expect(await runCli(["@a1", "approve", "0123456789abcdef"], s.deps)).toBe(1);
   expect(s.err.join("")).toContain("note: agent @a1 still runs under legacy `claude --bg` (fullsess), whose prompts cannot be read or answered");
   expect(s.keys()).toEqual([]);
 });
@@ -313,7 +322,7 @@ test("approving writes nothing inside the claimed directory", async () => {
   };
   const before = await snapshot();
   const rootMtime = (await stat(s.root)).mtimeMs;
-  expect(await runCli(["alice", "approve", idOf(alicePrompt)], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "approve", idOf(alicePrompt)], s.deps)).toBe(0);
   expect(await snapshot()).toEqual(before);
   expect((await stat(s.root)).mtimeMs).toBe(rootMtime);
   expect(await s.auditExists()).toBe(true);
