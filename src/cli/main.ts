@@ -243,6 +243,10 @@ async function handleAttach(refInput: string, d: CliDeps): Promise<number> {
 
 async function handle(command: ParsedCommand, d: CliDeps): Promise<number> {
   if (command.kind === "help") { d.stdout(help); return 0; }
+  // BAKR-48: runCli already dispatches "status" before ever calling handle()
+  // (it needs no claimed directory — see runStatus's own comment); this
+  // branch exists only so TypeScript can narrow `command` past it below.
+  if (command.kind === "status") return runStatus(command.json, d);
   if (command.kind === "discover") {
     const directory = await resolveDirectory(d.cwd, d); if (!directory) return EXIT_FAILURE;
     return discover(directory, d);
