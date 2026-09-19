@@ -152,7 +152,7 @@ async function discover(directory: ClaimKey, d: CliDeps): Promise<number> {
  * to read the reason out of rather than only an exit code.
  */
 async function runStatus(json: boolean, d: CliDeps): Promise<number> {
-  const report = await collectStatus({ agentsPath: d.actions.agentsPath, runCommand: d.actions.runCommand, now: d.actions.now });
+  const report = await collectStatus({ agentsPath: d.actions.agentsPath, runCommand: d.actions.runCommand, now: d.actions.now, ...(d.actions.launchConfigDeps === undefined ? {} : { launchConfigDeps: d.actions.launchConfigDeps }) });
   d.stdout(json ? `${JSON.stringify(report, null, 2)}\n` : renderStatusText(report));
   return statusExitCode(report);
 }

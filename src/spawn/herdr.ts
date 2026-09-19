@@ -114,6 +114,27 @@ export function claudePid(result: Record<string, unknown>): number | undefined {
   return typeof claude?.pid === "number" ? claude.pid : undefined;
 }
 
+export type PaneArgv = { readonly ok: true; readonly argv: readonly string[] } | { readonly ok: false; readonly reason: string };
+
+/**
+ * The argv of the claude process a pane runs, from ONE `herdr pane
+ * process-info` — read-only. Never throws: a failed read, or a pane with no
+ * claude in its foreground, is `ok: false` with the reason, which every caller
+ * treats as "couldn't check", never as a mismatch (BAKR-61).
+ */
+export async function readPaneArgv(paneId: string, runCommand: RunCommand): Promise<PaneArgv> {
+  try {
+    const info = await herdr({ runCommand }, ["herdr", "pane", "process-info", "--pane", paneId]);
+    if (!info.ok) return { ok: false, reason: `\`herdr pane process-info\` failed for pane ${paneId}: ${info.message}` };
+    const processes = (info.result["process_info"] as { foreground_processes?: { name?: unknown; argv?: unknown }[] } | undefined)?.foreground_processes;
+    const argv = processes?.find((p) => p.name === "claude")?.argv;
+    if (!Array.isArray(argv) || !argv.every((a) => typeof a === "string")) return { ok: false, reason: `herdr reported no claude argv for pane ${paneId}` };
+    return { ok: true, argv: argv as string[] };
+  } catch (err) {
+    return { ok: false, reason: `\`herdr pane process-info\` failed for pane ${paneId}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+
 export type StartupPrompt =
   | { readonly kind: "trust"; readonly keys: readonly string[] }
   | { readonly kind: "development-channels"; readonly keys: readonly string[] }

@@ -286,6 +286,17 @@ export async function claudeLaunchArgs(directory: string, deps: LaunchConfigDeps
   return buildProviderLaunchArgs("claude", launchInputsFor(access));
 }
 
+/**
+ * The argv `claudeLaunchArgs` would return, READ-ONLY: nothing is provisioned,
+ * so `bakr status` and the daemon's argv check (BAKR-61) can compare a running
+ * agent against it without writing a byte. The servers come out the same as a
+ * provisioning call's: provisioning only disables servers that are never
+ * launched with and lifts bakr's own disables of ones already counted in.
+ */
+export async function expectedClaudeLaunchArgs(directory: string, deps: LaunchConfigDeps, declared?: readonly McpServerDeclaration[]): Promise<string[]> {
+  return buildProviderLaunchArgs("claude", launchInputsFor(await resolveMcpAccess(directory, deps, declared)));
+}
+
 /** Approval only: what a respawn needs (it takes no flags from bakr), and what a changed declaration writes at once. */
 export async function provisionMcpFor(directory: string, deps: LaunchConfigDeps, declared?: readonly McpServerDeclaration[]): Promise<void> {
   await provisionMcpAccess(directory, await resolveMcpAccess(directory, deps, declared), deps);

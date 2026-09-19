@@ -131,7 +131,7 @@ current-attempt launch-record clearing separately from stray fork-from-record
 clearing so neither operator-visible recovery is conflated.
 
 The table above covers every verb but `status`, which is a health report
-rather than an action and carries its own three codes — see its section below.
+rather than an action and carries its own three exit codes — see its section below.
 
 ### `bakr status`: the read-only health report (BAKR-48)
 
@@ -144,17 +144,22 @@ another never restored because of a stale launch record (BAKR-33).
 factory-dashboard polls this command every ~10 seconds instead.
 
 It is **strictly read-only**. It never starts, wakes, restores, relaunches or
-stops anything, it runs no herdr command other than `agent list` and
-`agent read`, and it does not write the store (it does not even lock it — the
+stops anything, it runs no herdr command other than `agent list`,
+`agent read` and — for each `on` agent every other check calls healthy —
+one `pane process-info` (its live argv, BAKR-61), and it does not write the
+store (it does not even lock it — the
 store is written atomically by temp-file-and-rename, so a plain read sees
 either the whole old file or the whole new one). A test asserts exactly that,
 including that the store file's bytes are unchanged. It resolves no claim key
-and claims no directory, so it is valid from any cwd.
+and claims no directory, so it is valid from any cwd. The flags an agent
+should run with are read from its `.mcp.json` and settings without
+provisioning anything.
 
 ```
 { "version": 1, "checkedAt": "<iso>",
   "herdr": {"ok": true} | {"ok": false, "reason": "…"},
   "store": {"ok": true} | {"ok": false, "reason": "…"},
+  "argv": {"ok": true} | {"ok": false, "reason": "…"},
   "agents": [ { "id", "name", "state", "directory", "pane", "sessionId", "herdrStatus",
                 "blockedOn": "startup"|"permission"|"unknown"|null,
                 "ok": true|false|null, "problem": null | {"code", "text"} } ],
@@ -180,6 +185,23 @@ The check for each `on` agent is: exactly one herdr pane runs its
 | `duplicate-session` | More than one pane runs its session |
 | `restore-refused` | Not running, and an unresolved launch record explains it (the BAKR-33 case) |
 | `blocked` | Alive, in its own pane, and waiting on a dialog (`blockedOn` says which kind) |
+| `argv-mismatch` | Alive, in its own pane, but its claude was not started with the flags bakr launches it with now (BAKR-61) |
+
+`argv-mismatch` is checked last, only on an agent nothing above explains. It
+exists because of 2026-09-19: after a reboot herdr's own
+`resume_agents_on_restore` brought every agent back as a bare
+`claude --resume <id>` — same pane, same session, no channel flags — and every
+agent looked healthy while it was deaf on rocketr and yappr. herdr keeps no
+launch argv to restore with, so any restore it does is bare. The live argv
+must carry every development channel, the `--mcp-config` and the
+`--settings` approval bakr launches with (the approval compared parsed, so
+key order and whitespace never matter), run the agent's own session, and carry
+no permission bypass. The daemon checks the same thing on every reconcile
+cycle and relaunches a mismatched agent on the **same session** with its
+flags — the `relaunch` verb, so never mid-turn — at most twice in a row before
+it stops and logs an error for an operator. Setting herdr's
+`resume_agents_on_restore = false` would stop the bare resumes at the source;
+that is the operator's choice, and bakr is correct either way.
 
 `off` and `archived` agents are listed with `ok: null` and no problem — bakr
 does not keep them running, so nothing herdr shows can make one unhealthy —
@@ -192,7 +214,9 @@ neither reported in `unresolvedLaunches` nor held against the agent.
 
 **"Couldn't check" is never "down."** If herdr cannot be read, the reason
 lands on `herdr` and every agent comes out `ok: null` with `problem: null` —
-never `not-in-herdr`. If the store cannot be read, the reason lands on
+never `not-in-herdr`. If an agent's argv cannot be read (or its launch
+config cannot), that agent is `ok: null` with `problem: null` and the reason
+lands on `argv` — never `argv-mismatch`. If the store cannot be read, the reason lands on
 `store` and `agents` is empty: bakr has no second source of truth for which
 agents exist, and inventing one from a listing is precisely what this product
 forbids. A *missing* store is not a failed read — it is an empty herd.
@@ -201,7 +225,7 @@ forbids. A *missing* store is not a failed read — it is an empty herd.
 |---:|---|
 | 0 | Healthy |
 | 1 | Problems found — at least one agent has `ok: false` |
-| 2 | Something could not be checked (`herdr.ok` or `store.ok` is false) |
+| 2 | Something could not be checked (`herdr.ok`, `store.ok` or `argv.ok` is false) |
 
 The JSON is printed in every case, including both failures, so a consumer
 always has a document to read the reason out of. Exit 2 wins over exit 1: a
@@ -219,7 +243,8 @@ lists only drovr-hosted workspaces; after BAKR-35's `hostResident` swap,
 
 Speed: one `herdr agent list` — shared between the pane inventory and Drovr's
 scan, so the poll pays for exactly one — plus one `herdr agent read` per
-Claude pane, in parallel. A test measures 11 agents against the fake host at
+Claude pane and one `herdr pane process-info` per healthy `on` agent, in
+parallel. A test measures 11 agents against the fake host at
 well under the 2s budget.
 
 A plain `bakr status` (no `--json`) prints a short human summary of the same

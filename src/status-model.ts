@@ -55,8 +55,13 @@ export type BlockedOn = "startup" | "permission" | "unknown";
  * - `restore-refused` — not running, and an unresolved launch record explains
  *                      it: a restore was attempted and never resolved (BAKR-33).
  * - `blocked`        — alive, in the right pane, and stuck on a dialog.
+ * - `argv-mismatch`  — alive, in the right pane, but its claude was not
+ *                      started with the flags bakr launches it with now
+ *                      (BAKR-61: herdr's bare `claude --resume <id>` after a
+ *                      reboot — no channels, so the agent is deaf). Checked
+ *                      only on an agent nothing above already explains.
  */
-export type ProblemCode = "not-in-herdr" | "wrong-session" | "wrong-pane" | "duplicate-session" | "restore-refused" | "blocked";
+export type ProblemCode = "not-in-herdr" | "wrong-session" | "wrong-pane" | "duplicate-session" | "restore-refused" | "blocked" | "argv-mismatch";
 
 export interface Problem {
   readonly code: ProblemCode;
@@ -112,6 +117,8 @@ export interface StatusReport {
   readonly checkedAt: string;
   readonly herdr: Check;
   readonly store: Check;
+  /** BAKR-61: whether every otherwise-healthy `on` agent's live argv could be read. `ok: false` names the panes that could not be; those agents are `ok: null`. */
+  readonly argv: Check;
   readonly agents: readonly AgentStatus[];
   readonly duplicates: readonly DuplicateSession[];
   readonly orphanPanes: readonly OrphanPane[];
@@ -280,7 +287,46 @@ export function buildStatusReport(inputs: StatusInputs): StatusReport {
     excerpt: p.excerpt,
   }));
 
-  return { version: STATUS_SCHEMA_VERSION, checkedAt, herdr: herdrCheck, store: storeCheck, agents, duplicates, orphanPanes, unresolvedLaunches, blockedPrompts };
+  return { version: STATUS_SCHEMA_VERSION, checkedAt, herdr: herdrCheck, store: storeCheck, argv: { ok: true }, agents, duplicates, orphanPanes, unresolvedLaunches, blockedPrompts };
+}
+
+/**
+ * What reading one agent's live argv found (BAKR-61): it matches, it does not
+ * (`reason` names every difference), or it could not be read or compared
+ * (`ok: null` — couldn't check, never a mismatch).
+ */
+export type ArgvObservation = { readonly ok: true } | { readonly ok: false; readonly reason: string } | { readonly ok: null; readonly reason: string };
+
+/**
+ * The agents `applyArgvVerdicts` judges: `on`, and healthy by every other
+ * check, so the argv is read only where a pane runs the agent's own session and
+ * nothing else already explains a problem. Their argv is read from `pane`.
+ */
+export const argvCandidates = (report: StatusReport): readonly AgentStatus[] =>
+  report.agents.filter((a) => a.state === "on" && a.ok === true && a.pane !== null && a.sessionId !== null);
+
+/**
+ * Folds argv observations, keyed by agent id, into the report. A mismatch
+ * makes the agent `ok: false` with `argv-mismatch`; an observation that could
+ * not be made makes it `ok: null` and fails the top-level `argv` check, so the
+ * exit code is 2 — the same "couldn't check is not down" rule as a failed
+ * herdr read, never a clean bill of health it has not earned. An agent with
+ * no observation is left exactly as it was.
+ */
+export function applyArgvVerdicts(report: StatusReport, observed: ReadonlyMap<string, ArgvObservation>): StatusReport {
+  const unreadable: string[] = [];
+  const agents = report.agents.map((agent): AgentStatus => {
+    const seen = observed.get(agent.id);
+    if (seen === undefined || agent.ok !== true) return agent;
+    if (seen.ok === true) return agent;
+    if (seen.ok === null) {
+      unreadable.push(`${agent.id} (pane ${agent.pane}): ${seen.reason}`);
+      return { ...agent, ok: null, problem: null };
+    }
+    return { ...agent, ok: false, problem: { code: "argv-mismatch", text: `pane ${agent.pane} is running session ${agent.sessionId} without the flags bakr launches it with: ${seen.reason}` } };
+  });
+  const argv: Check = unreadable.length === 0 ? { ok: true } : { ok: false, reason: `could not check the live argv of ${unreadable.join("; ")}` };
+  return { ...report, argv, agents };
 }
 
 export const EXIT_STATUS_HEALTHY = 0;
@@ -297,7 +343,7 @@ export const EXIT_STATUS_UNCHECKABLE = 2;
  * always also lands on that agent as a `problem`.
  */
 export function statusExitCode(report: StatusReport): number {
-  if (!report.herdr.ok || !report.store.ok) return EXIT_STATUS_UNCHECKABLE;
+  if (!report.herdr.ok || !report.store.ok || !report.argv.ok) return EXIT_STATUS_UNCHECKABLE;
   return report.agents.some((a) => a.ok === false) ? EXIT_STATUS_PROBLEMS : EXIT_STATUS_HEALTHY;
 }
 
@@ -306,6 +352,7 @@ export function renderStatusText(report: StatusReport): string {
   const lines: string[] = [`checked at ${report.checkedAt}`];
   if (!report.herdr.ok) lines.push(`herdr: COULD NOT CHECK — ${report.herdr.reason}`);
   if (!report.store.ok) lines.push(`store: COULD NOT CHECK — ${report.store.reason}`);
+  if (!report.argv.ok) lines.push(`argv: COULD NOT CHECK — ${report.argv.reason}`);
   if (report.agents.length === 0) lines.push("no agents");
   for (const agent of report.agents) {
     const mark = agent.ok === true ? "ok" : agent.ok === false ? "PROBLEM" : "not checked";

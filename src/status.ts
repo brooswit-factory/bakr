@@ -1,15 +1,20 @@
-// BAKR-48: the impure half of `bakr status` — two reads, in parallel, and
-// nothing else. The decisions all live in status-model.ts.
+// BAKR-48: the impure half of `bakr status` — two reads, in parallel, then
+// one argv read per healthy agent (BAKR-61), and nothing else. The decisions
+// all live in status-model.ts and argv-check.ts.
 //
 // STRICTLY READ-ONLY, and the reason is the whole point of the command: the
 // dashboard polls this every ~10 seconds, so anything it did as a side effect
 // would be done 8,640 times a day to a live herd.
 //   - herdr: `agent list` ONCE, plus one `agent read` per Claude pane (drovr's
-//     `listBlockingPrompts`). NO other herdr command — in particular NOT
-//     `pane process-info`, which is why this does not reuse `herdrList`
-//     (spawn/herdr.ts): that helper runs one process-info per pane for a pid
-//     this report has no use for. The single listing is SHARED between the
-//     pane inventory and drovr's scan, so polling costs one list and N reads.
+//     `listBlockingPrompts`), plus one `pane process-info` per `on` agent
+//     that every other check calls healthy (BAKR-61: its live argv, compared
+//     with the flags bakr would launch it with). NO other herdr command, and
+//     no process-info for any other pane, which is why this does not reuse
+//     `herdrList` (spawn/herdr.ts). The single listing is SHARED between the
+//     pane inventory and drovr's scan, so polling costs one list, N reads and
+//     at most one process-info per healthy agent.
+//   - each healthy agent's launch config: its `.mcp.json` and settings, read
+//     through `expectedClaudeLaunchArgs`, which provisions nothing.
 //   - the store: one plain `load`, no lock at all. `save` is an atomic
 //     temp+rename, so a reader sees either the whole old file or the whole new
 //     one — never a torn write — and taking even a shared lock would let a
@@ -21,17 +26,22 @@
 // because drovr's `listResidents` lists only drovr-hosted workspaces. When
 // BAKR-35 lands, `listPanes` below is the one function to replace.
 
-import { emptyAgentStore, isSupersededStaleCwdRespawnFailure, type LaunchRecord } from "./agent-model";
+import { emptyAgentStore, isSupersededStaleCwdRespawnFailure, type AgentRecord, type LaunchRecord } from "./agent-model";
 import { load as loadAgents } from "./agent-store-io";
-import { isRecognizedStaleCwdRefusal, type RunCommand } from "./spawn";
+import { isRecognizedStaleCwdRefusal, readPaneArgv, type RunCommand } from "./spawn";
 import { herdrApprovalClient, type ApprovalClient } from "./cli/herdr-transport";
-import { buildStatusReport, type BlockingPromptInfo, type HerdrPane, type StatusInputs, type StatusReport } from "./status-model";
+import { applyArgvVerdicts, argvCandidates, buildStatusReport, type ArgvObservation, type BlockingPromptInfo, type HerdrPane, type StatusInputs, type StatusReport } from "./status-model";
+import { checkAgentArgv } from "./argv-check";
+import { expectedClaudeLaunchArgs, type LaunchConfigDeps } from "./launch-config";
+import { realLaunchConfigDeps } from "./paths";
 import { listBlockingPrompts } from "@brooswit/drovr";
 
 export interface StatusDeps {
   readonly agentsPath: string;
   readonly runCommand: RunCommand;
   readonly now: () => number;
+  /** Where an agent's `.mcp.json` and settings are read from, for the flags it should run with. Defaults to the real filesystem; read only, never provisioned. */
+  readonly launchConfigDeps?: LaunchConfigDeps;
 }
 
 const message = (err: unknown): string => err instanceof Error ? err.message : String(err);
@@ -92,10 +102,32 @@ async function readStore(agentsPath: string): Promise<StatusInputs["store"]> {
   }
 }
 
+/**
+ * One agent's live argv against the flags bakr would launch it with now. A
+ * process-info that fails, or a launch config that cannot be read, is
+ * `ok: null` — couldn't check — never a mismatch.
+ */
+async function observeArgv(agent: AgentRecord, pane: string, sessionId: string, deps: StatusDeps): Promise<ArgvObservation> {
+  const [live, expected] = await Promise.all([
+    readPaneArgv(pane, deps.runCommand),
+    expectedClaudeLaunchArgs(agent.directory, deps.launchConfigDeps ?? realLaunchConfigDeps, agent.mcp).then((args) => ({ ok: true as const, args }), (err: unknown) => ({ ok: false as const, reason: message(err) })),
+  ]);
+  if (!live.ok) return { ok: null, reason: live.reason };
+  if (!expected.ok) return { ok: null, reason: `could not read the launch config of ${agent.directory}: ${expected.reason}` };
+  return checkAgentArgv(expected.args, live.argv, sessionId);
+}
+
 /** The whole read-only health report. Neither read can fail the other: both are attempted, both report for themselves. */
 export async function collectStatus(deps: StatusDeps): Promise<StatusReport> {
   const [herdr, store] = await Promise.all([readHerdr(deps.runCommand), readStore(deps.agentsPath)]);
   const isSuperseded = (record: LaunchRecord): boolean =>
     store.ok && isSupersededStaleCwdRespawnFailure(store.state, record, isRecognizedStaleCwdRefusal);
-  return buildStatusReport({ checkedAt: deps.now(), herdr, store, isSuperseded });
+  const report = buildStatusReport({ checkedAt: deps.now(), herdr, store, isSuperseded });
+  if (!store.ok) return report;
+  const observed = new Map<string, ArgvObservation>();
+  await Promise.all(argvCandidates(report).map(async (a) => {
+    const agent = store.state.agents[a.id];
+    if (agent !== undefined) observed.set(a.id, await observeArgv(agent, a.pane!, a.sessionId!, deps));
+  }));
+  return applyArgvVerdicts(report, observed);
 }
