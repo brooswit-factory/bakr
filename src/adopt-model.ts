@@ -9,11 +9,23 @@
 // agent-model.ts deliberately ships no "adopt" verb of its own (see its own
 // module comment) — this file is that verb's validated core, built on the
 // low-level primitives agent-model.ts DOES ship: `setAgentDirectory`,
-// `discardLaunchRecordsForAgents`, `resetRestoreAttempts`,
-// `checkNameAvailability`, `lookupAgentById`.
+// `discardLaunchRecordsForAgents`, `resetRestoreAttempts`, `lookupAgentById`.
+//
+// BAKR-34/BAKR-42 (R9): custom names, and the per-directory name-collision
+// check that used to run here, are retired along with `checkNameAvailability`
+// — a name is now derived from an agent's directory (R1/R3, agent-name.ts),
+// so there is no longer a custom-name value for two agents to collide over.
+// `adopt` still moves however many named agents into `destination` in one
+// transition, same as before; if that leaves more than one non-archived
+// agent sharing a directory, that is the identical legacy shape R6 already
+// requires the store to keep loading through (resolving that directory's
+// derived name AMBIGUOUS rather than refusing the move outright) — adopt is
+// not where BAKR-42 draws its one-per-directory line (`create`, and
+// `bakr <real path>` when it would create, are — see agent-lifecycle.ts's
+// `decideCreate`).
 
 import type { ClaimKey } from "./claim-key-resolve";
-import { type AgentRecord, type AgentStoreState, checkNameAvailability, discardLaunchRecordsForAgents, lookupAgentById, resetRestoreAttempts, setAgentDirectory } from "./agent-model";
+import { type AgentRecord, type AgentStoreState, discardLaunchRecordsForAgents, lookupAgentById, resetRestoreAttempts, setAgentDirectory } from "./agent-model";
 
 // --- The refusal set (B11) ---------------------------------------------
 
@@ -44,8 +56,7 @@ export type AdoptRefusal =
   | { readonly ok: false; readonly reason: "destination-missing"; readonly message: string }
   | { readonly ok: false; readonly reason: "destination-not-a-directory"; readonly message: string }
   | { readonly ok: false; readonly reason: "unknown-agent"; readonly message: string; readonly agentIds: readonly string[] }
-  | { readonly ok: false; readonly reason: "agent-not-in-source"; readonly message: string; readonly agents: readonly { readonly id: string; readonly currentDirectory: ClaimKey }[] }
-  | { readonly ok: false; readonly reason: "name-collision"; readonly message: string; readonly conflicts: readonly { readonly agentId: string; readonly name: string; readonly heldBy: string }[] };
+  | { readonly ok: false; readonly reason: "agent-not-in-source"; readonly message: string; readonly agents: readonly { readonly id: string; readonly currentDirectory: ClaimKey }[] };
 
 /** One entry per launch record adoption discarded (B13/Q5) — reported so the clearing is never silent (B13's own requirement). `error` is `undefined` when the record was still pending (no outcome recorded yet) rather than given up on. */
 export interface ClearedLaunchRecord {
@@ -118,27 +129,6 @@ export function validateAdopt(inputs: AdoptInputs): AdoptValidation {
       reason: "agent-not-in-source",
       message: `these agents do not currently live in "${source}" — either this id was never there, or a concurrent adopt already moved it: ${notInSource.map((a) => `${a.id} (now in "${a.currentDirectory}")`).join(", ")}`,
       agents: notInSource,
-    };
-  }
-
-  const conflicts: { agentId: string; name: string; heldBy: string }[] = [];
-  for (const id of agentIds) {
-    const agent = agentState.agents[id] as AgentRecord;
-    if (agent.name === undefined) continue;
-    // Every named agent currently lives in `source` (just proved above), so
-    // it cannot be its own collision target in `destination` — no
-    // `excludingAgentId` is needed, unlike a rename's own availability check.
-    const availability = checkNameAvailability(agentState, destination, agent.name);
-    if (!availability.ok) {
-      conflicts.push({ agentId: id, name: agent.name, heldBy: availability.heldBy.id });
-    }
-  }
-  if (conflicts.length > 0) {
-    return {
-      ok: false,
-      reason: "name-collision",
-      message: `these names are already held in the destination "${destination}" (archived agents keep their names — B4): ${conflicts.map((c) => `"${c.name}" (wanted by ${c.agentId}, held by ${c.heldBy})`).join(", ")}`,
-      conflicts,
     };
   }
 

@@ -88,20 +88,21 @@ import {
   type AgentStoreState,
   type AttemptKey,
   type LaunchRecord,
+  type RefClassification,
 } from "./agent-model";
 import { load, withAgentStoreLock } from "./agent-store-io";
 import {
   decideArchive,
   decideAttachTarget,
-  decideCreateName,
+  decideCreate,
   decideDelete,
   decideOff,
   decideOn,
-  decideRename,
   decideUnarchive,
   resolveOrRefuse,
   type ResolutionRefusal,
 } from "./agent-lifecycle";
+import { computeAgentNames, type AgentNames } from "./agent-name";
 import { launch, listBackgroundSessions, isHerdrPaneId, decideLiveness, isPidAlive, respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal, stopSession, type RunCommand, type BackgroundSessionInfo } from "./spawn";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
 import { realTranscriptProbeDeps, realLaunchConfigDeps, realResumeCwdDeps, realReadTranscript } from "./paths";
@@ -267,13 +268,11 @@ async function recordStopOutcome(_deps: AgentActionDeps, _agentId: string, _stop
 
 export type CreateResult =
   | StoreMalformed
-  | { readonly ok: false; readonly reason: "empty" | "contains-at" | "reserved"; readonly message: string }
-  | { readonly ok: false; readonly reason: "taken"; readonly message: string; readonly heldBy: AgentRecord }
+  | { readonly ok: false; readonly reason: "directory-occupied"; readonly message: string; readonly agent: AgentRecord }
   | { readonly ok: true; readonly agent: AgentRecord; readonly launch: { readonly ok: true; readonly launchShortId: string } | { readonly ok: false; readonly error: string } };
 
 type CreateLockResult =
-  | { readonly ok: false; readonly reason: "empty" | "contains-at" | "reserved"; readonly message: string }
-  | { readonly ok: false; readonly reason: "taken"; readonly message: string; readonly heldBy: AgentRecord }
+  | { readonly ok: false; readonly reason: "directory-occupied"; readonly message: string; readonly agent: AgentRecord }
   | { readonly ok: true; readonly agent: AgentRecord; readonly attemptId: string };
 
 /**
@@ -286,17 +285,23 @@ type CreateLockResult =
  * is still resolved the one way every launch is: by a later listing (see
  * `list`, or the daemon's own next cycle). The returned
  * `launch.launchShortId` is the session's herdr pane id.
+ *
+ * BAKR-34/BAKR-42 R1/R9: `name` is gone from this signature — an agent's
+ * name is always derived from `directory` at read time (agent-name.ts), so
+ * every newly created `AgentRecord.name` is `undefined`. R6: refuses when a
+ * non-archived agent already exists for `directory` (`decideCreate`,
+ * agent-lifecycle.ts) — an archived one there does not block it.
  */
-export async function create(deps: AgentActionDeps, directory: ClaimKey, name?: string, mcp?: readonly McpServerDeclaration[]): Promise<CreateResult> {
+export async function create(deps: AgentActionDeps, directory: ClaimKey, mcp?: readonly McpServerDeclaration[]): Promise<CreateResult> {
   const decided = await withAgentStoreLock<CreateLockResult>(
     deps.agentsPath,
     (current) => {
-      const nameCheck = decideCreateName(current, directory, name);
-      if (!nameCheck.ok) {
-        return { state: current, result: nameCheck };
+      const occupancy = decideCreate(current, directory);
+      if (!occupancy.ok) {
+        return { state: current, result: occupancy };
       }
       const id = mintUniqueAgentId(current, deps.randomBytes);
-      const agent: AgentRecord = { id, name, directory, state: "on", createdAt: deps.now(), birthSessionId: undefined, restoreTarget: undefined, ...(mcp === undefined ? {} : { mcp }) };
+      const agent: AgentRecord = { id, name: undefined, directory, state: "on", createdAt: deps.now(), birthSessionId: undefined, restoreTarget: undefined, ...(mcp === undefined ? {} : { mcp }) };
       let next = putAgent(current, agent);
       const attemptId = deps.generateAttemptId();
       next = beginLaunch(next, id, directory, undefined, attemptId, deps.now());
@@ -425,7 +430,7 @@ type OnLockResult =
  * thing that test structurally cannot catch, and it would have sent
  * BAKR-23 looking for a function that no longer exists.)
  */
-export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<OnResult> {
+export async function on(deps: AgentActionDeps, classification: RefClassification): Promise<OnResult> {
   // Fetched ONCE, outside any lock, before the decision — mirrors
   // daemon.ts's own "one listing per cycle" discipline. Every field access
   // below reads this same snapshot; nothing here issues a second listing.
@@ -453,7 +458,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
   const decided = await withAgentStoreLock<OnLockResult>(
     deps.agentsPath,
     (current) => {
-      const decision = decideOn(current, directory, ref);
+      const decision = decideOn(current, classification);
       if (!decision.ok) {
         return { state: current, result: decision };
       }
@@ -486,7 +491,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
         }
         next = cleared;
         const attemptId = deps.generateAttemptId();
-        next = beginLaunch(next, agentId, directory, attemptKey, attemptId, deps.now());
+        next = beginLaunch(next, agentId, decision.agent.directory, attemptKey, attemptId, deps.now());
         const launchPlan: OnLaunchPlan =
           plan.kind === "fresh"
             ? { kind: "issue-fresh", attemptId }
@@ -530,7 +535,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
       }
 
       const attemptId = deps.generateAttemptId();
-      next = beginLaunch(next, agentId, directory, attemptKey, attemptId, deps.now());
+      next = beginLaunch(next, agentId, decision.agent.directory, attemptKey, attemptId, deps.now());
       const launchPlan: OnLaunchPlan =
         plan.kind === "fresh"
           ? { kind: "issue-fresh", attemptId }
@@ -545,7 +550,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
   if (!result.ok) return result;
   if (result.launch.kind === "issue-fresh") {
     const { attemptId } = result.launch;
-    const launchResult = await launch(directory, await configuredLaunchArgs(deps, directory, result.agent.id), { runCommand: deps.runCommand, label: result.agent.id });
+    const launchResult = await launch(result.agent.directory, await configuredLaunchArgs(deps, result.agent.directory, result.agent.id), { runCommand: deps.runCommand, label: result.agent.id });
     await withAgentStoreLock(
       deps.agentsPath,
       (current) => ({
@@ -557,7 +562,7 @@ export async function on(deps: AgentActionDeps, directory: ClaimKey, ref: string
     return { ok: true, kind: result.kind, agent: result.agent, launchWedgeCleared: result.launchWedgeCleared, forkWedgeCleared: result.forkWedgeCleared, launchIssued: true };
   }
   if (result.launch.kind === "issue-respawn") {
-    const recovery = await dispatchRespawn(deps, directory, result.agent.id, result.launch.attemptId, result.launch.shortId, result.launch.restoreSessionId);
+    const recovery = await dispatchRespawn(deps, result.agent.directory, result.agent.id, result.launch.attemptId, result.launch.shortId, result.launch.restoreSessionId);
     // "respawned" is the ordinary, unremarkable path — `recovery` is
     // reported only for the three shapes worth an operator's attention
     // (an escape happened, or the attempt was refused outright), never
@@ -710,11 +715,11 @@ type OffLockResult =
   | { readonly ok: true; readonly kind: "turn-off"; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined };
 
 /** on -> off (B6), stopping the agent's own session (B9). See the module comment for the record-intent / stop-unlocked / record-outcome three-step and why that ordering is the asymmetric-safe one (BAKR-17 Q2). */
-export async function off(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<OffResult> {
+export async function off(deps: AgentActionDeps, classification: RefClassification): Promise<OffResult> {
   const recorded = await withAgentStoreLock<OffLockResult>(
     deps.agentsPath,
     (current) => {
-      const decision = decideOff(current, directory, ref);
+      const decision = decideOff(current, classification);
       if (!decision.ok || decision.kind === "no-change") {
         return { state: current, result: decision };
       }
@@ -767,11 +772,11 @@ type ArchiveLockResult =
  * ever act on; left in place, it would sit forever, re-logged as an ERROR
  * on every daemon start.
  */
-export async function archive(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<ArchiveResult> {
+export async function archive(deps: AgentActionDeps, classification: RefClassification): Promise<ArchiveResult> {
   const recorded = await withAgentStoreLock<ArchiveLockResult>(
     deps.agentsPath,
     (current) => {
-      const decision = decideArchive(current, directory, ref);
+      const decision = decideArchive(current, classification);
       if (!decision.ok || decision.kind === "no-change") {
         return { state: current, result: decision };
       }
@@ -801,11 +806,11 @@ export type UnarchiveResult =
   | { readonly ok: true; readonly agent: AgentRecord };
 
 /** archived -> off, NEVER on (B6). No session-stopping — an archived agent already has none. */
-export async function unarchive(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<UnarchiveResult> {
+export async function unarchive(deps: AgentActionDeps, classification: RefClassification): Promise<UnarchiveResult> {
   const decided = await withAgentStoreLock<UnarchiveResult>(
     deps.agentsPath,
     (current) => {
-      const decision = decideUnarchive(current, directory, ref);
+      const decision = decideUnarchive(current, classification);
       if (!decision.ok) {
         return { state: current, result: decision };
       }
@@ -817,35 +822,8 @@ export async function unarchive(deps: AgentActionDeps, directory: ClaimKey, ref:
   return decided.result;
 }
 
-// --- rename / name -------------------------------------------------------
-
-export type RenameResult =
-  | StoreMalformed
-  | ResolutionRefusal
-  | { readonly ok: false; readonly reason: "empty" | "contains-at" | "reserved"; readonly message: string }
-  | { readonly ok: false; readonly reason: "taken"; readonly message: string; readonly heldBy: AgentRecord }
-  | { readonly ok: true; readonly kind: "no-change"; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "renamed"; readonly agent: AgentRecord };
-
-/** ONE function, not two (BAKR-17 doc) — `name` below is a plain alias, never a second implementation. Enforces per-directory uniqueness including archived holders (B4) and the reserved list (B5); moves nothing (R16). */
-export async function rename(deps: AgentActionDeps, directory: ClaimKey, ref: string, newName: string): Promise<RenameResult> {
-  const decided = await withAgentStoreLock<RenameResult>(
-    deps.agentsPath,
-    (current) => {
-      const decision = decideRename(current, directory, ref, newName);
-      if (!decision.ok || decision.kind === "no-change") {
-        return { state: current, result: decision };
-      }
-      return { state: putAgent(current, decision.agent), result: decision };
-    },
-    lockOpts(deps)
-  );
-  if (decided.status === "malformed") return { ok: false, reason: "store-malformed", message: decided.error };
-  return decided.result;
-}
-
-/** Alias for `rename`, for a caller naming a previously-unnamed agent — see `rename`'s own doc for why this is not a second implementation. */
-export const name = rename;
+// --- name / rename: RETIRED (R9) — an agent's name is always derived from
+// its directory now (R1/R3). See agent-lifecycle.ts's module comment.
 
 // --- mcp -------------------------------------------------------------------
 
@@ -870,7 +848,7 @@ export type McpResult =
  * it. Never starts or stops anything; `relaunch` carries a changed
  * subscription into a running agent.
  */
-export async function mcp(deps: AgentActionDeps, directory: ClaimKey, ref: string, declaration?: readonly McpServerDeclaration[] | null): Promise<McpResult> {
+export async function mcp(deps: AgentActionDeps, classification: RefClassification, declaration?: readonly McpServerDeclaration[] | null): Promise<McpResult> {
   const launchDeps = deps.launchConfigDeps ?? realLaunchConfigDeps;
   const describe = async (agent: AgentRecord) => {
     const access = await resolveMcpAccess(agent.directory, launchDeps, agent.mcp);
@@ -879,14 +857,14 @@ export async function mcp(deps: AgentActionDeps, directory: ClaimKey, ref: strin
   if (declaration === undefined) {
     const loaded = await load(deps.agentsPath);
     if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
-    const resolved = resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), directory, ref);
+    const resolved = resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), classification);
     return resolved.ok ? { ok: true, agent: resolved.agent, changed: false, ...(await describe(resolved.agent)) } : resolved;
   }
   const next = declaration ?? undefined;
   const decided = await withAgentStoreLock<ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord; readonly changed: boolean }>(
     deps.agentsPath,
     (current) => {
-      const resolved = resolveOrRefuse(current, directory, ref);
+      const resolved = resolveOrRefuse(current, classification);
       if (!resolved.ok) return { state: current, result: resolved };
       const changed = JSON.stringify(resolved.agent.mcp) !== JSON.stringify(next);
       const updated = setAgentMcp(current, resolved.agent.id, next);
@@ -925,11 +903,11 @@ export type DeleteResult =
  * file, references it — conversations stay exactly where Claude Code keeps
  * them; only bakr's own record of the agent is removed.
  */
-export async function deleteAgent(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<DeleteResult> {
+export async function deleteAgent(deps: AgentActionDeps, classification: RefClassification): Promise<DeleteResult> {
   const recorded = await withAgentStoreLock<ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined; readonly launches: readonly LaunchRecord[] }>(
     deps.agentsPath,
     (current) => {
-      const decision = decideDelete(current, directory, ref);
+      const decision = decideDelete(current, classification);
       if (!decision.ok) {
         return { state: current, result: decision };
       }
@@ -1021,15 +999,16 @@ const RELAUNCH_POLL_MS = 500;
  * off), or is the caller's own session (`selfSessionId`: relaunching it would
  * kill the process asking).
  */
-export async function relaunch(deps: AgentActionDeps, directory: ClaimKey, ref: string, opts: { readonly selfSessionId?: string } = {}): Promise<RelaunchResult> {
+export async function relaunch(deps: AgentActionDeps, classification: RefClassification, opts: { readonly selfSessionId?: string } = {}): Promise<RelaunchResult> {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const pidAlive = deps.isPidAlive ?? isPidAlive;
 
   const loaded = await load(deps.agentsPath);
   if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
-  const found = resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), directory, ref);
+  const found = resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), classification);
   if (!found.ok) return found;
   const agent = found.agent;
+  const directory = agent.directory;
   const target = agent.restoreTarget;
   if (agent.state !== "on") return { ok: false, reason: "not-on", message: `agent ${agent.id} is ${agent.state}; relaunch only replaces a running agent's session (use "on")`, agent };
   if (target === undefined) return { ok: false, reason: "no-session", message: `agent ${agent.id} has no session yet; nothing to relaunch`, agent };
@@ -1167,21 +1146,40 @@ export type AttachTargetResult =
   | { readonly ok: false; readonly reason: "archived" | "off" | "not-yet-live"; readonly message: string; readonly agent: AgentRecord }
   | { readonly ok: true; readonly agent: AgentRecord; readonly restoreSessionId: string; readonly birthSessionId: string };
 
-/** Resolves `<id|name>` in `directory` and decides whether it is attachable NOW — never attaches, never touches a terminal, never starts anything. Read-only, same as `list`. */
-export async function attachTarget(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<AttachTargetResult> {
+/** Resolves a ref GLOBALLY (R4) and decides whether it is attachable NOW — never attaches, never touches a terminal, never starts anything. Read-only, same as `list`. */
+export async function attachTarget(deps: AgentActionDeps, classification: RefClassification): Promise<AttachTargetResult> {
   const loaded = await load(deps.agentsPath);
   if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
   const state: AgentStoreState = loaded.status === "loaded" ? loaded.state : emptyAgentStore();
-  return decideAttachTarget(state, directory, ref);
+  return decideAttachTarget(state, classification);
+}
+
+// --- names (BAKR-34/BAKR-42): the current derived-name set, for display ---
+
+export type AgentNamesResult = StoreMalformed | { readonly ok: true; readonly names: AgentNames };
+
+/**
+ * The GLOBAL derived-name set (agent-name.ts) — deliberately NOT
+ * directory-scoped, unlike `list`: collision growth (R3) depends on every
+ * non-archived agent's directory across the whole store, not just one
+ * directory's worth. `bakr list`'s own label, and any other display of an
+ * agent's current name, should go through this rather than reading
+ * `agent.name` (legacy-only — see agent-model.ts's module comment).
+ */
+export async function agentNames(deps: AgentActionDeps): Promise<AgentNamesResult> {
+  const loaded = await load(deps.agentsPath);
+  if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
+  const state: AgentStoreState = loaded.status === "loaded" ? loaded.state : emptyAgentStore();
+  return { ok: true, names: computeAgentNames(Object.values(state.agents)) };
 }
 
 // --- resolve only (a query about an agent, whatever its state) --------------
 
 export type ResolveTargetResult = StoreMalformed | ResolutionRefusal | { readonly ok: true; readonly agent: AgentRecord };
 
-/** Resolves `<id|name>` in `directory` with the same refusals every verb gives, and decides nothing about its state. Read-only. */
-export async function resolveTarget(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<ResolveTargetResult> {
+/** Resolves a ref GLOBALLY (R4) with the same refusals every verb gives, and decides nothing about its state. Read-only. */
+export async function resolveTarget(deps: AgentActionDeps, classification: RefClassification): Promise<ResolveTargetResult> {
   const loaded = await load(deps.agentsPath);
   if (loaded.status === "malformed") return { ok: false, reason: "store-malformed", message: loaded.error };
-  return resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), directory, ref);
+  return resolveOrRefuse(loaded.status === "loaded" ? loaded.state : emptyAgentStore(), classification);
 }

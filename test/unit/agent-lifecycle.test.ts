@@ -6,22 +6,23 @@
 // file — everything here is a pure function of a store snapshot.
 
 import { describe, expect, test } from "bun:test";
-import { type AgentRecord, emptyAgentStore, putAgent, type AgentStoreState } from "../../src/agent-model";
+import { type AgentRecord, type RefClassification, emptyAgentStore, putAgent, type AgentStoreState } from "../../src/agent-model";
 import {
   decideArchive,
   decideAttachTarget,
-  decideCreateName,
+  decideCreate,
   decideDelete,
-  decideName,
   decideOff,
   decideOn,
-  decideRename,
   decideUnarchive,
 } from "../../src/agent-lifecycle";
 import type { ClaimKey } from "../../src/claim-key-resolve";
 
 const DIR_A = "/home/alice/project" as ClaimKey;
 const DIR_B = "/home/alice/other" as ClaimKey;
+const byId = (ref: string): RefClassification => ({ kind: "id", ref });
+const byName = (ref: string): RefClassification => ({ kind: "name", ref });
+const byDirectory = (directory: ClaimKey): RefClassification => ({ kind: "directory", directory });
 
 function makeAgent(overrides: Partial<AgentRecord> & { id: string }): AgentRecord {
   return {
@@ -41,26 +42,26 @@ function storeWith(...agents: AgentRecord[]): AgentStoreState {
   return state;
 }
 
-// --- Shared resolution: not-found / found-elsewhere, exercised through every verb ---
+// --- Shared resolution: not-found / ambiguous / renamed, exercised through every verb (R4/R6/R8) ---
 
 describe("resolution, shared by every verb", () => {
   test("not-found: unknown id", () => {
     const state = storeWith(makeAgent({ id: "@a1" }));
-    const decision = decideOn(state, DIR_A, "@doesnotexist00000");
+    const decision = decideOn(state, byId("@doesnotexist00000"));
     expect(decision.ok).toBe(false);
     if (!decision.ok) expect(decision.reason).toBe("not-found");
   });
 
   test("not-found: unknown name", () => {
     const state = storeWith(makeAgent({ id: "@a1", name: "real" }));
-    const decision = decideOn(state, DIR_A, "notreal");
+    const decision = decideOn(state, byName("notreal"));
     expect(decision.ok).toBe(false);
     if (!decision.ok) expect(decision.reason).toBe("not-found");
   });
 
   test("not-found message names the id as deleted when it is in retiredIds (delete's own note)", () => {
     const state = { ...emptyAgentStore(), retiredIds: ["@retired00000000000"] };
-    const decision = decideOn(state, DIR_A, "@retired00000000000");
+    const decision = decideOn(state, byId("@retired00000000000"));
     expect(decision.ok).toBe(false);
     if (!decision.ok && decision.reason === "not-found") {
       expect(decision.message).toContain("deleted");
@@ -69,26 +70,47 @@ describe("resolution, shared by every verb", () => {
     }
   });
 
-  test("found-elsewhere: an id exists, but in a different directory — NOT flattened into not-found", () => {
-    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_B }));
-    const decision = decideOn(state, DIR_A, "@a1");
+  test("R4: an id resolves globally — no directory input exists to be 'elsewhere' from any more", () => {
+    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_B, state: "off" }));
+    const decision = decideOn(state, byId("@a1"));
+    expect(decision.ok).toBe(true);
+  });
+
+  test("R4: a name resolves against the CURRENT global derived-name set (DIR_B's derived name is 'alice/other')", () => {
+    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_B, state: "off" }));
+    const decision = decideOn(state, byName("alice/other"));
+    expect(decision.ok).toBe(true);
+  });
+
+  test("R6: a directory (real-path ref) held by two non-archived agents refuses AMBIGUOUS, naming both @ids — never bricks, never picks one arbitrarily", () => {
+    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_A }), makeAgent({ id: "@a2", directory: DIR_A }));
+    const decision = decideOn(state, byDirectory(DIR_A));
     expect(decision.ok).toBe(false);
-    if (!decision.ok) {
-      expect(decision.reason).toBe("found-elsewhere");
-      if (decision.reason === "found-elsewhere") expect(decision.directory).toBe(DIR_B);
+    if (!decision.ok && decision.reason === "ambiguous") {
+      expect([...decision.agentIds].sort()).toEqual(["@a1", "@a2"]);
+    } else {
+      throw new Error("expected ambiguous");
     }
   });
 
-  test("a name never resolves outside its own directory scope (not found-elsewhere, genuinely not-found)", () => {
-    const state = storeWith(makeAgent({ id: "@a1", name: "bob", directory: DIR_B }));
-    const decision = decideOn(state, DIR_A, "bob");
+  test("R8: a stale legacy `name` refuses 'renamed', naming the current derived name, and changes nothing", () => {
+    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_A, name: "old-custom-name", state: "off" }));
+    const decision = decideOn(state, byName("old-custom-name"));
     expect(decision.ok).toBe(false);
-    if (!decision.ok) expect(decision.reason).toBe("not-found");
+    if (!decision.ok && decision.reason === "renamed") {
+      expect(decision.derivedName).toBe("alice/project");
+      expect(decision.message).toContain("alice/project");
+    } else {
+      throw new Error("expected renamed");
+    }
+    // Nothing changed: the agent is still off, still named "old-custom-name" in the store.
+    expect(state.agents["@a1"]?.state).toBe("off");
+    expect(state.agents["@a1"]?.name).toBe("old-custom-name");
   });
 
-  test("CONTROL: a real, in-scope id resolves", () => {
+  test("CONTROL: a real, resolvable id resolves", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "off" }));
-    const decision = decideOn(state, DIR_A, "@a1");
+    const decision = decideOn(state, byId("@a1"));
     expect(decision.ok).toBe(true);
   });
 });
@@ -98,14 +120,14 @@ describe("resolution, shared by every verb", () => {
 describe("decideOn", () => {
   test("refused while archived — never a silent unarchive", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "archived" }));
-    const decision = decideOn(state, DIR_A, "@a1");
+    const decision = decideOn(state, byId("@a1"));
     expect(decision.ok).toBe(false);
     if (!decision.ok) expect(decision.reason).toBe("archived");
   });
 
   test("already on: wasOff is false, agent unchanged (the launch-record wedge check is agent-actions.ts's job, not this pure function's)", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "sess-1", shortId: "sess-1s" } }));
-    const decision = decideOn(state, DIR_A, "@a1");
+    const decision = decideOn(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok) {
       expect(decision.wasOff).toBe(false);
@@ -116,7 +138,7 @@ describe("decideOn", () => {
 
   test("CONTROL: off -> on with a restoreTarget respawns that short id", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "off", restoreTarget: { sessionId: "sess-1", shortId: "sess-1s" } }));
-    const decision = decideOn(state, DIR_A, "@a1");
+    const decision = decideOn(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok) {
       expect(decision.wasOff).toBe(true);
@@ -127,7 +149,7 @@ describe("decideOn", () => {
 
   test("off -> on with NO restoreTarget yet is a fresh launch (plan.kind === 'fresh')", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "off", restoreTarget: undefined }));
-    const decision = decideOn(state, DIR_A, "@a1");
+    const decision = decideOn(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok) {
       expect(decision.wasOff).toBe(true);
@@ -141,21 +163,21 @@ describe("decideOn", () => {
 describe("decideOff", () => {
   test("refused while archived (interpretation call: symmetric with on-while-archived)", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "archived" }));
-    const decision = decideOff(state, DIR_A, "@a1");
+    const decision = decideOff(state, byId("@a1"));
     expect(decision.ok).toBe(false);
     if (!decision.ok) expect(decision.reason).toBe("archived");
   });
 
   test("no-change: already off", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "off" }));
-    const decision = decideOff(state, DIR_A, "@a1");
+    const decision = decideOff(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok) expect(decision.kind).toBe("no-change");
   });
 
   test("CONTROL: on -> off captures the live session id to stop", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-1", shortId: "live-1s" } }));
-    const decision = decideOff(state, DIR_A, "@a1");
+    const decision = decideOff(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok && decision.kind === "turn-off") {
       expect(decision.agent.state).toBe("off");
@@ -167,7 +189,7 @@ describe("decideOff", () => {
 
   test("on -> off with no live session yet reports restoreSessionId undefined (nothing to stop)", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "on", restoreTarget: undefined }));
-    const decision = decideOff(state, DIR_A, "@a1");
+    const decision = decideOff(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok && decision.kind === "turn-off") {
       expect(decision.restoreSessionId).toBeUndefined();
@@ -182,7 +204,7 @@ describe("decideOff", () => {
 describe("decideArchive", () => {
   test("no-change: already archived", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "archived", name: "keepme" }));
-    const decision = decideArchive(state, DIR_A, "@a1");
+    const decision = decideArchive(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok) {
       expect(decision.kind).toBe("no-change");
@@ -192,7 +214,7 @@ describe("decideArchive", () => {
 
   test("CONTROL: on -> archived, keeping the name, capturing the session to stop", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "on", name: "keepme", restoreTarget: { sessionId: "live-1", shortId: "live-1s" } }));
-    const decision = decideArchive(state, DIR_A, "@a1");
+    const decision = decideArchive(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok && decision.kind === "archive") {
       expect(decision.agent.state).toBe("archived");
@@ -205,7 +227,7 @@ describe("decideArchive", () => {
 
   test("CONTROL: off -> archived is also permitted (archive is not on-only)", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "off" }));
-    const decision = decideArchive(state, DIR_A, "@a1");
+    const decision = decideArchive(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok) expect(decision.kind).toBe("archive");
   });
@@ -216,130 +238,57 @@ describe("decideArchive", () => {
 describe("decideUnarchive", () => {
   test("refused: not archived (on)", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "on" }));
-    const decision = decideUnarchive(state, DIR_A, "@a1");
+    const decision = decideUnarchive(state, byId("@a1"));
     expect(decision.ok).toBe(false);
     if (!decision.ok) expect(decision.reason).toBe("not-archived");
   });
 
   test("refused: not archived (off)", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "off" }));
-    const decision = decideUnarchive(state, DIR_A, "@a1");
+    const decision = decideUnarchive(state, byId("@a1"));
     expect(decision.ok).toBe(false);
     if (!decision.ok) expect(decision.reason).toBe("not-archived");
   });
 
   test("CONTROL: archived -> off, never on", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "archived" }));
-    const decision = decideUnarchive(state, DIR_A, "@a1");
+    const decision = decideUnarchive(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok) expect(decision.agent.state).toBe("off");
   });
 });
 
-// --- rename / name: one function; per-directory uniqueness incl. archived holders ---
+// --- name / rename: RETIRED (R9) — an agent's name is always derived from
+// its directory now; see agent-name.test.ts for derivation coverage and
+// agent-model.test.ts's `resolveAgent` suite for the R8 rename hint.
 
-describe("decideRename (and decideName — the SAME function)", () => {
-  test("decideName is decideRename, not a second implementation", () => {
-    expect(decideName).toBe(decideRename);
-  });
+// --- create: one non-archived agent per directory (R6) ---------------------
 
-  test("no-change: renaming to the name it already has", () => {
-    const state = storeWith(makeAgent({ id: "@a1", name: "bob" }));
-    const decision = decideRename(state, DIR_A, "@a1", "bob");
+describe("decideCreate (R6)", () => {
+  test("ok: an empty directory", () => {
+    const decision = decideCreate(emptyAgentStore(), DIR_A);
     expect(decision.ok).toBe(true);
-    if (decision.ok) expect(decision.kind).toBe("no-change");
   });
 
-  test("refused: empty name", () => {
-    const state = storeWith(makeAgent({ id: "@a1" }));
-    const decision = decideRename(state, DIR_A, "@a1", "");
+  test("refused: a non-archived agent already exists for this directory", () => {
+    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_A, state: "on" }));
+    const decision = decideCreate(state, DIR_A);
     expect(decision.ok).toBe(false);
-    if (!decision.ok && "reason" in decision) expect(decision.reason).toBe("empty");
-  });
-
-  test("refused: contains '@'", () => {
-    const state = storeWith(makeAgent({ id: "@a1" }));
-    const decision = decideRename(state, DIR_A, "@a1", "bo@b");
-    expect(decision.ok).toBe(false);
-    if (!decision.ok && "reason" in decision) expect(decision.reason).toBe("contains-at");
-  });
-
-  test("refused: a reserved word", () => {
-    const state = storeWith(makeAgent({ id: "@a1" }));
-    const decision = decideRename(state, DIR_A, "@a1", "archive");
-    expect(decision.ok).toBe(false);
-    if (!decision.ok && "reason" in decision) expect(decision.reason).toBe("reserved");
-  });
-
-  test("refused: taken by a live holder in the same directory", () => {
-    const state = storeWith(makeAgent({ id: "@a1" }), makeAgent({ id: "@a2", name: "taken" }));
-    const decision = decideRename(state, DIR_A, "@a1", "taken");
-    expect(decision.ok).toBe(false);
-    if (!decision.ok && "reason" in decision && decision.reason === "taken") {
-      expect(decision.heldBy.id).toBe("@a2");
-    } else {
-      throw new Error("expected taken");
+    if (!decision.ok) {
+      expect(decision.reason).toBe("directory-occupied");
+      expect(decision.agent.id).toBe("@a1");
     }
   });
 
-  test("refused: taken by an ARCHIVED holder (B4 — archived agents keep their name)", () => {
-    const state = storeWith(makeAgent({ id: "@a1" }), makeAgent({ id: "@a2", name: "taken", state: "archived" }));
-    const decision = decideRename(state, DIR_A, "@a1", "taken");
-    expect(decision.ok).toBe(false);
-    if (!decision.ok && "reason" in decision) expect(decision.reason).toBe("taken");
-  });
-
-  test("CONTROL: the same name is free in a DIFFERENT directory (B4: per-directory, not global)", () => {
-    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_A }), makeAgent({ id: "@a2", directory: DIR_B, name: "shared" }));
-    const decision = decideRename(state, DIR_A, "@a1", "shared");
-    expect(decision.ok).toBe(true);
-    if (decision.ok) expect(decision.kind).toBe("renamed");
-  });
-
-  test("CONTROL: a valid, available new name succeeds regardless of lifecycle state (on/off/archived all permitted)", () => {
-    for (const lifecycleState of ["on", "off", "archived"] as const) {
-      const state = storeWith(makeAgent({ id: "@a1", state: lifecycleState }));
-      const decision = decideRename(state, DIR_A, "@a1", "freshname");
-      expect(decision.ok).toBe(true);
-      if (decision.ok && decision.kind === "renamed") {
-        expect(decision.agent.name).toBe("freshname");
-        expect(decision.agent.state).toBe(lifecycleState); // rename moves nothing else (R16)
-      } else {
-        throw new Error("expected renamed");
-      }
-    }
-  });
-
-  test("R16: rename never touches `directory`", () => {
-    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_A }));
-    const decision = decideRename(state, DIR_A, "@a1", "newname");
-    expect(decision.ok).toBe(true);
-    if (decision.ok && decision.kind === "renamed") expect(decision.agent.directory).toBe(DIR_A);
-  });
-});
-
-// --- create: name validation only (the mint/launch is agent-actions.ts's job) ---
-
-describe("decideCreateName", () => {
-  test("ok: no name given (unnamed is a normal, supported state)", () => {
-    const decision = decideCreateName(emptyAgentStore(), DIR_A, undefined);
+  test("CONTROL: an ARCHIVED agent in the directory does not block create", () => {
+    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_A, state: "archived" }));
+    const decision = decideCreate(state, DIR_A);
     expect(decision.ok).toBe(true);
   });
 
-  test("refused: empty / contains-at / reserved — same rules as rename", () => {
-    expect(decideCreateName(emptyAgentStore(), DIR_A, "").ok).toBe(false);
-    expect(decideCreateName(emptyAgentStore(), DIR_A, "a@b").ok).toBe(false);
-    expect(decideCreateName(emptyAgentStore(), DIR_A, "list").ok).toBe(false);
-  });
-
-  test("refused: taken in this directory", () => {
-    const state = storeWith(makeAgent({ id: "@a1", name: "taken" }));
-    const decision = decideCreateName(state, DIR_A, "taken");
-    expect(decision.ok).toBe(false);
-  });
-
-  test("CONTROL: an available name is accepted", () => {
-    const decision = decideCreateName(emptyAgentStore(), DIR_A, "fresh");
+  test("CONTROL: an agent in a DIFFERENT directory never blocks", () => {
+    const state = storeWith(makeAgent({ id: "@a1", directory: DIR_B, state: "on" }));
+    const decision = decideCreate(state, DIR_A);
     expect(decision.ok).toBe(true);
   });
 });
@@ -348,7 +297,7 @@ describe("decideCreateName", () => {
 
 describe("decideDelete", () => {
   test("not-found on an unknown ref (double-delete naturally resolves here — no special-casing needed)", () => {
-    const decision = decideDelete(emptyAgentStore(), DIR_A, "@unknown0000000000");
+    const decision = decideDelete(emptyAgentStore(), byId("@unknown0000000000"));
     expect(decision.ok).toBe(false);
   });
 
@@ -359,7 +308,7 @@ describe("decideDelete", () => {
       ["archived", undefined],
     ] as const) {
       const state = storeWith(makeAgent({ id: "@a1", state: lifecycleState, restoreTarget: restoreSessionId === undefined ? undefined : { sessionId: restoreSessionId, shortId: "live-1s" } }));
-      const decision = decideDelete(state, DIR_A, "@a1");
+      const decision = decideDelete(state, byId("@a1"));
       expect(decision.ok).toBe(true);
       if (decision.ok) {
         expect(decision.agent.id).toBe("@a1");
@@ -374,14 +323,14 @@ describe("decideDelete", () => {
 describe("decideAttachTarget", () => {
   test("refused: archived", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "archived" }));
-    const decision = decideAttachTarget(state, DIR_A, "@a1");
+    const decision = decideAttachTarget(state, byId("@a1"));
     expect(decision.ok).toBe(false);
     if (!decision.ok && "reason" in decision) expect(decision.reason).toBe("archived");
   });
 
   test("refused: off, with a message saying turning it on is the way — never silently started", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "off" }));
-    const decision = decideAttachTarget(state, DIR_A, "@a1");
+    const decision = decideAttachTarget(state, byId("@a1"));
     expect(decision.ok).toBe(false);
     if (!decision.ok && "reason" in decision) {
       expect(decision.reason).toBe("off");
@@ -391,14 +340,14 @@ describe("decideAttachTarget", () => {
 
   test("refused: on, but not yet live (launch hasn't resolved a session)", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "on", birthSessionId: undefined, restoreTarget: undefined }));
-    const decision = decideAttachTarget(state, DIR_A, "@a1");
+    const decision = decideAttachTarget(state, byId("@a1"));
     expect(decision.ok).toBe(false);
     if (!decision.ok && "reason" in decision) expect(decision.reason).toBe("not-yet-live");
   });
 
   test("CONTROL: on and live returns the session identity a caller needs, touching nothing else", () => {
     const state = storeWith(makeAgent({ id: "@a1", state: "on", birthSessionId: "durable-1", restoreTarget: { sessionId: "live-1", shortId: "live-1s" } }));
-    const decision = decideAttachTarget(state, DIR_A, "@a1");
+    const decision = decideAttachTarget(state, byId("@a1"));
     expect(decision.ok).toBe(true);
     if (decision.ok) {
       expect(decision.restoreSessionId).toBe("live-1");

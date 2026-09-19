@@ -27,6 +27,7 @@
 import type { ClaimKey } from "./claim-key-resolve";
 import type { McpServerDeclaration } from "./launch-config";
 import { stripAnsi } from "./spawn/parse";
+import { computeAgentNames } from "./agent-name";
 
 export type AgentLifecycleState = "on" | "off" | "archived";
 
@@ -238,63 +239,13 @@ export function mintUniqueAgentId(state: AgentStoreState, randomBytes: (byteLeng
   return id;
 }
 
-// --- Name rules (B4, B5, B11) -------------------------------------------
-
-/** B5: a deliberate superset. If you add a word, say so in the PR — do not widen this list quietly. */
-export const RESERVED_NAMES: readonly string[] = ["create", "attach", "on", "off", "name", "rename", "archive", "unarchive", "delete", "list", "adopt", "relaunch", "status"];
-
-/** B11: every refusal is typed and carries a message a surface can show verbatim. */
-export type NameSyntaxResult =
-  | { readonly ok: true }
-  | { readonly ok: false; readonly reason: "empty"; readonly message: string }
-  | { readonly ok: false; readonly reason: "contains-at"; readonly message: string }
-  | { readonly ok: false; readonly reason: "reserved"; readonly message: string };
-
-/**
- * Syntax only — no filesystem, no store, no directory scope. `@` is refused
- * at EVERY position, not just leading (B3: "@" excluded from the name
- * charset entirely, so "a name collides with an id" cannot arise by
- * construction). Every reserved word (B5) is refused exactly, case-sensitive
- * — no fuzzy or case-insensitive matching, since none is specified and
- * inventing one would silently reserve more than the list says.
- */
-export function validateNameSyntax(name: string): NameSyntaxResult {
-  if (name.length === 0) {
-    return { ok: false, reason: "empty", message: "a name must not be empty" };
-  }
-  if (name.includes("@")) {
-    return { ok: false, reason: "contains-at", message: `a name must not contain "@" (found in "${name}") — "@" is reserved for agent ids` };
-  }
-  if (RESERVED_NAMES.includes(name)) {
-    return { ok: false, reason: "reserved", message: `"${name}" is a reserved word and cannot be used as a name` };
-  }
-  return { ok: true };
-}
-
-export type NameAvailabilityResult =
-  | { readonly ok: true }
-  | { readonly ok: false; readonly reason: "taken"; readonly message: string; readonly heldBy: AgentRecord };
-
-/**
- * B4: names are unique within a claimed directory, not globally — the same
- * name in two directories is two different, unrelated names. Archived
- * agents keep holding their name (so a future unarchive can never collide);
- * only `delete` frees it (not shipped by this story). `excludingAgentId`
- * lets a future rename check availability without the agent colliding with
- * its own current name.
- */
-export function checkNameAvailability(state: AgentStoreState, directory: ClaimKey, name: string, excludingAgentId?: string): NameAvailabilityResult {
-  const holder = Object.values(state.agents).find((a) => a.directory === directory && a.name === name && a.id !== excludingAgentId);
-  if (holder === undefined) {
-    return { ok: true };
-  }
-  return {
-    ok: false,
-    reason: "taken",
-    message: `the name "${name}" is already held by ${holder.id} in this directory${holder.state === "archived" ? " (archived — archived agents keep their name)" : ""}`,
-    heldBy: holder,
-  };
-}
+// --- Name rules (BAKR-34/BAKR-42 R9): custom names, `name`/`rename`, and
+// their reserved-word/availability checks are RETIRED — an agent's name is
+// now always derived from its directory (R1/R3, agent-name.ts). What
+// remains of `AgentRecord.name` is legacy-only, read solely by the R8 rename
+// hint below. `RESERVED_NAMES`/`validateNameSyntax`/`checkNameAvailability`
+// (formerly B4/B5/B11) are retired along with the custom-naming system they
+// existed to validate — see agent-lifecycle.ts's own module comment.
 
 // --- Membership (B9, R-D) ------------------------------------------------
 
@@ -359,43 +310,71 @@ export function setAgentDirectory(state: AgentStoreState, agentId: string, direc
   return { ...state, agents: { ...state.agents, [agentId]: { ...agent, directory } } };
 }
 
-// --- The resolver (B4, R-E) ----------------------------------------------
+// --- The resolver (BAKR-34/BAKR-42 R2/R4/R8) -------------------------------
+
+/**
+ * R2's lexical classification, already turned into data: an `id` or `name`
+ * ref carries the raw string; a `directory` ref carries the ClaimKey the
+ * caller already resolved from a real-path ref (symlink-aware resolution is
+ * impure — `agent-model.ts` never touches the filesystem, so that step is
+ * always the caller's job; see `src/cli/ref.ts`). This is what makes
+ * "@" / real-path / name mutually exclusive by construction rather than by
+ * convention: a caller cannot even construct a `RefClassification` without
+ * having already made that lexical call.
+ */
+export type RefClassification =
+  | { readonly kind: "id"; readonly ref: string }
+  | { readonly kind: "directory"; readonly directory: ClaimKey }
+  | { readonly kind: "name"; readonly ref: string };
 
 export type ResolveOutcome =
   | { readonly outcome: "found"; readonly agent: AgentRecord }
-  | { readonly outcome: "found-elsewhere"; readonly agent: AgentRecord; readonly directory: ClaimKey }
-  | { readonly outcome: "not-found" };
+  | { readonly outcome: "not-found" }
+  /** R6: a legacy store already violating "one non-archived agent per directory" must still load — this is the read-time consequence, never a load-time crash. `agents` names every non-archived agent sharing the directory a `name`/`directory` ref resolved to. */
+  | { readonly outcome: "ambiguous"; readonly agents: readonly AgentRecord[] }
+  /** R8: `ref` is not an id, not a real path, and not any agent's current derived name — but it does equal some non-archived agent's legacy stored `name`. `derivedName` is that agent's current name, when it has one (its own directory might itself be ambiguous, in which case there is no single name to suggest and a caller should point at `@id` instead). */
+  | { readonly outcome: "renamed"; readonly agent: AgentRecord; readonly derivedName: string | undefined };
 
 /**
- * `scope` has no default and no ambient fallback — it is impossible to call
- * this function without one (AC5), which is what makes B4's "the resolver's
- * directory scope is an explicit, required input" true by construction
- * rather than by convention.
- *
- * `ref` starting with "@" is treated as an id and resolved GLOBALLY: an id
- * belonging to another directory comes back as `found-elsewhere`, carrying
- * that directory, rather than either a false hit or an opaque miss — a
- * caller can then refuse or confirm intelligently (R-E). Any other `ref` is
- * treated as a name and resolved ONLY within `scope`: a name that exists in
- * a different directory is simply `not-found` — never a hit, never a
- * cross-directory suggestion masquerading as a resolution. This split is
- * unambiguous by construction: `validateNameSyntax` refuses "@" anywhere in
- * a name (B3), so a real name can never be mistaken for an id prefix.
+ * R4: resolution is global — an id resolves from any directory, and a name
+ * is resolved against the CURRENT derived-name set (agent-name.ts),
+ * likewise independent of any caller cwd. `directory` (a real-path ref,
+ * already resolved by the caller) matches by exact equality against
+ * non-archived agents only, the same rule `computeAgentNames` applies (R3:
+ * archived agents are @id-only) — this is also what makes R6's
+ * one-per-directory enforcement and its `ambiguous` escape hatch apply
+ * uniformly whether an agent was reached by name or by real path.
  */
-export function resolveAgent(state: AgentStoreState, scope: ClaimKey, ref: string): ResolveOutcome {
-  if (ref.startsWith("@")) {
-    const agent = state.agents[ref];
-    if (agent === undefined) {
-      return { outcome: "not-found" };
-    }
-    if (agent.directory !== scope) {
-      return { outcome: "found-elsewhere", agent, directory: agent.directory };
-    }
-    return { outcome: "found", agent };
+export function resolveAgent(state: AgentStoreState, classification: RefClassification): ResolveOutcome {
+  if (classification.kind === "id") {
+    const agent = state.agents[classification.ref];
+    return agent === undefined ? { outcome: "not-found" } : { outcome: "found", agent };
   }
 
-  const agent = Object.values(state.agents).find((a) => a.directory === scope && a.name === ref);
-  return agent === undefined ? { outcome: "not-found" } : { outcome: "found", agent };
+  if (classification.kind === "directory") {
+    const matches = Object.values(state.agents).filter((a) => a.directory === classification.directory && a.state !== "archived");
+    if (matches.length === 0) return { outcome: "not-found" };
+    if (matches.length === 1) return { outcome: "found", agent: matches[0]! };
+    return { outcome: "ambiguous", agents: matches };
+  }
+
+  const names = computeAgentNames(Object.values(state.agents));
+  for (const [directory, name] of names.directoryToName) {
+    if (name !== classification.ref) continue;
+    const ids = names.agentIdsByDirectory.get(directory) ?? [];
+    if (ids.length === 1) return { outcome: "found", agent: state.agents[ids[0]!]! };
+    if (ids.length > 1) return { outcome: "ambiguous", agents: ids.map((id) => state.agents[id]!) };
+  }
+
+  // R8: the one-release rename hint. Restricted to a non-archived legacy
+  // holder — an archived agent has no derived name at all (R3), so there is
+  // nothing this hint could point at for one.
+  const legacyHolder = Object.values(state.agents).find((a) => a.state !== "archived" && a.name === classification.ref);
+  if (legacyHolder !== undefined) {
+    return { outcome: "renamed", agent: legacyHolder, derivedName: names.nameByAgentId.get(legacyHolder.id) };
+  }
+
+  return { outcome: "not-found" };
 }
 
 // --- Which session to resume (BAKR-22: respawn, with a fork-only escape) --

@@ -15,47 +15,92 @@
 // (state, scope, ref, ...) -> a decision; nothing here ever touches a
 // session, a clock, or the filesystem.
 //
-// B2 (restated because this file leans on it constantly): `directory` is
-// the resolver's SCOPE, never an agent's identity. `resolveAgent` (imported
-// from agent-model.ts) is the only place a `ref` is turned into an agent,
-// and its `found-elsewhere` outcome gets its OWN refusal below rather than
-// being flattened into `not-found` (BAKR-17 doc's own addition to the
-// epic's list) — the resolver went to the trouble of distinguishing the
-// two; collapsing them here would throw that away and tell an operator
-// their id does not exist when it demonstrably does, just in another
-// directory.
+// B2 (restated because this file leans on it constantly): `directory` is an
+// agent's ATTRIBUTE, never its identity — an id is. `resolveAgent` (imported
+// from agent-model.ts) is the only place a `ref` is turned into an agent.
+// BAKR-34/BAKR-42 R4 removed `found-elsewhere` entirely: resolution is
+// global now (an id or a name resolves independent of any caller cwd), so
+// there is no longer a "found, but scoped elsewhere" outcome to distinguish
+// from `not-found` — see `ResolutionRefusal` and `resolveOrRefuse` below,
+// which only ever produce `not-found`, `ambiguous` (R6) or `renamed` (R8).
 
 import type { ClaimKey } from "./claim-key-resolve";
-import { type AgentRecord, type AgentStoreState, type RestorePlan, checkNameAvailability, planRestore, resolveAgent, validateNameSyntax } from "./agent-model";
+import { type AgentRecord, type AgentStoreState, type RefClassification, type RestorePlan, planRestore, resolveAgent } from "./agent-model";
 
 // --- Shared resolution (every verb starts here) ---------------------------
 
+/** The raw ref text a refusal message can show verbatim — an id, a real-path spelling, or a name; whichever the caller classified. */
+function refText(classification: RefClassification): string {
+  return classification.kind === "directory" ? classification.directory : classification.ref;
+}
+
 export type ResolutionRefusal =
   | { readonly ok: false; readonly reason: "not-found"; readonly message: string }
-  | { readonly ok: false; readonly reason: "found-elsewhere"; readonly message: string; readonly directory: ClaimKey };
+  /** R6: a directory (reached by name or by real path) held by more than one non-archived agent — a legacy store already violating one-per-directory, kept loadable rather than bricked. */
+  | { readonly ok: false; readonly reason: "ambiguous"; readonly message: string; readonly agentIds: readonly string[] }
+  /** R8: `ref` matched only a legacy stored `name`; nothing was changed. `derivedName` is present unless that agent's own directory is itself ambiguous. */
+  | { readonly ok: false; readonly reason: "renamed"; readonly message: string; readonly derivedName?: string };
 
 export type Resolved = { readonly ok: true; readonly agent: AgentRecord } | ResolutionRefusal;
 
 /**
- * The one entry point every decision function below calls first. B2: an
- * id resolves globally but reports which directory it actually belongs to
- * when that is not `scope`; a name never resolves outside `scope` at all.
+ * The one entry point every decision function below calls first. R4:
+ * resolution no longer takes a directory scope — an id resolves from any
+ * cwd, and a name resolves against the current global derived-name set
+ * (agent-name.ts); `found-elsewhere` no longer exists because there is no
+ * scope left to be "elsewhere" from. `classification` is `RefClassification`
+ * (agent-model.ts) — the caller has already made R2's lexical id/real-path/name
+ * call, and, for a real-path ref, already resolved it to a `ClaimKey`
+ * (symlink-aware resolution is impure and never happens in this file).
  */
-export function resolveOrRefuse(state: AgentStoreState, scope: ClaimKey, ref: string): Resolved {
-  const outcome = resolveAgent(state, scope, ref);
+export function resolveOrRefuse(state: AgentStoreState, classification: RefClassification): Resolved {
+  const outcome = resolveAgent(state, classification);
   if (outcome.outcome === "not-found") {
-    const retiredNote = ref.startsWith("@") && state.retiredIds.includes(ref) ? " (this id was deleted — ids are retired on delete and never reused)" : "";
-    return { ok: false, reason: "not-found", message: `no agent "${ref}" found in this directory${retiredNote}` };
+    const ref = refText(classification);
+    const retiredNote = classification.kind === "id" && state.retiredIds.includes(ref) ? " (this id was deleted — ids are retired on delete and never reused)" : "";
+    return { ok: false, reason: "not-found", message: `no agent "${ref}" found${retiredNote}` };
   }
-  if (outcome.outcome === "found-elsewhere") {
+  if (outcome.outcome === "ambiguous") {
+    const ids = outcome.agents.map((a) => a.id);
     return {
       ok: false,
-      reason: "found-elsewhere",
-      message: `"${ref}" is an agent id that exists, but in a different directory ("${outcome.directory}") — an id's directory is where it was created, and this is not that directory`,
-      directory: outcome.directory,
+      reason: "ambiguous",
+      message: `"${refText(classification)}" names a directory held by more than one non-archived agent (${ids.join(", ")}) — archive one, or act on a specific agent by its @id`,
+      agentIds: ids,
+    };
+  }
+  if (outcome.outcome === "renamed") {
+    const hint = outcome.derivedName === undefined
+      ? `its directory is shared by another agent (ambiguous) — use its @id (${outcome.agent.id}) instead`
+      : `use "${outcome.derivedName}" instead (or its @id, ${outcome.agent.id})`;
+    return {
+      ok: false,
+      reason: "renamed",
+      message: `"${refText(classification)}" was a custom name; an agent's name is now derived from its directory — ${hint}`,
+      ...(outcome.derivedName === undefined ? {} : { derivedName: outcome.derivedName }),
     };
   }
   return { ok: true, agent: outcome.agent };
+}
+
+// --- create: one non-archived agent per directory (R6) ---------------------
+
+export type CreateDecision =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: "directory-occupied"; readonly message: string; readonly agent: AgentRecord };
+
+/** R6: `create` (and `bakr <real path>` when it would create) refuses a directory that already holds a non-archived agent; an archived one there does not block it. */
+export function decideCreate(state: AgentStoreState, directory: ClaimKey): CreateDecision {
+  const existing = Object.values(state.agents).find((a) => a.directory === directory && a.state !== "archived");
+  if (existing !== undefined) {
+    return {
+      ok: false,
+      reason: "directory-occupied",
+      message: `a non-archived agent already exists for this directory (${existing.id}) — archive it first, or act on it directly`,
+      agent: existing,
+    };
+  }
+  return { ok: true };
 }
 
 // --- on: off -> on (B6). Refused while archived — never a silent unarchive. -
@@ -81,8 +126,8 @@ export type OnDecision =
  * from `create` crashing, needs the identical check `on` performs for the
  * off -> on case — see the module comment in agent-actions.ts).
  */
-export function decideOn(state: AgentStoreState, scope: ClaimKey, ref: string): OnDecision {
-  const resolved = resolveOrRefuse(state, scope, ref);
+export function decideOn(state: AgentStoreState, classification: RefClassification): OnDecision {
+  const resolved = resolveOrRefuse(state, classification);
   if (!resolved.ok) return resolved;
   const agent = resolved.agent;
 
@@ -120,8 +165,8 @@ export type OffDecision =
  * the way it does on-while-archived, so it is a choice, not a re-derivation
  * of something already specified.
  */
-export function decideOff(state: AgentStoreState, scope: ClaimKey, ref: string): OffDecision {
-  const resolved = resolveOrRefuse(state, scope, ref);
+export function decideOff(state: AgentStoreState, classification: RefClassification): OffDecision {
+  const resolved = resolveOrRefuse(state, classification);
   if (!resolved.ok) return resolved;
   const agent = resolved.agent;
 
@@ -146,8 +191,8 @@ export type ArchiveDecision =
   | { readonly ok: true; readonly kind: "no-change"; readonly agent: AgentRecord }
   | { readonly ok: true; readonly kind: "archive"; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined };
 
-export function decideArchive(state: AgentStoreState, scope: ClaimKey, ref: string): ArchiveDecision {
-  const resolved = resolveOrRefuse(state, scope, ref);
+export function decideArchive(state: AgentStoreState, classification: RefClassification): ArchiveDecision {
+  const resolved = resolveOrRefuse(state, classification);
   if (!resolved.ok) return resolved;
   const agent = resolved.agent;
 
@@ -166,8 +211,8 @@ export type UnarchiveDecision =
   | { readonly ok: false; readonly reason: "not-archived"; readonly message: string; readonly agent: AgentRecord }
   | { readonly ok: true; readonly agent: AgentRecord };
 
-export function decideUnarchive(state: AgentStoreState, scope: ClaimKey, ref: string): UnarchiveDecision {
-  const resolved = resolveOrRefuse(state, scope, ref);
+export function decideUnarchive(state: AgentStoreState, classification: RefClassification): UnarchiveDecision {
+  const resolved = resolveOrRefuse(state, classification);
   if (!resolved.ok) return resolved;
   const agent = resolved.agent;
 
@@ -182,64 +227,10 @@ export function decideUnarchive(state: AgentStoreState, scope: ClaimKey, ref: st
   return { ok: true, agent: { ...agent, state: "off" } };
 }
 
-// --- rename / name: one function, not two (B4/B5) --------------------------
-
-export type RenameDecision =
-  | ResolutionRefusal
-  | { readonly ok: false; readonly reason: "empty" | "contains-at" | "reserved"; readonly message: string }
-  | { readonly ok: false; readonly reason: "taken"; readonly message: string; readonly heldBy: AgentRecord }
-  | { readonly ok: true; readonly kind: "no-change"; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "renamed"; readonly agent: AgentRecord };
-
-/**
- * `name` is this SAME function applied to an agent whose `name` is
- * `undefined` (BAKR-17 doc: "model it as one function, not two") — see the
- * `name` export below, an alias rather than a second implementation.
- * Availability is checked INCLUDING archived holders (B4) via
- * `checkNameAvailability`'s own sweep over every agent in `scope`, and the
- * reserved-word list is re-checked via `validateNameSyntax` exactly as
- * `create` must. Moves nothing (R16): `directory` is never touched here.
- */
-export function decideRename(state: AgentStoreState, scope: ClaimKey, ref: string, newName: string): RenameDecision {
-  const resolved = resolveOrRefuse(state, scope, ref);
-  if (!resolved.ok) return resolved;
-  const agent = resolved.agent;
-
-  if (agent.name === newName) {
-    return { ok: true, kind: "no-change", agent };
-  }
-  const syntax = validateNameSyntax(newName);
-  if (!syntax.ok) {
-    return syntax;
-  }
-  const availability = checkNameAvailability(state, scope, newName, agent.id);
-  if (!availability.ok) {
-    return availability;
-  }
-  return { ok: true, kind: "renamed", agent: { ...agent, name: newName } };
-}
-
-/** Alias, not a second implementation — see `decideRename`'s own doc. */
-export const decideName = decideRename;
-
-// --- create: name validation only (the mint + launch is agent-actions.ts's job) -
-
-export type CreateNameDecision =
-  | { readonly ok: true }
-  | { readonly ok: false; readonly reason: "empty" | "contains-at" | "reserved"; readonly message: string }
-  | { readonly ok: false; readonly reason: "taken"; readonly message: string; readonly heldBy: AgentRecord };
-
-/** `name` is optional at create — an unnamed agent is a normal, supported state (every migrated BAKR-16 agent started this way). */
-export function decideCreateName(state: AgentStoreState, scope: ClaimKey, name: string | undefined): CreateNameDecision {
-  if (name === undefined) {
-    return { ok: true };
-  }
-  const syntax = validateNameSyntax(name);
-  if (!syntax.ok) {
-    return syntax;
-  }
-  return checkNameAvailability(state, scope, name);
-}
+// --- name / rename: RETIRED (R9) --------------------------------------------
+// Custom names are gone; an agent's name is always derived from its
+// directory (R1/R3). See agent-model.ts's module comment and the R8 rename
+// hint in `resolveOrRefuse` above for what a stale custom name now does.
 
 // --- delete: any state -> removed, id retired, name freed (B6) -------------
 
@@ -254,8 +245,8 @@ export type DeleteDecision = ResolutionRefusal | { readonly ok: true; readonly a
  * THAT the delete is permitted and what session (if any) must be stopped
  * first.
  */
-export function decideDelete(state: AgentStoreState, scope: ClaimKey, ref: string): DeleteDecision {
-  const resolved = resolveOrRefuse(state, scope, ref);
+export function decideDelete(state: AgentStoreState, classification: RefClassification): DeleteDecision {
+  const resolved = resolveOrRefuse(state, classification);
   if (!resolved.ok) return resolved;
   return { ok: true, agent: resolved.agent, restoreSessionId: resolved.agent.restoreTarget?.sessionId };
 }
@@ -281,8 +272,8 @@ export type AttachDecision =
  * caller is told to retry shortly rather than being handed a session id
  * that does not exist yet.
  */
-export function decideAttachTarget(state: AgentStoreState, scope: ClaimKey, ref: string): AttachDecision {
-  const resolved = resolveOrRefuse(state, scope, ref);
+export function decideAttachTarget(state: AgentStoreState, classification: RefClassification): AttachDecision {
+  const resolved = resolveOrRefuse(state, classification);
   if (!resolved.ok) return resolved;
   const agent = resolved.agent;
 

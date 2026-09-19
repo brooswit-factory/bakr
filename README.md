@@ -38,16 +38,28 @@ directories — that claim is what brings an agent back after a reboot.
 |---|---|
 | `bakr` | Claim and discover the current directory |
 | `bakr list [--archived]` | List this directory's agents |
-| `bakr create [--name <name>]` | Claim the current directory, then create without auto-attaching |
+| `bakr create` | Claim the current directory, then create without auto-attaching |
 | `bakr adopt <@id> [<@id> ...]` | Claim the current directory, then explicitly adopt offered orphans here |
-| `bakr <id\|name>` | Attach in the current terminal |
-| `bakr <id\|name> on\|off\|archive\|unarchive` | Change lifecycle state |
-| `bakr <id\|name> name\|rename <new>` | Rename |
-| `bakr <id\|name> delete [--yes]` | Delete, with confirmation |
-| `bakr <id\|name> send <message>` | Message the running agent and print its reply |
-| `bakr <id\|name> permissions` | List the tool-permission prompts waiting on that agent's pane |
-| `bakr <id\|name> approve <promptId> [--always] [--as <operator>]` | Approve one of those prompts, recorded in a 0600 audit |
+| `bakr <id\|path\|name>` | Starts it if off, attaches if on — from any directory |
+| `bakr <id\|path\|name> on\|off\|archive\|unarchive` | Change lifecycle state — from any directory |
+| `bakr <id\|path\|name> delete [--yes]` | Delete, with confirmation |
+| `bakr <id\|path\|name> send <message>` | Message the running agent and print its reply |
+| `bakr <id\|path\|name> permissions` | List the tool-permission prompts waiting on that agent's pane |
+| `bakr <id\|path\|name> approve <promptId> [--always] [--as <operator>]` | Approve one of those prompts, recorded in a 0600 audit |
 | `bakr status [--json]` | A read-only health report of every agent on this host |
+
+**An agent's name is its directory's last two path segments** (e.g.
+`~/code/brooswit-factory/bakr` is named `brooswit-factory/bakr`), grown by
+one more leading segment on a collision with another agent's directory.
+Custom names are gone (`create --name` and the `name`/`rename` verbs are
+retired) — a ref that matches only a stale custom name from before this
+change refuses with a `renamed: use <derived-name>` hint and changes
+nothing. A ref is an id iff it starts with `@`; a real path iff it starts
+with `/`, `./`, `../`, `~/`, or is exactly `~`; anything else — a slash
+included — is a name: `bakr code/brooswit-factory` is a name, `bakr
+./code/brooswit-factory` is a path. An id or a name resolves from ANY
+current directory; `--dir <path>` still works as a deprecated alias (same
+behaviour, plus a stderr notice) for a caller that cannot `cd` first.
 
 Help is flag-only (`bakr --help`); `help` remains available as an agent
 reference. Attach requires TTY stdin and stdout, inherits all three streams,
@@ -257,10 +269,10 @@ An agent with no declaration of its own has every server its directory's
 of notifications:
 
 ```
-bakr create --name rocketr --mcp rocketr --mcp yappr
-bakr rocketr mcp                           # show it, and what the next start carries
-bakr rocketr mcp rocketr yappr:no-notify   # replace it (writes the approval now)
-bakr rocketr mcp default                   # back to every server in .mcp.json
+bakr create --mcp rocketr --mcp yappr
+bakr <name> mcp                           # show it, and what the next start carries
+bakr <name> mcp rocketr yappr:no-notify   # replace it (writes the approval now)
+bakr <name> mcp default                   # back to every server in .mcp.json
 ```
 
 The servers themselves are still defined in the directory's `.mcp.json`; a

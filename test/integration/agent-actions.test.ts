@@ -18,15 +18,14 @@ import {
   deleteAgent,
   list,
   mcp,
-  name as nameVerb,
   off,
   on,
-  rename,
   stopLiveSession,
   unarchive,
   type AgentActionDeps,
 } from "../../src/agent-actions";
 import type { ClaimKey } from "../../src/claim-key-resolve";
+import type { RefClassification } from "../../src/agent-model";
 import type { McpSettingsIo } from "@brooswit/drovr";
 import { makeFakeHost, type FakeHost } from "../support/fake-host";
 
@@ -41,6 +40,7 @@ const ROCKETR_MCP = JSON.stringify({ mcpServers: { rocketr: { type: "http" }, ya
 
 const KEY = "/claimed/dir" as ClaimKey;
 const OTHER_KEY = "/claimed/other" as ClaimKey;
+const byId = (ref: string): RefClassification => ({ kind: "id", ref });
 
 const cleanupDirs: string[] = [];
 afterEach(async () => {
@@ -184,7 +184,7 @@ describe("create", () => {
       ...baseDeps(dir, fake.runCommand),
       launchConfigDeps: { readConfigFile: async () => ROCKETR_MCP, settingsIo },
     };
-    const result = await create(deps, KEY, "rocketr", [{ name: "rocketr", notifications: true }, { name: "yappr", notifications: false }]);
+    const result = await create(deps, KEY, [{ name: "rocketr", notifications: true }, { name: "yappr", notifications: false }]);
     expect(result.ok).toBe(true);
     expect(afterNamedSession(fake.starts()[0]!)).toEqual([
       "--mcp-config", `${KEY}/.mcp.json`,
@@ -197,28 +197,36 @@ describe("create", () => {
     expect(stored.state.agents[result.agent.id]!.mcp).toEqual([{ name: "rocketr", notifications: true }, { name: "yappr", notifications: false }]);
   });
 
-  test("with a name: the agent holds it", async () => {
+  // BAKR-34/BAKR-42 R1/R9: `create` no longer takes a name — an agent's
+  // name is always derived from its directory now (agent-name.ts).
+  test("BAKR-34/BAKR-42 R1: a freshly created agent's `name` field is always undefined — it holds no custom name to persist", async () => {
     const dir = await makeTempDir();
-    const result = await create(baseDeps(dir, makeFakeHost().runCommand), KEY, "bob");
+    const result = await create(baseDeps(dir, makeFakeHost().runCommand), KEY);
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.agent.name).toBe("bob");
+    if (result.ok) expect(result.agent.name).toBeUndefined();
   });
 
-  test("refused: name taken in this directory — no agent created", async () => {
-    const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeHost().runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@existing0000000000", name: "taken" }));
-    const result = await create(deps, KEY, "taken");
-    expect(result.ok).toBe(false);
+  // R6: one non-archived agent per directory, enforced at create.
+  describe("R6: one non-archived agent per directory", () => {
+    test("refused: a non-archived agent already exists for this directory — no second agent created", async () => {
+      const dir = await makeTempDir();
+      const deps = baseDeps(dir, makeFakeHost().runCommand);
+      await seedAgent(deps.agentsPath, makeAgent({ id: "@existing0000000000", directory: KEY, state: "on" }));
+      const result = await create(deps, KEY);
+      expect(result.ok).toBe(false);
+      if (!result.ok && "reason" in result) expect(result.reason).toBe("directory-occupied");
 
-    const store = await loadAgents(deps.agentsPath);
-    if (store.status === "loaded") expect(Object.keys(store.state.agents).length).toBe(1); // unchanged
-  });
+      const store = await loadAgents(deps.agentsPath);
+      if (store.status === "loaded") expect(Object.keys(store.state.agents).length).toBe(1); // unchanged
+    });
 
-  test("refused: reserved word", async () => {
-    const dir = await makeTempDir();
-    const result = await create(baseDeps(dir, makeFakeHost().runCommand), KEY, "archive");
-    expect(result.ok).toBe(false);
+    test("CONTROL: an ARCHIVED agent in this directory does not block create", async () => {
+      const dir = await makeTempDir();
+      const deps = baseDeps(dir, makeFakeHost().runCommand);
+      await seedAgent(deps.agentsPath, makeAgent({ id: "@existing0000000000", directory: KEY, state: "archived" }));
+      const result = await create(deps, KEY);
+      expect(result.ok).toBe(true);
+    });
   });
 
   test("launch failure is reported honestly, but the agent record still exists (recoverable via `on`)", async () => {
@@ -245,7 +253,7 @@ describe("on", () => {
     const fake = makeFakeHost();
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off", birthSessionId: "durable-xyz", restoreTarget: { sessionId: "durable-xyz", shortId: "durable-x" } }));
-    const result = await on(deps, KEY, "@a1");
+    const result = await on(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.kind).toBe("turn-on");
@@ -267,7 +275,7 @@ describe("on", () => {
     const fake = makeFakeHost();
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off", restoreTarget: undefined }));
-    await on(deps, KEY, "@a1");
+    await on(deps, byId("@a1"));
 
     expect(fake.starts()).toHaveLength(1);
     expect(afterNamedSession(fake.starts()[0]!)).toEqual([]);
@@ -284,7 +292,7 @@ describe("on", () => {
     const pane = fake.addPane({ cwd: KEY, sessionId: "d1" });
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: pane.paneId } }));
-    const result = await on(deps, KEY, "@a1");
+    const result = await on(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.kind).toBe("no-change");
@@ -303,7 +311,7 @@ describe("on", () => {
     const deps = baseDeps(dir, fake.runCommand);
     // FALSIFIER: a gate that looked the session up by `shortId` alone would find nothing, call it absent, and start a second process on session d1.
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: "d1shortx" } }));
-    const result = await on(deps, KEY, "@a1");
+    const result = await on(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.kind).toBe("no-change");
@@ -320,7 +328,7 @@ describe("on", () => {
     pane.pid = undefined;
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: pane.paneId } }));
-    const result = await on(deps, KEY, "@a1");
+    const result = await on(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.launchIssued).toBe(false);
     expect(listings(fake)).toBe(1);
@@ -331,7 +339,7 @@ describe("on", () => {
     const dir = await makeTempDir();
     const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "archived" }));
-    const result = await on(deps, KEY, "@a1");
+    const result = await on(deps, byId("@a1"));
     expect(result.ok).toBe(false);
   });
 
@@ -430,7 +438,7 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
     store = { ...store, launches: [{ attemptId: "stale-fork-attempt", agentId: "@a1", key: KEY, attemptKey: { kind: "forkFrom", sessionId: OLD_SESSION }, attemptedAt: 1, launchShortId: undefined, error: "escape launch failed: systemd-run: simulated failure" }] };
     await saveAgents(deps.agentsPath, store);
 
-    const result = await on(deps, KEY, "@a1");
+    const result = await on(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
 
@@ -483,7 +491,7 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
     };
     await saveAgents(deps.agentsPath, store);
 
-    const result = await on(deps, KEY, "@a1");
+    const result = await on(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.launchWedgeCleared).toBe(true);
@@ -508,7 +516,7 @@ describe("BAKR-27 AC4: on() clears a stray FAILED forkFrom-keyed record for the 
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "d1", shortId: pane.paneId } }));
 
-    const result = await on(deps, KEY, "@a1");
+    const result = await on(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.launchWedgeCleared).toBe(false);
@@ -581,7 +589,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-1", shortId: pane.paneId } }));
 
-    const result = await off(deps, KEY, "@a1");
+    const result = await off(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("stopped");
     expect(listings(fake)).toBe(1);
@@ -601,7 +609,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-2", shortId: pane.paneId } }));
 
-    const result = await archive(deps, KEY, "@a1");
+    const result = await archive(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "archived") expect(result.stop.kind).toBe("stopped");
     expect(listings(fake)).toBe(1);
@@ -615,7 +623,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-3", shortId: pane.paneId } }));
 
-    const result = await deleteAgent(deps, KEY, "@a1");
+    const result = await deleteAgent(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "deleted") expect(result.stop.kind).toBe("stopped");
     expect(listings(fake)).toBe(1);
@@ -633,7 +641,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const fake = makeFakeHost();
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: undefined }));
-    const result = await off(deps, KEY, "@a1");
+    const result = await off(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("nothing-to-stop");
     expect(fake.calls.length).toBe(0);
@@ -643,7 +651,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const dir = await makeTempDir();
     const deps = baseDeps(dir, makeFakeHost().runCommand); // empty listing
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "vanished", shortId: "vanished" } }));
-    const result = await off(deps, KEY, "@a1");
+    const result = await off(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("already-gone");
     const store = await loadAgents(deps.agentsPath);
@@ -655,7 +663,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const fake = makeFakeHost({ failListing: true });
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-1", shortId: "short-1" } }));
-    const result = await off(deps, KEY, "@a1");
+    const result = await off(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("listing-failed");
     const store = await loadAgents(deps.agentsPath);
@@ -671,7 +679,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const pane = fake.addPane({ cwd: KEY, sessionId: "live-4" });
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-4", shortId: pane.paneId } }));
-    const result = await off(deps, KEY, "@a1");
+    const result = await off(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok && result.kind === "turned-off") expect(result.stop.kind).toBe("stop-failed");
     const store = await loadAgents(deps.agentsPath);
@@ -683,7 +691,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const fake = makeFakeHost({ failListing: true });
     const deps = baseDeps(dir, fake.runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", restoreTarget: { sessionId: "live-5", shortId: "w1:p1" } }));
-    const result = await deleteAgent(deps, KEY, "@a1");
+    const result = await deleteAgent(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.kind).toBe("parked");
     const store = await loadAgents(deps.agentsPath);
@@ -696,7 +704,7 @@ describe("off, archive and delete all stop a session through the IDENTICAL `stop
     const fake2 = makeFakeHost();
     fake2.addPane({ cwd: KEY, sessionId: "live-5" });
     const retryDeps = { ...deps, runCommand: fake2.runCommand };
-    const retryResult = await deleteAgent(retryDeps, KEY, "@a1");
+    const retryResult = await deleteAgent(retryDeps, byId("@a1"));
     expect(retryResult.ok).toBe(true);
     if (retryResult.ok) expect(retryResult.kind).toBe("deleted");
     expect(fake2.stops()).toEqual(["w1"]);
@@ -729,11 +737,11 @@ describe("archive / unarchive", () => {
     const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", name: "keepme" }));
 
-    const archived = await archive(deps, KEY, "@a1");
+    const archived = await archive(deps, byId("@a1"));
     expect(archived.ok).toBe(true);
     if (archived.ok && archived.kind === "archived") expect(archived.agent.name).toBe("keepme");
 
-    const unarchived = await unarchive(deps, KEY, "@a1");
+    const unarchived = await unarchive(deps, byId("@a1"));
     expect(unarchived.ok).toBe(true);
     if (unarchived.ok) {
       expect(unarchived.agent.state).toBe("off");
@@ -745,34 +753,14 @@ describe("archive / unarchive", () => {
     const dir = await makeTempDir();
     const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off" }));
-    const result = await unarchive(deps, KEY, "@a1");
+    const result = await unarchive(deps, byId("@a1"));
     expect(result.ok).toBe(false);
   });
 
-  test("rename refuses a taken name held by an ARCHIVED agent (B4)", async () => {
-    const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeHost().runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1" }));
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a2", name: "held", state: "archived" }));
-    const result = await rename(deps, KEY, "@a1", "held");
-    expect(result.ok).toBe(false);
-  });
 });
 
-// --- rename / name alias, persisted through the real store --------------
-
-describe("rename / name", () => {
-  test("name (the alias) and rename are the same function — persisted identically", async () => {
-    expect(nameVerb).toBe(rename);
-    const dir = await makeTempDir();
-    const deps = baseDeps(dir, makeFakeHost().runCommand);
-    await seedAgent(deps.agentsPath, makeAgent({ id: "@a1" }));
-    const result = await nameVerb(deps, KEY, "@a1", "firstname");
-    expect(result.ok).toBe(true);
-    const store = await loadAgents(deps.agentsPath);
-    if (store.status === "loaded") expect(store.state.agents["@a1"]?.name).toBe("firstname");
-  });
-});
+// --- name / rename: RETIRED (R9) — see cli-grammar.test.ts and
+// agent-model.test.ts's `resolveAgent` suite for what replaced them.
 
 // --- list: directory-scoped, archived included (R10) ---------------------
 
@@ -803,7 +791,7 @@ describe("attachTarget", () => {
     const dir = await makeTempDir();
     const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "on", birthSessionId: "d1", restoreTarget: { sessionId: "l1", shortId: "l1short0" } }));
-    const result = await attachTarget(deps, KEY, "@a1");
+    const result = await attachTarget(deps, byId("@a1"));
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.restoreSessionId).toBe("l1");
@@ -815,7 +803,7 @@ describe("attachTarget", () => {
     const dir = await makeTempDir();
     const deps = baseDeps(dir, makeFakeHost().runCommand);
     await seedAgent(deps.agentsPath, makeAgent({ id: "@a1", state: "off" }));
-    const result = await attachTarget(deps, KEY, "@a1");
+    const result = await attachTarget(deps, byId("@a1"));
     expect(result.ok).toBe(false);
     if (!result.ok && "reason" in result) {
       expect(result.reason).toBe("off");
@@ -854,17 +842,18 @@ describe("mcp", () => {
       ...baseDeps(dir, makeFakeHost().runCommand),
       launchConfigDeps: { readConfigFile: async () => ROCKETR_MCP, settingsIo },
     };
-    const created = await create(deps, KEY, "rocketr");
+    const created = await create(deps, KEY);
     if (!created.ok) throw new Error("create failed");
+    const ref = byId(created.agent.id);
     for (const path of Object.keys(settingsIo.files)) delete settingsIo.files[path];
 
-    const shown = await mcp(deps, KEY, "rocketr");
+    const shown = await mcp(deps, ref);
     if (!shown.ok) throw new Error(shown.message);
     expect(shown.agent.mcp).toBeUndefined();
     expect(shown.effective).toEqual([{ name: "rocketr", notifications: true }, { name: "yappr", notifications: true }]);
     expect(shown.changed).toBe(false);
 
-    const set = await mcp(deps, KEY, "rocketr", [{ name: "rocketr", notifications: true }]);
+    const set = await mcp(deps, ref, [{ name: "rocketr", notifications: true }]);
     if (!set.ok) throw new Error(set.message);
     expect(set.changed).toBe(true);
     expect(set.agent.mcp).toEqual([{ name: "rocketr", notifications: true }]);
@@ -872,21 +861,21 @@ describe("mcp", () => {
     // The approval is written at once, ahead of the agent's next start.
     expect(approvalIn(settingsIo, KEY)).toEqual(["rocketr"]);
 
-    const again = await mcp(deps, KEY, "rocketr", [{ name: "rocketr", notifications: true }]);
+    const again = await mcp(deps, ref, [{ name: "rocketr", notifications: true }]);
     if (!again.ok) throw new Error(again.message);
     expect(again.changed).toBe(false);
 
-    const reset = await mcp(deps, KEY, "rocketr", null);
+    const reset = await mcp(deps, ref, null);
     if (!reset.ok) throw new Error(reset.message);
     expect(reset.changed).toBe(true);
     expect(reset.agent.mcp).toBeUndefined();
   });
 
-  test("refused for an agent that is not in this directory, and nothing is written", async () => {
+  test("refused for an unknown ref, and nothing is written", async () => {
     const dir = await makeTempDir();
     const settingsIo = memorySettings();
     const deps = { ...baseDeps(dir, makeFakeHost().runCommand), launchConfigDeps: { readConfigFile: async () => ROCKETR_MCP, settingsIo } };
-    const result = await mcp(deps, KEY, "nobody", [{ name: "rocketr", notifications: true }]);
+    const result = await mcp(deps, { kind: "name", ref: "nobody" }, [{ name: "rocketr", notifications: true }]);
     expect(result.ok).toBe(false);
     expect(settingsIo.files).toEqual({});
   });

@@ -95,7 +95,7 @@ async function main(): Promise<void> {
   const key = directory as ClaimKey;
 
   if (mode === "safe") {
-    const result = await on(deps, key, agentId);
+    const result = await on(deps, { kind: "id", ref: agentId });
     const launched = result.ok && result.launchIssued;
     console.log(JSON.stringify({ launched }));
     return;

@@ -223,7 +223,12 @@ describe("adopt: refusals, live (DoD #6)", () => {
     expect(!outcome.ok && outcome.reason).toBe("agent-not-in-source");
   });
 
-  test("name-collision: the destination already holds a DIFFERENT agent with the same name", async () => {
+  // BAKR-34/BAKR-42 R9: custom names — and the name-collision check that
+  // used to run here — are retired. Adopting into a directory that already
+  // holds a non-archived agent now simply succeeds (see adopt-model.ts's
+  // own module comment): R6's one-per-directory line is drawn at `create`,
+  // not at adopt.
+  test("adopting into a destination that already holds a DIFFERENT agent succeeds — no name-collision check exists any more", async () => {
     const storeDir = await makeTempDir();
     const source = await makeOrphan(storeDir);
     const destination = await makeTempDir("bakr-adopt-dest-");
@@ -232,8 +237,7 @@ describe("adopt: refusals, live (DoD #6)", () => {
     await saveAgents(join(storeDir, "agents.json"), agentState);
 
     const outcome = await adopt(makeDeps(storeDir), { source, destinationInput: destination, agentIds: ["@a1"] });
-    expect(outcome.ok).toBe(false);
-    expect(!outcome.ok && outcome.reason).toBe("name-collision");
+    expect(outcome.ok).toBe(true);
   });
 
   test("SECOND ADOPTER: two candidates racing for the same orphan — the first succeeds, the second gets a typed refusal naming where the agents went (Q3)", async () => {

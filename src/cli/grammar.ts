@@ -7,12 +7,11 @@ export const TOP_LEVEL_WORDS = ["list", "create", "adopt", "relaunch", "status"]
 export type ParsedCommand =
   | { kind: "discover" }
   | { kind: "list"; showArchived: boolean }
-  | { kind: "create"; name?: string; mcp?: string[] }
+  | { kind: "create"; mcp?: string[] }
   | { kind: "adopt"; ids: string[] }
   | { kind: "attach"; ref: string }
   | { kind: "on" | "off" | "archive" | "unarchive"; ref: string }
   | { kind: "delete"; ref: string; yes: boolean }
-  | { kind: "rename"; ref: string; newName: string }
   | { kind: "send"; ref: string; message: string }
   /** Read-only: the tool-permission prompts waiting on this agent's own pane. */
   | { kind: "permissions"; ref: string }
@@ -31,7 +30,7 @@ export type ParsedCommand =
 
 export type ParseResult = { ok: true; command: ParsedCommand } | { ok: false; message: string };
 
-type Flags = { name?: string; mcp: string[]; yes: boolean; archived: boolean; all: boolean; json: boolean; always: boolean; as?: string; help: boolean };
+type Flags = { mcp: string[]; yes: boolean; archived: boolean; all: boolean; json: boolean; always: boolean; as?: string; help: boolean };
 
 function scan(argv: string[]): { ok: true; words: string[]; flags: Flags } | { ok: false; message: string } {
   const words: string[] = [];
@@ -39,9 +38,7 @@ function scan(argv: string[]): { ok: true; words: string[]; flags: Flags } | { o
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!;
     if (token === "--name") {
-      const value = argv[++i];
-      if (value === undefined || value.startsWith("-")) return { ok: false, message: "--name requires a value" };
-      flags.name = value;
+      return { ok: false, message: `--name is retired — an agent's name is derived from its directory now; "create" no longer takes a name (BAKR-42)` };
     } else if (token === "--mcp") {
       const value = argv[++i];
       if (value === undefined || value.startsWith("-")) return { ok: false, message: "--mcp requires a server spec" };
@@ -65,7 +62,6 @@ function scan(argv: string[]): { ok: true; words: string[]; flags: Flags } | { o
 
 function error(message: string): ParseResult { return { ok: false, message }; }
 function disallowed(f: Flags, allowed: Partial<Record<keyof Flags, boolean>>, label: string): string | undefined {
-  if (f.name !== undefined && !allowed.name) return `--name is not valid with "${label}"`;
   if (f.mcp.length > 0 && !allowed.mcp) return `--mcp is not valid with "${label}"`;
   if (f.yes && !allowed.yes) return `--yes/-y is not valid with "${label}"`;
   if (f.archived && !allowed.archived) return `--archived is not valid with "${label}"`;
@@ -80,8 +76,7 @@ export function parseArgv(argv: string[]): ParseResult {
   const s = scan(argv); if (!s.ok) return s;
   const { words, flags } = s;
   if (flags.help) {
-    if (words.length || flags.name !== undefined || flags.mcp.length > 0 || flags.yes || flags.archived || flags.all || flags.json) return error("--help/-h must be used alone");
-    if (words.length || flags.name !== undefined || flags.mcp.length > 0 || flags.yes || flags.archived || flags.all || flags.always || flags.as !== undefined) return error("--help/-h must be used alone");
+    if (words.length || flags.mcp.length > 0 || flags.yes || flags.archived || flags.all || flags.json || flags.always || flags.as !== undefined) return error("--help/-h must be used alone");
     return { ok: true, command: { kind: "help" } };
   }
   if (!words.length) {
@@ -96,8 +91,8 @@ export function parseArgv(argv: string[]): ParseResult {
   }
   if (first === "create") {
     if (words.length !== 1) return error('"create" takes no positional arguments');
-    const bad = disallowed(flags, { name: true, mcp: true }, "create");
-    return bad ? error(bad) : { ok: true, command: { kind: "create", ...(flags.name === undefined ? {} : { name: flags.name }), ...(flags.mcp.length === 0 ? {} : { mcp: flags.mcp }) } };
+    const bad = disallowed(flags, { mcp: true }, "create");
+    return bad ? error(bad) : { ok: true, command: { kind: "create", ...(flags.mcp.length === 0 ? {} : { mcp: flags.mcp }) } };
   }
   if (first === "status") {
     if (words.length !== 1) return error('"status" takes no arguments');
@@ -128,9 +123,12 @@ export function parseArgv(argv: string[]): ParseResult {
     if (words.length !== 2) return error('"delete" takes no further positional arguments');
     return { ok: true, command: { kind: "delete", ref: first, yes: flags.yes } };
   }
+  // BAKR-34/BAKR-42 R9: `name`/`rename` are retired — an agent's name is
+  // always derived from its directory now. A usage error, not a dispatched
+  // command: `bakr <ref>` alone (with no verb) is what surfaces R8's own
+  // "renamed: use <derived-name>" hint when `ref` is a stale custom name.
   if (verb === "name" || verb === "rename") {
-    if (words.length !== 3) return error(`"${verb}" requires exactly one new name`);
-    return { ok: true, command: { kind: "rename", ref: first, newName: words[2]! } };
+    return error(`"${verb}" is retired — an agent's name is derived from its directory now (BAKR-42); run "bakr ${first}" alone to see its current derived name if "${first}" was a custom name`);
   }
   if (verb === "relaunch") {
     if (words.length !== 2) return error('"relaunch" takes no further arguments');

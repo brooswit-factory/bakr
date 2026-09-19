@@ -3,6 +3,7 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { emptyAgentStore, putAgent, type AgentRecord } from "../../src/agent-model";
+import { deriveDirectoryNames } from "../../src/agent-name";
 import { load as loadAgents, save as saveAgents } from "../../src/agent-store-io";
 import type { ClaimKey } from "../../src/claim-key-resolve";
 import { runCli, type CliDeps } from "../../src/cli/main";
@@ -54,12 +55,18 @@ async function setup(agent: Partial<AgentRecord>, send: ResidentMessenger["messa
     permissions: { list: async () => { throw new Error("send must not read permission prompts"); }, approve: async () => { throw new Error("send must not approve a permission prompt"); } },
     permissionAuditPath: join(root, "permission-approvals.jsonl"),
   };
-  return { root, deps, out, err, sent, commands, agentsPath, host };
+  // BAKR-34/BAKR-42 R1/R3: the label shown for @a1 is its CURRENT derived name
+  // (agent-name.ts), never the legacy `name` field — computed here the same
+  // way production does, so the assertion below tracks the real derivation
+  // rather than a hardcoded guess at what a temp directory's last two
+  // segments happen to be.
+  const name = deriveDirectoryNames([root]).get(root)!;
+  return { root, name, deps, out, err, sent, commands, agentsPath, host };
 }
 
 test("send targets the agent's current session and prints the reply without a TTY", async () => {
   const s = await setup({}, async () => ({ status: "replied", reply: "done" }));
-  expect(await runCli(["alice", "send", "status?"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "send", "status?"], s.deps)).toBe(0);
   expect(s.sent).toEqual([[{ provider: "claude", sessionId: "full-session", cwd: s.root }, "status?"]]);
   expect(s.out.join("")).toBe("done\n");
   expect(s.err).toEqual([]);
@@ -75,14 +82,14 @@ test("a pending reply is delivered but reported as unfinished", async () => {
 test.each([["busy", 1], ["not-running", 1], ["unsupported-provider", 1], ["delivery-unconfirmed", 3]] as const)(
   "transport refusal %s is reported, never retried", async (reason, code) => {
     const s = await setup({}, async () => { throw refusal(reason); });
-    expect(await runCli(["alice", "send", "hi"], s.deps)).toBe(code);
+    expect(await runCli(["@a1", "send", "hi"], s.deps)).toBe(code);
     expect(s.sent.length).toBe(1);
     expect(s.err.join("")).toBe(`${reason}: ${reason} detail\n`);
   });
 
 test("an off agent is refused before any transport call", async () => {
   const s = await setup({ state: "off" }, async () => { throw new Error("must not send"); });
-  expect(await runCli(["alice", "send", "hi"], s.deps)).toBe(1);
+  expect(await runCli(["@a1", "send", "hi"], s.deps)).toBe(1);
   expect(s.sent).toEqual([]);
 });
 
@@ -94,9 +101,9 @@ test("an off agent is refused before any transport call", async () => {
 test("an agent whose session moved into a worktree under its directory is listed and sendable there", async () => {
   const s = await setup({}, async () => ({ status: "replied", reply: "done" }), r => [{ sessionId: "full-session", cwd: `${r}/.claude/worktrees/feat` }]);
   expect(await runCli(["list"], s.deps)).toBe(0);
-  expect(s.out.join("")).toBe(`@a1 "alice" — on — listed by claude in .claude/worktrees/feat\n`);
+  expect(s.out.join("")).toBe(`@a1 "${s.name}" — on — listed by claude in .claude/worktrees/feat\n`);
   s.out.length = 0;
-  expect(await runCli(["alice", "send", "status?"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "send", "status?"], s.deps)).toBe(0);
   expect(s.sent).toEqual([[{ provider: "claude", sessionId: "full-session", cwd: `${s.root}/.claude/worktrees/feat` }, "status?"]]);
   expect(s.out.join("")).toBe("done\n");
 });
@@ -105,10 +112,10 @@ test("an on agent whose session is not running is reported as such by list and r
   const s = await setup({}, async () => { throw new Error("must not send"); }, r => [{ sessionId: "other-session", cwd: r }]);
   const before = await loadAgents(s.agentsPath);
   expect(await runCli(["list"], s.deps)).toBe(0);
-  expect(s.out.join("")).toBe(`@a1 "alice" — on — not listed\n`);
-  expect(await runCli(["alice", "send", "hi"], s.deps)).toBe(1);
+  expect(s.out.join("")).toBe(`@a1 "${s.name}" — on — not listed\n`);
+  expect(await runCli(["@a1", "send", "hi"], s.deps)).toBe(1);
   expect(s.sent).toEqual([]);
-  expect(s.err.join("")).toContain("not-running: agent @a1 is on in bakr's store but its exact session full-session is not a running background session — nothing was sent; the daemon restores it, or run `bakr alice on`");
+  expect(s.err.join("")).toContain("not-running: agent @a1 is on in bakr's store but its exact session full-session is not a running background session — nothing was sent; the daemon restores it, or run `bakr @a1 on`");
   expect(s.commands.every(isListingCommand)).toBe(true);
   expect(await loadAgents(s.agentsPath)).toEqual(before);
 });
@@ -116,8 +123,8 @@ test("an on agent whose session is not running is reported as such by list and r
 test("the exact session running outside the agent's directory is never messaged", async () => {
   const s = await setup({}, async () => { throw new Error("must not send"); }, r => [{ sessionId: "full-session", cwd: `${r}-sibling` }]);
   expect(await runCli(["list"], s.deps)).toBe(0);
-  expect(s.out.join("")).toBe(`@a1 "alice" — on — listed by claude, not sendable (outside-directory)\n`);
-  expect(await runCli(["alice", "send", "hi"], s.deps)).toBe(1);
+  expect(s.out.join("")).toBe(`@a1 "${s.name}" — on — listed by claude, not sendable (outside-directory)\n`);
+  expect(await runCli(["@a1", "send", "hi"], s.deps)).toBe(1);
   expect(s.sent).toEqual([]);
   expect(s.err.join("")).toContain("outside-directory:");
 });
@@ -126,15 +133,15 @@ test("a session still running under legacy `claude --bg` (not yet relaunched int
   const s = await setup({}, async () => ({ status: "replied", reply: "done" }), () => []);
   s.host.legacy.push({ id: "fullsess", sessionId: "full-session", cwd: s.root, startedAt: 1, kind: "background", pid: process.pid });
   expect(await runCli(["list"], s.deps)).toBe(0);
-  expect(s.out.join("")).toBe(`@a1 "alice" — on — listed by claude\n`);
+  expect(s.out.join("")).toBe(`@a1 "${s.name}" — on — listed by claude\n`);
   s.out.length = 0;
-  expect(await runCli(["alice", "send", "status?"], s.deps)).toBe(0);
+  expect(await runCli(["@a1", "send", "status?"], s.deps)).toBe(0);
   expect(s.sent).toEqual([[{ provider: "claude", sessionId: "full-session", cwd: s.root }, "status?"]]);
 });
 
 test("a failed listing refuses send without guessing a cwd", async () => {
   const s = await setup({}, async () => { throw new Error("must not send"); }, () => new Error("daemon down"));
-  expect(await runCli(["alice", "send", "hi"], s.deps)).toBe(3);
+  expect(await runCli(["@a1", "send", "hi"], s.deps)).toBe(3);
   expect(s.sent).toEqual([]);
   expect(s.err.join("")).toContain("listing-failed:");
 });
