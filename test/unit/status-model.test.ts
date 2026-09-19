@@ -10,7 +10,7 @@
 import { describe, expect, test } from "bun:test";
 import { emptyAgentStore, putAgent, type AgentRecord, type AgentStoreState, type LaunchRecord } from "../../src/agent-model";
 import type { ClaimKey } from "../../src/claim-key-resolve";
-import { buildStatusReport, statusExitCode, renderStatusText, type HerdrPane, type BlockingPromptInfo, type StatusInputs } from "../../src/status-model";
+import { applyArgvVerdicts, argvCandidates, buildStatusReport, statusExitCode, renderStatusText, type HerdrPane, type BlockingPromptInfo, type StatusInputs } from "../../src/status-model";
 
 const KEY = "/claimed/dir" as ClaimKey;
 const CHECKED_AT = 1_700_000_000_000;
@@ -211,4 +211,56 @@ test("FALSIFIER: a failed herdr listing leaves every agent ok: null, never not-i
 test("exit 2 wins over exit 1: a report that could not see everything is never a clean bill of health", () => {
   const r = report({ agents: [agent({ id: "@a" })], herdr: { ok: false, reason: "down" }, store: { ok: false, reason: "malformed" } });
   expect(statusExitCode(r)).toBe(2);
+});
+
+// BAKR-61: the live-argv check, folded in after every other check.
+describe("bakr status: argv-mismatch (BAKR-61)", () => {
+  const healthy = () => report({ agents: [agent({ id: "@a" })], panes: [pane({ paneId: "@a-pane", sessionId: "@a-session" })] });
+
+  test("only an on agent every other check calls healthy is an argv candidate", () => {
+    const r = report({
+      agents: [agent({ id: "@a" }), agent({ id: "@gone" }), agent({ id: "@off", state: "off" })],
+      panes: [pane({ paneId: "@a-pane", sessionId: "@a-session" }), pane({ paneId: "@off-pane", sessionId: "@off-session" })],
+    });
+    expect(argvCandidates(r).map((a) => a.id)).toEqual(["@a"]);
+  });
+
+  test("a mismatch is `ok: false`, problem `argv-mismatch` naming the pane, session and difference, and exit 1", () => {
+    const r = applyArgvVerdicts(healthy(), new Map([["@a", { ok: false, reason: "argv lacks --dangerously-load-development-channels server:rocketr" } as const]]));
+    expect(only(r).ok).toBe(false);
+    expect(only(r).problem!.code).toBe("argv-mismatch");
+    expect(only(r).problem!.text).toContain("pane @a-pane is running session @a-session");
+    expect(only(r).problem!.text).toContain("argv lacks --dangerously-load-development-channels server:rocketr");
+    expect(r.argv).toEqual({ ok: true });
+    expect(statusExitCode(r)).toBe(1);
+    expect(renderStatusText(r)).toContain("PROBLEM: argv-mismatch");
+  });
+
+  test("a match leaves the agent healthy and the exit 0", () => {
+    const r = applyArgvVerdicts(healthy(), new Map([["@a", { ok: true } as const]]));
+    expect(only(r)).toMatchObject({ ok: true, problem: null });
+    expect(statusExitCode(r)).toBe(0);
+  });
+
+  test("an agent another check already explains keeps that problem: argv never overrides it", () => {
+    const r0 = report({ agents: [agent({ id: "@a" })], panes: [pane({ paneId: "w9:p1", sessionId: "@a-session" })] });
+    const r = applyArgvVerdicts(r0, new Map([["@a", { ok: false, reason: "argv lacks everything" } as const]]));
+    expect(only(r).problem!.code).toBe("wrong-pane");
+  });
+
+  // FALSIFIER: an unreadable argv must be "couldn't check", never "down" and
+  // never a clean bill of health. Folding `ok: null` into a mismatch fails the
+  // first two expectations; ignoring it fails the exit-code one.
+  test("an argv that could not be read is `ok: null`, no problem, the reason on `argv`, and exit 2", () => {
+    const r = applyArgvVerdicts(healthy(), new Map([["@a", { ok: null, reason: "`herdr pane process-info` failed for pane @a-pane: boom" } as const]]));
+    expect(only(r).ok).toBeNull();
+    expect(only(r).problem).toBeNull();
+    expect(r.argv).toEqual({ ok: false, reason: expect.stringContaining("@a (pane @a-pane): `herdr pane process-info` failed") });
+    expect(statusExitCode(r)).toBe(2);
+    expect(renderStatusText(r)).toContain("argv: COULD NOT CHECK");
+  });
+
+  test("a report with no argv observations says argv ok", () => {
+    expect(healthy().argv).toEqual({ ok: true });
+  });
 });

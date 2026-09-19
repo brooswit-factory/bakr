@@ -61,3 +61,6 @@ export { stopSession } from "./stop";
 
 export type { RespawnDeps, RespawnResult } from "./respawn";
 export { respawnSession, isRecognizedStaleCwdRefusal, isRecognizedMissingJobRefusal } from "./respawn";
+
+export type { PaneArgv } from "./herdr";
+export { readPaneArgv } from "./herdr";

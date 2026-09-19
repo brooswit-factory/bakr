@@ -27,6 +27,7 @@ import { list as listClaims, emptyStore, type ClaimStoreState } from "./claim-mo
 import { loadOrMigrateAgentStore } from "./agent-store-migrate";
 import { load as loadAgents, withAgentStoreLock } from "./agent-store-io";
 import {
+  putAgent,
   type AgentRecord,
   type AgentStoreState,
   type AttemptKey,
@@ -50,8 +51,10 @@ import {
   resetRestoreAttempts,
   planRestore,
 } from "./agent-model";
-import { claudeLaunchArgs, provisionMcpFor, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
-import { listBackgroundSessions, decideLiveness, checkLiveness, isPidAlive, launch, respawnSession, isRecognizedStaleCwdRefusal, detectStaleRegisteredCwdRefusal, type RunCommand, type BackgroundSessionInfo } from "./spawn";
+import { claudeLaunchArgs, expectedClaudeLaunchArgs, provisionMcpFor, type LaunchConfigDeps, type McpServerDeclaration } from "./launch-config";
+import { listBackgroundSessions, decideLiveness, checkLiveness, isPidAlive, isHerdrPaneId, launch, readPaneArgv, respawnSession, isRecognizedStaleCwdRefusal, detectStaleRegisteredCwdRefusal, type RunCommand, type BackgroundSessionInfo } from "./spawn";
+import { checkAgentArgv } from "./argv-check";
+import { relaunch, type AgentActionDeps } from "./agent-actions";
 import { probeResumableTranscript, type TranscriptProbeDeps } from "./transcript-probe";
 import { realTranscriptProbeDeps, realLaunchConfigDeps, realResumeCwdDeps } from "./paths";
 import { resumeCwdFor, type ResumeCwdDeps } from "./resume-cwd";
@@ -62,6 +65,16 @@ import { log } from "./log";
 
 /** See session-slots.ts's own module comment for the live incident this bound closes — ported unchanged. Now counted per AGENT id (R-C), not per durable session id. */
 const MAX_CONSECUTIVE_UNVERIFIED_RESTORES = 3;
+
+/**
+ * BAKR-61: how many times in a row this process relaunches one agent whose
+ * live argv does not match what bakr launches it with, before it stops and
+ * says so. A relaunch that still comes back mismatched means bakr's own launch
+ * and its own check disagree; relaunching again would only kill and restart a
+ * live session forever. Counted in memory, per agent, reset by a match — so a
+ * daemon restart (the evidence a reboot brings) gets a fresh look.
+ */
+const MAX_CONSECUTIVE_ARGV_RELAUNCHES = 2;
 
 export interface DaemonDeps {
   readonly runCommand: RunCommand;
@@ -80,6 +93,8 @@ export interface DaemonDeps {
   /** Where a session last ran, so a restore resumes there (resume-cwd.ts). Defaults to reading its real transcript. */
   readonly resumeCwdDeps?: ResumeCwdDeps;
   readonly acquireTimeoutMs?: number;
+  /** BAKR-61: the waits and probes of the relaunch an argv mismatch triggers (`relaunch`'s own deps). Optional — each defaults to the real one; tests pass instant ones. */
+  readonly relaunch?: Pick<AgentActionDeps, "sleep" | "isPidAlive" | "readTranscript">;
 }
 
 /** The agent's own MCP declaration, read fresh from the store; `undefined` (the default: every server its `.mcp.json` configures) when it has none or the store cannot be read. */
@@ -136,6 +151,13 @@ export interface DaemonState {
    * started" signal in this tree.
    */
   readonly isFirstCycle?: boolean;
+  /**
+   * BAKR-61: consecutive argv relaunches per agent id — see
+   * `MAX_CONSECUTIVE_ARGV_RELAUNCHES`. An agent whose argv matches has no
+   * entry. OPTIONAL for the same reason as `isFirstCycle`: an older literal
+   * starts every agent at zero.
+   */
+  readonly argvRelaunches?: Readonly<Record<string, number>>;
 }
 
 export function initialDaemonState(): DaemonState {
@@ -213,6 +235,8 @@ export interface ReconcileResult {
   readonly orphanReportSignatures: Readonly<Record<string, string>>;
   /** See `DaemonState.isFirstCycle` — carried forward into the next cycle's `DaemonState` by `runDaemonLoop`, exactly like `orphanReportSignatures`. OPTIONAL for the identical reason: a pre-BAKR-33 literal that omits it defaults to `false` wherever read. */
   readonly isFirstCycle?: boolean;
+  /** See `DaemonState.argvRelaunches` — carried forward by `runDaemonLoop`. */
+  readonly argvRelaunches?: Readonly<Record<string, number>>;
 }
 
 /**
@@ -583,6 +607,97 @@ async function dispatchRespawnForDaemon(deps: DaemonDeps, agentId: string, key: 
   return { kind: "refused", error: result.error };
 }
 
+/** `prior`'s argv relaunch counts, for a cycle that decided nothing about any agent. */
+const carryArgv = (prior: DaemonState): { argvRelaunches?: Readonly<Record<string, number>> } =>
+  prior.argvRelaunches === undefined ? {} : { argvRelaunches: prior.argvRelaunches };
+
+/** The operator verbs' deps, from the daemon's own: what `relaunch` needs to replace a session. */
+function actionDepsFor(deps: DaemonDeps): AgentActionDeps {
+  return {
+    agentsPath: deps.agentsPath,
+    runCommand: deps.runCommand,
+    now: deps.now,
+    generateAttemptId: deps.generateAttemptId,
+    randomBytes: deps.randomBytes,
+    ...(deps.acquireTimeoutMs === undefined ? {} : { acquireTimeoutMs: deps.acquireTimeoutMs }),
+    ...(deps.transcriptProbeDeps === undefined ? {} : { transcriptProbeDeps: deps.transcriptProbeDeps }),
+    ...(deps.launchConfigDeps === undefined ? {} : { launchConfigDeps: deps.launchConfigDeps }),
+    ...(deps.resumeCwdDeps === undefined ? {} : { resumeCwdDeps: deps.resumeCwdDeps }),
+    ...deps.relaunch,
+  };
+}
+
+/**
+ * BAKR-61: an agent the liveness check just called alive is only healthy if
+ * its claude runs with the flags bakr launches it with now. herdr's own
+ * resume-on-restore brings a pane back after a reboot as a bare
+ * `claude --resume <id>` — same pane, same session, no channels — and before
+ * this check the daemon adopted every one of those as healthy while the agents
+ * were deaf (2026-09-19). A mismatch is replaced by `relaunch` — the operator
+ * verb, so the same stop, wait, resume-in-place and bookkeeping — on the SAME
+ * session id, through drovr's hostResident.
+ *
+ * Returns this agent's consecutive-relaunch count to carry into the next cycle
+ * (`undefined`: none). Never relaunches when:
+ *   - the argv or the launch config cannot be read — couldn't check is not a
+ *     mismatch; the count is carried unchanged;
+ *   - the session is mid-turn — `relaunch` refuses, and the next idle cycle
+ *     tries again without counting it;
+ *   - it has already relaunched this agent `MAX_CONSECUTIVE_ARGV_RELAUNCHES`
+ *     times in a row and the argv still does not match — it logs that once
+ *     and waits for an operator (or a match, or a daemon restart).
+ * A relaunch whose replacement fails leaves `relaunch` parking the agent
+ * `off`; the daemon turns it back `on` so its ordinary restore — which carries
+ * the configured flags — brings it back, bounded by its own attempt limit,
+ * and `bakr status` keeps reporting it rather than hiding an `off` agent.
+ */
+async function reconcileArgv(deps: DaemonDeps, agentId: string, key: ClaimKey, sessions: readonly BackgroundSessionInfo[], prior: number): Promise<number | undefined> {
+  const carry = prior > 0 ? prior : undefined;
+  const loaded = await loadAgents(deps.agentsPath);
+  const agent = loaded.status === "loaded" ? loaded.state.agents[agentId] : undefined;
+  const target = agent?.restoreTarget;
+  if (agent === undefined || agent.state !== "on" || target === undefined) return carry;
+  const entry = sessions.find((s) => s.sessionId === target.sessionId);
+  // A legacy `claude --bg` session has no pane to read an argv from; `relaunch` is how it moves to one anyway.
+  if (entry === undefined || !isHerdrPaneId(entry.id)) return carry;
+
+  const [live, expected] = await Promise.all([
+    readPaneArgv(entry.id, deps.runCommand),
+    expectedClaudeLaunchArgs(key, deps.launchConfigDeps ?? realLaunchConfigDeps, agent.mcp).catch(() => undefined),
+  ]);
+  if (!live.ok || expected === undefined) return carry;
+  const verdict = checkAgentArgv(expected, live.argv, target.sessionId);
+  if (verdict.ok) return undefined;
+
+  if (prior >= MAX_CONSECUTIVE_ARGV_RELAUNCHES) {
+    if (prior === MAX_CONSECUTIVE_ARGV_RELAUNCHES) {
+      log("error", `agent ${agentId} in "${key}": pane ${entry.id} still runs session ${target.sessionId} without bakr's launch flags (${verdict.reason}) after ${prior} relaunches in a row — not relaunching again; bakr's launch and its argv check disagree, and an operator must look (BAKR-61). \`bakr status\` reports it as argv-mismatch.`);
+    }
+    return MAX_CONSECUTIVE_ARGV_RELAUNCHES + 1;
+  }
+
+  log("warn", `agent ${agentId} in "${key}": pane ${entry.id} runs session ${target.sessionId} without bakr's launch flags (${verdict.reason}) — not healthy; relaunching the same session with them (BAKR-61)`);
+  const result = await relaunch(actionDepsFor(deps), key, agentId);
+  if (result.ok) {
+    log("info", `agent ${agentId} in "${key}": relaunched session ${result.next.sessionId} in pane ${result.next.shortId} (was ${result.previous.shortId}) with its launch flags`);
+    return prior + 1;
+  }
+  if (result.reason === "busy") {
+    log("info", `agent ${agentId} in "${key}": ${result.message} — its argv relaunch waits for it to be idle`);
+    return carry;
+  }
+  if (result.reason === "launch-failed" || result.reason === "unlisted") {
+    await withAgentStoreLock(deps.agentsPath, (current) => {
+      const now = current.agents[agentId];
+      return { state: now === undefined || now.state !== "off" ? current : putAgent(current, { ...now, state: "on" }), result: undefined };
+    }, lockOpts(deps));
+    log("error", `agent ${agentId} in "${key}": the argv relaunch stopped session ${target.sessionId} but its replacement did not come up (${result.message}) — turned back on so the ordinary restore brings it back with its flags`);
+    return prior + 1;
+  }
+  log("warn", `agent ${agentId} in "${key}": argv relaunch refused (${result.reason}): ${result.message}`);
+  return prior + 1;
+}
+
 /**
  * One reconcile cycle. See the module comment for the R-F.3 discipline this
  * function's per-agent helper enforces. Exactly ONE session listing per
@@ -599,17 +714,17 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
     if (prior.claimDegraded) parts.push(`claim store "${deps.claimsPath}" is malformed`);
     if (prior.agentsDegraded) parts.push(`agent store at "${deps.agentsPath}" (or its pre-migration session-slots.json) is malformed`);
     log("error", `reconcile skipped this cycle: ${parts.join("; ")} — this process will never write to the affected file(s); restart after repairing on disk`);
-    return { claimDegraded: prior.claimDegraded, agentsDegraded: prior.agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
+    return { claimDegraded: prior.claimDegraded, agentsDegraded: prior.agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false, ...carryArgv(prior) };
   }
 
   const { claimState, claimDegraded, agentsDegraded } = await loadStores(deps);
   if (claimDegraded || agentsDegraded) {
-    return { claimDegraded, agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
+    return { claimDegraded, agentsDegraded, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false, ...carryArgv(prior) };
   }
 
   const promoted = await promoteWedgedLaunches(deps);
   if (promoted.malformed) {
-    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false, ...carryArgv(prior) };
   }
 
   let sessions: BackgroundSessionInfo[];
@@ -620,12 +735,12 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
       "error",
       `reconcile skipped this cycle: the session listing failed: ${err instanceof Error ? err.message : String(err)} — never treated as "nothing running"; no restore is issued this cycle (BAKR-8 Constraint 1)`
     );
-    return { claimDegraded: false, agentsDegraded: false, restored: [], skippedListingFailed: true, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
+    return { claimDegraded: false, agentsDegraded: false, restored: [], skippedListingFailed: true, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false, ...carryArgv(prior) };
   }
 
   const resolved = await resolvePendingLaunches(deps, sessions);
   if (resolved.malformed) {
-    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false, ...carryArgv(prior) };
   }
 
   // A fresh, unlocked peek to enumerate WHICH agent ids to consider this
@@ -635,7 +750,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   const peeked = await loadAgents(deps.agentsPath);
   if (peeked.status === "malformed") {
     log("error", `agent store at "${deps.agentsPath}" became malformed mid-cycle: ${peeked.error} — degrading for the rest of this process's life`);
-    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false };
+    return { claimDegraded: false, agentsDegraded: true, restored: [], skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: prior.isFirstCycle ?? false, ...carryArgv(prior) };
   }
   const peekedState = peeked.status === "loaded" ? peeked.state : emptyAgentStore();
 
@@ -731,6 +846,8 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
   // resolves again, or loses its last `on` agent, simply has no entry here,
   // so a future re-orphaning reports fresh rather than staying silent.
   const nextOrphanReportSignatures: Record<string, string> = {};
+  // BAKR-61: only agents still counting carry an entry; one that matches, or is no longer `on`, drops out.
+  const nextArgvRelaunches: Record<string, number> = {};
 
   for (const claimEntry of listClaims(claimState)) {
     const key = claimEntry.key;
@@ -765,11 +882,18 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
     for (const agent of onAgents) {
       const outcome = await decideAndBeginForAgent(deps, agent.id, key, sessions, prior.isFirstCycle);
       if (outcome.malformed) {
-        return { claimDegraded: false, agentsDegraded: true, restored, skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: false };
+        return { claimDegraded: false, agentsDegraded: true, restored, skippedListingFailed: false, orphanReportSignatures: prior.orphanReportSignatures, isFirstCycle: false, ...carryArgv(prior) };
       }
       const decision = outcome.decision as AgentDecision;
 
-      if (decision.kind === "skip" || decision.kind === "alive" || decision.kind === "reset") {
+      if (decision.kind === "alive" || decision.kind === "reset") {
+        const count = await reconcileArgv(deps, agent.id, key, sessions, prior.argvRelaunches?.[agent.id] ?? 0);
+        if (count !== undefined) nextArgvRelaunches[agent.id] = count;
+        continue;
+      }
+      if (decision.kind === "skip") {
+        const count = prior.argvRelaunches?.[agent.id];
+        if (count !== undefined) nextArgvRelaunches[agent.id] = count;
         continue;
       }
       if (decision.kind === "not-verifiable") {
@@ -862,7 +986,7 @@ export async function runReconcileCycle(prior: DaemonState, deps: DaemonDeps): P
     }
   }
 
-  return { claimDegraded: false, agentsDegraded: false, restored, skippedListingFailed: false, orphanReportSignatures: nextOrphanReportSignatures, isFirstCycle: false };
+  return { claimDegraded: false, agentsDegraded: false, restored, skippedListingFailed: false, orphanReportSignatures: nextOrphanReportSignatures, isFirstCycle: false, argvRelaunches: nextArgvRelaunches };
 }
 
 export interface DaemonLoopOptions {
@@ -895,7 +1019,7 @@ export async function runDaemonLoop(deps: DaemonDeps, options: DaemonLoopOptions
   while (options.signal?.aborted !== true) {
     try {
       const result = await runReconcileCycle(state, deps);
-      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures, isFirstCycle: result.isFirstCycle ?? false };
+      state = { claimDegraded: result.claimDegraded, agentsDegraded: result.agentsDegraded, orphanReportSignatures: result.orphanReportSignatures, isFirstCycle: result.isFirstCycle ?? false, ...(result.argvRelaunches === undefined ? {} : { argvRelaunches: result.argvRelaunches }) };
     } catch (err) {
       log("error", `reconcile cycle threw and was caught, daemon continues: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     }

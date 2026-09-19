@@ -53,10 +53,15 @@ const storeOf = (agents: readonly AgentRecord[], launches: readonly LaunchRecord
  * would fail the run outright — which is the point: the command is documented
  * as valid from any cwd.
  */
-function cliDeps(agentsPath: string, host: FakeHost, out: string[], err: string[]): CliDeps {
+function cliDeps(agentsPath: string, host: FakeHost, out: string[], err: string[], mcpJson?: string): CliDeps {
   const forbidden = (what: string) => () => { throw new Error(`status must never use ${what}`); };
+  // BAKR-61: the launch config is READ for the expected argv, never provisioned — a write throws.
+  const launchConfigDeps = {
+    readConfigFile: async (path: string) => path === join(KEY, ".mcp.json") ? mcpJson : undefined,
+    settingsIo: { readSettings: async () => undefined, writeSettings: async (path: string) => { throw new Error(`status must never write ${path}`); } },
+  };
   return {
-    actions: { agentsPath, runCommand: host.runCommand, now: () => CHECKED_AT, generateAttemptId: forbidden("generateAttemptId"), randomBytes: forbidden("randomBytes") },
+    actions: { agentsPath, runCommand: host.runCommand, now: () => CHECKED_AT, generateAttemptId: forbidden("generateAttemptId"), randomBytes: forbidden("randomBytes"), launchConfigDeps },
     adopt: { claimsPath: "/must/not/exist/claims.json", agentsPath, now: forbidden("adopt.now"), resolveInputs: { lstat: forbidden("lstat"), readlink: forbidden("readlink") }, lexicalInputs: { cwd: "/nonexistent/cwd", home: "/nonexistent" }, probeDeps: { stat: forbidden("stat") } },
     claimsPath: "/must/not/exist/claims.json",
     permissionAuditPath: "/must/not/exist/permission-approvals.jsonl",
@@ -76,7 +81,7 @@ function cliDeps(agentsPath: string, host: FakeHost, out: string[], err: string[
 
 interface Run { code: number; report: StatusReport; out: string; err: string; host: FakeHost }
 
-async function runStatus(setup: { agents?: readonly AgentRecord[]; launches?: readonly LaunchRecord[]; host?: FakeHost; malformedStore?: boolean; argv?: string[] }): Promise<Run & { agentsPath: string }> {
+async function runStatus(setup: { agents?: readonly AgentRecord[]; launches?: readonly LaunchRecord[]; host?: FakeHost; malformedStore?: boolean; argv?: string[]; mcpJson?: string }): Promise<Run & { agentsPath: string }> {
   const dir = await makeTempDir();
   const agentsPath = join(dir, "agents.json");
   if (setup.malformedStore) await writeFile(agentsPath, "{ not json", "utf8");
@@ -84,7 +89,7 @@ async function runStatus(setup: { agents?: readonly AgentRecord[]; launches?: re
   const host = setup.host ?? makeFakeHost();
   const out: string[] = [];
   const err: string[] = [];
-  const code = await runCli(setup.argv ?? ["status", "--json"], cliDeps(agentsPath, host, out, err));
+  const code = await runCli(setup.argv ?? ["status", "--json"], cliDeps(agentsPath, host, out, err, setup.mcpJson));
   const text = out.join("");
   return { code, report: (setup.argv ?? ["status", "--json"]).includes("--json") ? JSON.parse(text) as StatusReport : ({} as StatusReport), out: text, err: err.join(""), host, agentsPath };
 }
@@ -119,9 +124,10 @@ test("a healthy host: every agent ok, problem null everywhere, exit 0", async ()
   expect(report.checkedAt).toBe(new Date(CHECKED_AT).toISOString());
 });
 
-test("STRICTLY READ-ONLY: only `herdr agent list` and `herdr agent read` run, and the store's bytes are unchanged", async () => {
+test("STRICTLY READ-ONLY: only `herdr agent list`, `herdr agent read` and one `herdr pane process-info` per healthy agent run, and the store's bytes are unchanged", async () => {
   const host = makeFakeHost();
   const pane = paneFor(host, "@one-session");
+  paneFor(host, "a-strangers-session"); // not an agent's pane, so its process is never read
   const dir = await makeTempDir();
   const agentsPath = join(dir, "agents.json");
   await saveAgents(agentsPath, storeOf([agentRecord("@one", { restoreTarget: { sessionId: "@one-session", shortId: pane.paneId } })]));
@@ -132,8 +138,10 @@ test("STRICTLY READ-ONLY: only `herdr agent list` and `herdr agent read` run, an
 
   expect(code).toBe(0);
   const commands = host.calls.map((c) => c.slice(0, 3).join(" "));
-  expect([...new Set(commands)].sort()).toEqual(["herdr agent list", "herdr agent read"]);
+  expect([...new Set(commands)].sort()).toEqual(["herdr agent list", "herdr agent read", "herdr pane process-info"]);
   expect(host.calls.filter((c) => c[2] === "list")).toHaveLength(1); // one listing, shared by the scan and the inventory
+  // BAKR-61: exactly one argv read, of the one healthy agent's own pane.
+  expect(host.calls.filter((c) => c[2] === "process-info")).toEqual([["herdr", "pane", "process-info", "--pane", pane.paneId]]);
   expect(host.starts()).toEqual([]);
   expect(host.stops()).toEqual([]);
   expect(await readFile(agentsPath)).toEqual(before);
@@ -234,5 +242,47 @@ test("under 2s for 11 agents (requirement 5), with one listing and one screen re
   expect(report.agents).toHaveLength(11);
   expect(host.calls.filter((c) => c[2] === "list")).toHaveLength(1);
   expect(host.calls.filter((c) => c[2] === "read")).toHaveLength(11);
+  expect(host.calls.filter((c) => c[2] === "process-info")).toHaveLength(11);
   expect(elapsed).toBeLessThan(2000);
+});
+
+// BAKR-61, end to end. The pane below is what herdr's resume_agents_on_restore
+// left on the laptop after the 2026-09-19 reboot: the agent's own session, in
+// its own pane, started as a bare `claude --resume <id>`.
+const ROCKETR_MCP = JSON.stringify({ mcpServers: { rocketr: { type: "http", url: "http://127.0.0.1:8790/mcp" } } });
+const ROCKETR_ARGS = ["--mcp-config", join(KEY, ".mcp.json"), "--settings", '{"enabledMcpjsonServers":["rocketr"]}', "--dangerously-load-development-channels=server:rocketr"];
+
+test("a bare `claude --resume <id>` in the agent's own pane is argv-mismatch, exit 1, never healthy", async () => {
+  const host = makeFakeHost();
+  const bare = host.addPane({ cwd: KEY, sessionId: "@bare-session", args: ["--resume", "@bare-session"] });
+  const full = host.addPane({ cwd: KEY, sessionId: "@full-session", args: ["--resume", "@full-session", ...ROCKETR_ARGS] });
+  const { code, report } = await runStatus({
+    host,
+    mcpJson: ROCKETR_MCP,
+    agents: [
+      agentRecord("@bare", { restoreTarget: { sessionId: "@bare-session", shortId: bare.paneId } }),
+      agentRecord("@full", { restoreTarget: { sessionId: "@full-session", shortId: full.paneId } }),
+    ],
+  });
+  // FALSIFIER: without the argv check the bare pane is `ok: true` and the exit is 0 — exactly what bakr reported after the reboot.
+  expect(code).toBe(1);
+  const bareStatus = report.agents.find((a) => a.id === "@bare")!;
+  expect(bareStatus.ok).toBe(false);
+  expect(bareStatus.problem!.code).toBe("argv-mismatch");
+  expect(bareStatus.problem!.text).toContain("--dangerously-load-development-channels server:rocketr");
+  expect(report.agents.find((a) => a.id === "@full")!.ok).toBe(true);
+  expect(report.argv).toEqual({ ok: true });
+  expect(host.starts()).toEqual([]);
+  expect(host.stops()).toEqual([]);
+});
+
+test("an argv herdr cannot report is `ok: null` with the reason on `argv`, exit 2, and never a mismatch", async () => {
+  const host = makeFakeHost();
+  const pane = host.addPane({ cwd: KEY, sessionId: "@one-session", args: ["--resume", "@one-session"] });
+  pane.pid = undefined; // process-info then lists no claude in the pane's foreground
+  const { code, report } = await runStatus({ host, mcpJson: ROCKETR_MCP, agents: [agentRecord("@one", { restoreTarget: { sessionId: "@one-session", shortId: pane.paneId } })] });
+  expect(code).toBe(2);
+  expect(report.agents[0]!.ok).toBeNull();
+  expect(report.agents[0]!.problem).toBeNull();
+  expect(report.argv.ok).toBe(false);
 });
