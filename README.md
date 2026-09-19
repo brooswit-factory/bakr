@@ -196,7 +196,22 @@ launch argv to restore with, so any restore it does is bare. The live argv
 must carry every development channel, the `--mcp-config` and the
 `--settings` approval bakr launches with (the approval compared parsed, so
 key order and whitespace never matter), run the agent's own session, and carry
-no permission bypass. The daemon checks the same thing on every reconcile
+no permission bypass.
+
+**The no-bypass assertion is about bakr's own agents, and nothing else.** Every
+check here is applied only to agents in bakr's store; an agent bakr does not
+manage is never read, never judged and never relaunched. It holds because bakr
+strips the `--permission-mode bypassPermissions` that drovr's `hostResident`
+adds to every start, and refuses to launch if that strip stops matching
+(`withoutForcedPermissionMode`, src/spawn/herdr.ts) — the argv check is the
+second line, catching a bypass that reached a live process anyway. Agents other
+hosts spawn are a different matter: butchr's ticket agents, for instance, run
+with `bypassPermissions` **by design**, because an unattended agent cannot
+answer an approval prompt. Measured 2026-09-19: 22 of 22 live butchr workers
+carried it, and 0 of 15 bakr-managed agents did. So read this as bakr's own
+property — not as a fleet-wide permission boundary, which does not exist.
+
+The daemon checks the same thing on every reconcile
 cycle and relaunches a mismatched agent on the **same session** with its
 flags — the `relaunch` verb, so never mid-turn — at most twice in a row before
 it stops and logs an error for an operator. Setting herdr's
