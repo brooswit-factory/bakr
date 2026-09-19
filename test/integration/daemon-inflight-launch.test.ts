@@ -41,7 +41,15 @@ async function cycleWithPendingRecordAged(ageMs: number) {
     probeDeps: { stat: async () => ({ dev: 1, ino: 1, isDirectory: () => true }) },
     launchConfigDeps: { readConfigFile: async () => undefined },
   };
-  await runReconcileCycle(initialDaemonState(), deps);
+  // BAKR-33: `isFirstCycle: false` — this file's own scope is
+  // `promoteWedgedLaunches`'s marking behavior specifically (see its module
+  // doc), not this ticket's separate first-cycle-since-restart exception
+  // (covered by daemon-no-wedge-clear.test.ts). Without opting out, an
+  // 11-minute-old record that just got marked failed THIS cycle, with its
+  // target genuinely absent (no pane in this fixture), would also qualify
+  // for that exception on a literal first cycle — a real, intentional, but
+  // orthogonal behavior this file isn't testing.
+  await runReconcileCycle({ ...initialDaemonState(), isFirstCycle: false }, deps);
   const loaded = await loadAgents(join(dir, "agents.json"));
   if (loaded.status !== "loaded") throw new Error("store not loaded");
   return { launches: loaded.state.launches, host };

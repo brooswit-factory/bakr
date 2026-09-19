@@ -88,14 +88,14 @@ function baseDeps(dir: string, runCommand: RunCommand, transcriptProbeDeps: Tran
   };
 }
 
-async function runCycles(deps: DaemonDeps, count: number): Promise<{ capturedLines: string[]; results: Awaited<ReturnType<typeof runReconcileCycle>>[] }> {
+async function runCycles(deps: DaemonDeps, count: number, startState: DaemonState = initialDaemonState()): Promise<{ capturedLines: string[]; results: Awaited<ReturnType<typeof runReconcileCycle>>[] }> {
   const capturedLines: string[] = [];
   const results: Awaited<ReturnType<typeof runReconcileCycle>>[] = [];
   const originalConsoleLog = console.log;
   console.log = (...args: unknown[]) => {
     capturedLines.push(args.map(String).join(" "));
   };
-  let state: DaemonState = initialDaemonState();
+  let state: DaemonState = startState;
   try {
     for (let i = 0; i < count; i++) {
       const result = await runReconcileCycle(state, deps);
@@ -188,7 +188,12 @@ describe("B13a AC6: a stale respawn(X) record already on disk, written by a PRE-
     const fake = makeFakeHost();
     const deps = baseDeps(dir, fake.runCommand, noTranscript);
 
-    const { capturedLines } = await runCycles(deps, 2);
+    // BAKR-33: `isFirstCycle: false` — this test is about B13a's
+    // divergence-keyed suppression specifically, not this ticket's separate
+    // first-cycle-since-restart exception (daemon-no-wedge-clear.test.ts):
+    // an "absent" verdict on an actual first cycle would legitimately
+    // supersede-and-restore this record instead of merely reporting it.
+    const { capturedLines } = await runCycles(deps, 2, { ...initialDaemonState(), isFirstCycle: false });
 
     const unresolvedLines = capturedLines.filter((l) => l.includes("unresolved launch for agent") && l.includes(AGENT_ID));
     expect(unresolvedLines).toHaveLength(2); // still reported, every cycle

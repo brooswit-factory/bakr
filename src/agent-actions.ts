@@ -61,6 +61,12 @@
 // spawn-only reconcile loop) and B13 (the loop's give-up stays final) both
 // stay intact; see `test/unit/daemon-no-stop-path.test.ts`'s sibling
 // assertion in this story's own test suite.
+//
+// AMENDED (BAKR-33, 2026-09-18): that last sentence is no longer literally
+// true — see `clearFailedLaunchRecord`'s own doc (agent-model.ts) for the
+// one narrow, bounded exception `daemon.ts` now has (first reconcile cycle
+// since process start, gated on a fresh verified-absent liveness check).
+// B7/B13 stay intact for every cycle after the first.
 
 import {
   emptyAgentStore,
@@ -70,6 +76,7 @@ import {
   beginLaunch,
   clearFailedLaunchRecord,
   clearFailedForkFromRecordsForCurrentTarget,
+  discardLaunchRecordsForAgents,
   markLaunchStarted,
   markLaunchFailed,
   resolveLaunch,
@@ -735,9 +742,31 @@ export type ArchiveResult =
 type ArchiveLockResult =
   | ResolutionRefusal
   | { readonly ok: true; readonly kind: "no-change"; readonly agent: AgentRecord }
-  | { readonly ok: true; readonly kind: "archive"; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined };
+  | { readonly ok: true; readonly kind: "archive"; readonly agent: AgentRecord; readonly restoreSessionId: string | undefined; readonly launches: readonly LaunchRecord[] };
 
-/** {on, off} -> archived (B6), keeping the name, stopping the session if any. Identical stop path to `off` — `stopLiveSession` (see module comment / DoD item 2). */
+/**
+ * {on, off} -> archived (B6), keeping the name, stopping the session if
+ * any. Identical stop path to `off` — `stopLiveSession` (see module comment
+ * / DoD item 2) — EXTENDED with `delete`'s own `settleUnresolvedLaunches`
+ * fallback (BAKR-17): an agent archived straight from a still-pending,
+ * never-resolved launch (e.g. archived moments after `create`, before any
+ * listing ever matched its short id) has no `restoreTarget` yet for
+ * `stopLiveSession` to stop by — without this fallback, dropping that
+ * agent's launch record below (BAKR-33) would throw away the ONLY handle
+ * bakr had left on a session that might still be genuinely running,
+ * orphaning it. `settleUnresolvedLaunches` uses the launch record itself
+ * (captured in the SAME lock hold as the decision, exactly like `delete`
+ * captures its own `decision.launches`) to find and stop it by short id
+ * first.
+ *
+ * BAKR-33: once the stop is settled (confirmed stopped, already gone, or
+ * every recorded launch accounted for as ended), drops every launch record
+ * this agent still carries — same as `delete` (until this ticket, the only
+ * other path that ever removed one). An archived agent is never restored
+ * again (B6/B7), so a record naming it describes nothing the daemon will
+ * ever act on; left in place, it would sit forever, re-logged as an ERROR
+ * on every daemon start.
+ */
 export async function archive(deps: AgentActionDeps, directory: ClaimKey, ref: string): Promise<ArchiveResult> {
   const recorded = await withAgentStoreLock<ArchiveLockResult>(
     deps.agentsPath,
@@ -746,7 +775,8 @@ export async function archive(deps: AgentActionDeps, directory: ClaimKey, ref: s
       if (!decision.ok || decision.kind === "no-change") {
         return { state: current, result: decision };
       }
-      return { state: putAgent(current, decision.agent), result: decision };
+      const launches = current.launches.filter((l) => l.agentId === decision.agent.id);
+      return { state: putAgent(current, decision.agent), result: { ...decision, launches } };
     },
     lockOpts(deps)
   );
@@ -754,8 +784,11 @@ export async function archive(deps: AgentActionDeps, directory: ClaimKey, ref: s
   const decision = recorded.result;
   if (!decision.ok || decision.kind === "no-change") return decision;
 
-  const stop = await stopLiveSession(deps, decision.restoreSessionId);
+  const direct = await stopLiveSession(deps, decision.restoreSessionId);
+  const stop = direct.kind === "nothing-to-stop" ? await settleUnresolvedLaunches(deps, decision.launches) : direct;
   await recordStopOutcome(deps, decision.agent.id, stop);
+  await withAgentStoreLock(deps.agentsPath, (current) => ({ state: discardLaunchRecordsForAgents(current, [decision.agent.id]), result: undefined }), lockOpts(deps));
+
   return { ok: true, kind: "archived", agent: decision.agent, stop };
 }
 
