@@ -202,9 +202,11 @@ no permission bypass.
 check here is applied only to agents in bakr's store; an agent bakr does not
 manage is never read, never judged and never relaunched. It holds because bakr
 strips the `--permission-mode bypassPermissions` that drovr's `hostResident`
-adds to every start, and refuses to launch if that strip stops matching
+adds to every claude start, and refuses to launch if that strip stops matching
 (`withoutForcedPermissionMode`, src/spawn/herdr.ts) — the argv check is the
-second line, catching a bypass that reached a live process anyway. Agents other
+second line, catching a bypass that reached a live process anyway. drovr's own
+`checkManagedAgentArgv` asserts nothing about a bypass either way; the
+assertion is bakr's (`bypassIn`, src/argv-check.ts), applied to bakr's agents. Agents other
 hosts spawn are a different matter: butchr's ticket agents, for instance, run
 with `bypassPermissions` **by design**, because an unattended agent cannot
 answer an approval prompt. Measured 2026-09-19: 22 of 22 live butchr workers
