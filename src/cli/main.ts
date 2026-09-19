@@ -21,6 +21,8 @@ import { residentRefusal, resolveResidentCwd, type ResidentMessenger } from "./s
 import { approvalExitCode, findOwnPrompt, ownPendingPermissions, renderApproval, renderPendingPermissions, resolveOperator, type PermissionHost } from "./permissions";
 import { EXIT_FAILURE, EXIT_REFUSAL, EXIT_SUCCESS, EXIT_USAGE } from "./exit-codes";
 import { formatMcpSpec, parseMcpSpec, type McpServerDeclaration } from "../launch-config";
+import { collectStatus } from "../status";
+import { renderStatusText, statusExitCode } from "../status-model";
 
 export interface CliDeps {
   actions: AgentActionDeps;
@@ -47,7 +49,7 @@ export interface CliDeps {
   selfSessionId?: string;
 }
 
-const help = `usage:\n  bakr [--dir <path>] ...   (run as if started in <path>)\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> permissions\n  bakr <id|name> approve <promptId> [--always] [--as <operator>]\n  bakr <id|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|name> relaunch\n  bakr relaunch --all\n`;
+const help = `usage:\n  bakr [--dir <path>] ...   (run as if started in <path>)\n  bakr\n  bakr list [--archived]\n  bakr create [--name <name>] [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|name>\n  bakr <id|name> on|off|archive|unarchive|delete [--yes]|name <new>|rename <new>\n  bakr <id|name> send <message>\n  bakr <id|name> permissions\n  bakr <id|name> approve <promptId> [--always] [--as <operator>]\n  bakr <id|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|name> relaunch\n  bakr relaunch --all\n  bakr status [--json]\n`;
 
 /** Parses every spec, or returns the first refusal; duplicates keep their last spelling. */
 function parseMcpSpecs(specs: readonly string[]): McpServerDeclaration[] | string {
@@ -142,8 +144,22 @@ async function discover(directory: ClaimKey, d: CliDeps): Promise<number> {
   return EXIT_SUCCESS;
 }
 
+/**
+ * BAKR-48: the whole host's health, read-only, from any directory. It resolves
+ * no claim key and claims nothing — the report is host-wide, and a poll every
+ * ~10s must not touch the claim store. The JSON is printed in EVERY case,
+ * including both "couldn't check" cases, so a consumer always has a document
+ * to read the reason out of rather than only an exit code.
+ */
+async function runStatus(json: boolean, d: CliDeps): Promise<number> {
+  const report = await collectStatus({ agentsPath: d.actions.agentsPath, runCommand: d.actions.runCommand, now: d.actions.now });
+  d.stdout(json ? `${JSON.stringify(report, null, 2)}\n` : renderStatusText(report));
+  return statusExitCode(report);
+}
+
 async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): Promise<number> {
   if (command.kind === "help") { d.stdout(help); return 0; }
+  if (command.kind === "status") return runStatus(command.json, d);
   if (command.kind === "discover") return discover(directory, d);
   if (command.kind === "list") return renderList(directory, command.showArchived, d);
   if (command.kind === "create") {
@@ -297,4 +313,4 @@ async function handle(command: ParsedCommand, directory: ClaimKey, d: CliDeps): 
   return 0;
 }
 
-export async function runCli(argv:string[],d:CliDeps):Promise<number>{const parsed=parseArgv(argv);if(!parsed.ok){d.stderr(`bakr: usage error: ${parsed.message}\n${help}`);return EXIT_USAGE;}if(parsed.command.kind==="help"){d.stdout(help);return 0;}const directory=await resolveDirectory(d);if(!directory)return EXIT_FAILURE;try{return await handle(parsed.command,directory,d);}catch(e){d.stderr(`bakr could not serve the request: ${e instanceof Error?e.message:String(e)}\n`);return EXIT_FAILURE;}}
+export async function runCli(argv:string[],d:CliDeps):Promise<number>{const parsed=parseArgv(argv);if(!parsed.ok){d.stderr(`bakr: usage error: ${parsed.message}\n${help}`);return EXIT_USAGE;}if(parsed.command.kind==="help"){d.stdout(help);return 0;}if(parsed.command.kind==="status"){const json=parsed.command.json;try{return await runStatus(json,d);}catch(e){d.stderr(`bakr could not serve the request: ${e instanceof Error?e.message:String(e)}\n`);return EXIT_FAILURE;}}const directory=await resolveDirectory(d);if(!directory)return EXIT_FAILURE;try{return await handle(parsed.command,directory,d);}catch(e){d.stderr(`bakr could not serve the request: ${e instanceof Error?e.message:String(e)}\n`);return EXIT_FAILURE;}}

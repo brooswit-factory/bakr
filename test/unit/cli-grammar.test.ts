@@ -60,6 +60,26 @@ describe("bakr CLI grammar", () => {
     }
   });
 
+  test("status: a read-only host-wide report, --json or a human summary (BAKR-48)", () => {
+    expect(ok(["status"])).toEqual({kind:"status",json:false});
+    expect(ok(["status","--json"])).toEqual({kind:"status",json:true});
+    // `status` is a top-level word, so it can no longer be an agent name (RESERVED_NAMES).
+    for (const [argv, message] of [
+      [["status","now"], '"status" takes no arguments'],
+      [["status","--all"], '--all is not valid with "status"'],
+      [["status","--archived"], '--archived is not valid with "status"'],
+      [["status","--yes"], '--yes/-y is not valid with "status"'],
+      [["status","--name","x"], '--name is not valid with "status"'],
+      [["list","--json"], '--json is not valid with "list"'],
+      [["alice","on","--json"], '--json is not valid with "on"'],
+      [["--help","--json"], "used alone"],
+    ] as const) {
+      const r = parseArgv([...argv]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain(message);
+    }
+  });
+
   test("permissions: one agent's pending prompts, no arguments, no flags", () => {
     expect(ok(["alice","permissions"])).toEqual({kind:"permissions",ref:"alice"});
     expect(ok(["@a1","permissions"])).toEqual({kind:"permissions",ref:"@a1"});
