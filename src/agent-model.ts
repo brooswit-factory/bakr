@@ -243,7 +243,9 @@ export function mintUniqueAgentId(state: AgentStoreState, randomBytes: (byteLeng
 // their reserved-word/availability checks are RETIRED — an agent's name is
 // now always derived from its directory (R1/R3, agent-name.ts). What
 // remains of `AgentRecord.name` is legacy-only, read solely by the R8 rename
-// hint below.
+// hint below. `RESERVED_NAMES`/`validateNameSyntax`/`checkNameAvailability`
+// (formerly B4/B5/B11) are retired along with the custom-naming system they
+// existed to validate — see agent-lifecycle.ts's own module comment.
 
 // --- Membership (B9, R-D) ------------------------------------------------
 
@@ -529,11 +531,27 @@ export function hasLaunchRecordFor(state: AgentStoreState, agentId: string, atte
  * racing a resolution that is still coming, which is exactly the hazard
  * `hasLaunchRecordFor`'s guard exists to prevent (AC4).
  *
- * MUST be called only from an explicit, operator-initiated verb
- * (`agent-actions.ts`'s `on`) — never from `daemon.ts` or anything reachable
- * from its reconcile loop. B7 stays intact: "never retried automatically"
- * was written for an unattended loop; an operator who calls `on` again
- * after a launch demonstrably failed is not that.
+ * Historically (B13, BAKR-21): MUST be called only from an explicit,
+ * operator-initiated verb (`agent-actions.ts`'s `on`) — never from
+ * `daemon.ts` or anything reachable from its reconcile loop. B7's "never
+ * retried automatically" was written for an unattended loop; an operator
+ * who calls `on` again after a launch demonstrably failed is not that.
+ *
+ * AMENDED (BAKR-33, 2026-09-18, reviewer lead-bakr): `daemon.ts` MAY now
+ * call this too, but only through the ONE narrow, bounded door
+ * `decideAndBeginForAgent`'s respawn branch opens — gated on BOTH (a) this
+ * being the very first reconcile cycle since THIS PROCESS started
+ * (`DaemonState.isFirstCycle`), never any cycle after, and (b) a FRESH
+ * liveness check, computed this same cycle, independently verifying the
+ * record's target `absent` right now (never on `alive` or
+ * `not-verifiable`). This does not weaken B7/B13's steady-state guarantee —
+ * every cycle after the first still treats an existing failed record as
+ * permanent, exactly as before — it only says a process that just started
+ * (an operator's `systemctl restart`, or the host itself rebooting) gets
+ * ONE fresh, evidence-gated look, the daemon's own equivalent of an
+ * operator running `on` again. See `test/unit/daemon-no-wedge-clear.test.ts`
+ * for the behavioral tests that pin exactly this boundary — bounded to one
+ * cycle, gated on verified absence, never a second chance.
  */
 export function clearFailedLaunchRecord(state: AgentStoreState, agentId: string, attemptKey: AttemptKey | undefined): AgentStoreState {
   const record = state.launches.find((l) => l.agentId === agentId && attemptKeyEquals(l.attemptKey, attemptKey) && l.error !== undefined);
@@ -622,6 +640,42 @@ export function discardLaunchRecordsForAgents(state: AgentStoreState, agentIds: 
 }
 
 /**
+ * BAKR-33: `agentId` has just been proven live by `resolvedAttemptId`'s own
+ * successful resolution — a fresh launch, a `forkFrom` escape, or an
+ * ordinary respawn, whichever of `resolveLaunch`/`resolveRespawnAttempt`
+ * called this. Every OTHER launch record already sitting against that same
+ * agent with `error` set is now pure history: this agent's current session
+ * is proven live regardless of which key it got there through, so an old
+ * failed attempt — under this key, from a previous lifetime, or under any
+ * other key entirely (BAKR-17's `relaunch --all` incident and the pre-#36
+ * ready-too-early race both left records like this, never cleared once the
+ * agent recovered by some other route) — describes nothing about now.
+ *
+ * Dropping them HERE, as a side effect of the very resolution that proves
+ * the agent healthy, is what stops `daemon.ts`'s unresolved-launch log from
+ * re-reporting a story that is already over on every cycle (and, for a
+ * daemon that just restarted, on every start) — before this, `delete` was
+ * the ONLY code path that ever removed a launch record at all.
+ *
+ * This is NOT the B13 wedge-clear (`clearFailedLaunchRecord`): that
+ * function unblocks a FUTURE automatic attempt at an exact, still-current
+ * key, and stays restricted to an explicit operator verb for exactly that
+ * reason. This function never unblocks anything — the agent in question has
+ * already, independently, succeeded via a resolution `hasLaunchRecordFor`
+ * never stood in the way of; it only retires bookkeeping for a key that is
+ * now moot. Safe to reach from `daemon.ts`'s own automatic resolution paths
+ * (`resolvePendingLaunches`, `dispatchRespawnForDaemon`) as well as the
+ * operator verbs, unlike the wedge-clear.
+ *
+ * Never touches a record still PENDING (`error === undefined`) for this
+ * agent — an in-flight launch is never stale — nor the just-resolved record
+ * itself (the caller removes that one separately, by `resolvedAttemptId`).
+ */
+function isStaleNowThatAgentResolved(record: LaunchRecord, agentId: string, resolvedAttemptId: string): boolean {
+  return record.attemptId !== resolvedAttemptId && record.agentId === agentId && record.error !== undefined;
+}
+
+/**
  * A later listing found `launchShortId` with session id `resolvedSessionId`
  * — finalizes the matching pending record, attaching the outcome to the
  * AGENT that requested it (`record.agentId`), never to a directory-keyed
@@ -656,7 +710,7 @@ export function resolveLaunch(state: AgentStoreState, launchShortId: string, res
   const record = state.launches.find((l) => l.launchShortId === launchShortId && l.error === undefined);
   if (record === undefined) return state;
 
-  const launches = state.launches.filter((l) => l.attemptId !== record.attemptId);
+  const launches = state.launches.filter((l) => l.attemptId !== record.attemptId && !isStaleNowThatAgentResolved(l, record.agentId, record.attemptId));
   const agent = state.agents[record.agentId];
   if (agent === undefined) {
     return { ...state, launches };
@@ -682,11 +736,18 @@ export function resolveLaunch(state: AgentStoreState, launchShortId: string, res
  * `restoreTarget` needs no update — it was already correct, and BAKR-22
  * measured that `respawn` does not rotate it). Total, like every other
  * mutator here: a no-op if no pending record matches.
+ *
+ * BAKR-33: also drops every OTHER launch record already sitting against
+ * this same agent with `error` set — see `isStaleNowThatAgentResolved`'s
+ * own doc. This is the exact call site the ticket named: a healthy
+ * `respawn`/relaunch is what proves an agent's earlier failed launches
+ * (from a `relaunch --all` incident, the pre-#36 ready-too-early race, an
+ * early respawn refusal — any key) are no longer worth reporting.
  */
 export function resolveRespawnAttempt(state: AgentStoreState, attemptId: string, newShortId?: string): AgentStoreState {
   const record = state.launches.find((l) => l.attemptId === attemptId && l.error === undefined);
   if (record === undefined) return state;
-  const launches = state.launches.filter((l) => l.attemptId !== record.attemptId);
+  const launches = state.launches.filter((l) => l.attemptId !== record.attemptId && !isStaleNowThatAgentResolved(l, record.agentId, record.attemptId));
   const agent = state.agents[record.agentId];
   // Under herdr a restore resumes the SAME session in a NEW pane: the session id stays, the handle moves.
   if (newShortId === undefined || agent?.restoreTarget === undefined) return { ...state, launches };

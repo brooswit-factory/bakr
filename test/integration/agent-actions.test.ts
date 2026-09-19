@@ -59,6 +59,8 @@ async function makeTempDir(): Promise<string> {
 /** A listing read: herdr's pane registry, one pane's process info, or legacy `claude agents --json`. */
 const isListingRead = (argv: string[]): boolean =>
   (argv[0] === "herdr" && argv[1] === "agent" && argv[2] === "list") ||
+  // drovr's listResidents telling its residents' workspaces apart (BAKR-37).
+  (argv[0] === "herdr" && argv[1] === "workspace" && argv[2] === "list") ||
   (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "process-info") ||
   (argv[0] === "claude" && argv[1] === "agents");
 

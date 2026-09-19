@@ -22,6 +22,8 @@ import { residentRefusal, resolveResidentCwd, type ResidentMessenger } from "./s
 import { approvalExitCode, findOwnPrompt, ownPendingPermissions, renderApproval, renderPendingPermissions, resolveOperator, type PermissionHost } from "./permissions";
 import { EXIT_FAILURE, EXIT_REFUSAL, EXIT_SUCCESS, EXIT_USAGE } from "./exit-codes";
 import { formatMcpSpec, parseMcpSpec, type McpServerDeclaration } from "../launch-config";
+import { collectStatus } from "../status";
+import { renderStatusText, statusExitCode } from "../status-model";
 
 export interface CliDeps {
   actions: AgentActionDeps;
@@ -48,7 +50,7 @@ export interface CliDeps {
   selfSessionId?: string;
 }
 
-const help = `usage:\n  bakr [--dir <path>] ...      (deprecated: use "bakr <parent>/<leaf> ..." from any directory)\n  bakr\n  bakr list [--archived]\n  bakr create [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|path|name>          (starts it if off, attaches if on; from any directory)\n  bakr <id|path|name> on|off|archive|unarchive|delete [--yes]\n  bakr <id|path|name> send <message>\n  bakr <id|path|name> permissions\n  bakr <id|path|name> approve <promptId> [--always] [--as <operator>]\n  bakr <id|path|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|path|name> relaunch\n  bakr relaunch --all\n\nan agent's name is its directory's last two path segments (e.g. ~/code/x/y is "x/y"), grown by one more leading\nsegment on a collision. A ref is an id iff it starts with "@"; a real path iff it starts with "/", "./", "../",\n"~/", or is exactly "~"; anything else, slash included, is a name — "bakr code/x" is a name, "bakr ./code/x" is a path.\n`;
+const help = `usage:\n  bakr [--dir <path>] ...      (deprecated: use "bakr <parent>/<leaf> ..." from any directory)\n  bakr\n  bakr list [--archived]\n  bakr create [--mcp <server>[:no-notify] ...]\n  bakr adopt <@id> [<@id> ...]\n  bakr <id|path|name>          (starts it if off, attaches if on; from any directory)\n  bakr <id|path|name> on|off|archive|unarchive|delete [--yes]\n  bakr <id|path|name> send <message>\n  bakr <id|path|name> permissions\n  bakr <id|path|name> approve <promptId> [--always] [--as <operator>]\n  bakr <id|path|name> mcp [<server>[:no-notify] ... | default]\n  bakr <id|path|name> relaunch\n  bakr relaunch --all\n  bakr status [--json]\n\nan agent's name is its directory's last two path segments (e.g. ~/code/x/y is "x/y"), grown by one more leading\nsegment on a collision. A ref is an id iff it starts with "@"; a real path iff it starts with "/", "./", "../",\n"~/", or is exactly "~"; anything else, slash included, is a name — "bakr code/x" is a name, "bakr ./code/x" is a path.\n`;
 
 /** Parses every spec, or returns the first refusal; duplicates keep their last spelling. */
 function parseMcpSpecs(specs: readonly string[]): McpServerDeclaration[] | string {
@@ -165,6 +167,19 @@ async function discover(directory: ClaimKey, d: CliDeps): Promise<number> {
     .filter(o => o.agents.length).sort((a,b) => Number(Boolean(b.hintMatchedDestination))-Number(Boolean(a.hintMatchedDestination)));
   for (const offer of offers) d.stdout(`adoption offer${offer.hintMatchedDestination ? " (likely moved here)" : ""}: ${offer.source}\n  bakr adopt ${offer.agents.map(a => a.id).join(" ")}\n`);
   return EXIT_SUCCESS;
+}
+
+/**
+ * BAKR-48: the whole host's health, read-only, from any directory. It resolves
+ * no claim key and claims nothing — the report is host-wide, and a poll every
+ * ~10s must not touch the claim store. The JSON is printed in EVERY case,
+ * including both "couldn't check" cases, so a consumer always has a document
+ * to read the reason out of rather than only an exit code.
+ */
+async function runStatus(json: boolean, d: CliDeps): Promise<number> {
+  const report = await collectStatus({ agentsPath: d.actions.agentsPath, runCommand: d.actions.runCommand, now: d.actions.now });
+  d.stdout(json ? `${JSON.stringify(report, null, 2)}\n` : renderStatusText(report));
+  return statusExitCode(report);
 }
 
 /** `on` (start-if-off / no-op-if-on), printed the same way whether reached via the explicit `on` verb or bare `bakr <ref>` (R5). */
@@ -383,4 +398,4 @@ async function handle(command: ParsedCommand, d: CliDeps): Promise<number> {
   return 0;
 }
 
-export async function runCli(argv:string[],d:CliDeps):Promise<number>{const parsed=parseArgv(argv);if(!parsed.ok){d.stderr(`bakr: usage error: ${parsed.message}\n${help}`);return EXIT_USAGE;}if(parsed.command.kind==="help"){d.stdout(help);return 0;}try{return await handle(parsed.command,d);}catch(e){d.stderr(`bakr could not serve the request: ${e instanceof Error?e.message:String(e)}\n`);return EXIT_FAILURE;}}
+export async function runCli(argv:string[],d:CliDeps):Promise<number>{const parsed=parseArgv(argv);if(!parsed.ok){d.stderr(`bakr: usage error: ${parsed.message}\n${help}`);return EXIT_USAGE;}if(parsed.command.kind==="help"){d.stdout(help);return 0;}if(parsed.command.kind==="status"){const json=parsed.command.json;try{return await runStatus(json,d);}catch(e){d.stderr(`bakr could not serve the request: ${e instanceof Error?e.message:String(e)}\n`);return EXIT_FAILURE;}}try{return await handle(parsed.command,d);}catch(e){d.stderr(`bakr could not serve the request: ${e instanceof Error?e.message:String(e)}\n`);return EXIT_FAILURE;}}

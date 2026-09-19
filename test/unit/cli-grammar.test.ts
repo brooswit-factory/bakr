@@ -70,6 +70,27 @@ describe("bakr CLI grammar", () => {
     }
   });
 
+  test("status: a read-only host-wide report, --json or a human summary (BAKR-48)", () => {
+    expect(ok(["status"])).toEqual({kind:"status",json:false});
+    expect(ok(["status","--json"])).toEqual({kind:"status",json:true});
+    for (const [argv, message] of [
+      [["status","now"], '"status" takes no arguments'],
+      [["status","--all"], '--all is not valid with "status"'],
+      [["status","--archived"], '--archived is not valid with "status"'],
+      [["status","--yes"], '--yes/-y is not valid with "status"'],
+      // BAKR-34/BAKR-42 R9: --name is retired outright (scan()'s own
+      // early-return), which supersedes the per-verb "not valid with" shape.
+      [["status","--name","x"], "--name is retired"],
+      [["list","--json"], '--json is not valid with "list"'],
+      [["alice","on","--json"], '--json is not valid with "on"'],
+      [["--help","--json"], "used alone"],
+    ] as const) {
+      const r = parseArgv([...argv]);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.message).toContain(message);
+    }
+  });
+
   test("permissions: one agent's pending prompts, no arguments, no flags", () => {
     expect(ok(["alice","permissions"])).toEqual({kind:"permissions",ref:"alice"});
     expect(ok(["@a1","permissions"])).toEqual({kind:"permissions",ref:"@a1"});
