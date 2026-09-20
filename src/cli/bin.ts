@@ -12,7 +12,13 @@ import { EXIT_USAGE } from "./exit-codes";
 
 const dirOption=takeDirOption(process.argv.slice(2));
 if("error" in dirOption){process.stderr.write(`bakr: usage error: ${dirOption.error}\n`);process.exit(EXIT_USAGE);}
-if(dirOption.dir!==undefined){try{process.chdir(dirOption.dir);}catch(err){process.stderr.write(`bakr: usage error: --dir ${dirOption.dir}: ${err instanceof Error ? err.message : String(err)}\n`);process.exit(EXIT_USAGE);}}
+if(dirOption.dir!==undefined){
+  // BAKR-34/BAKR-42 R7: --dir stays a working alias, but its whole reason to
+  // exist (bakr could only resolve an agent from its own directory) is gone
+  // — an agent's name is its path now, reachable from any cwd directly.
+  process.stderr.write('bakr: --dir is deprecated — an agent\'s name is its path; use "bakr <parent>/<leaf> ..." from any directory\n');
+  try{process.chdir(dirOption.dir);}catch(err){process.stderr.write(`bakr: usage error: --dir ${dirOption.dir}: ${err instanceof Error ? err.message : String(err)}\n`);process.exit(EXIT_USAGE);}
+}
 async function prompt(text:string):Promise<string>{const rl=readline.createInterface({input:process.stdin,output:process.stdout});try{return await rl.question(text);}finally{rl.close();}}
 const common={agentsPath:agentsPath(),runCommand,now:Date.now,generateAttemptId:randomUUID,randomBytes:realRandomBytes,transcriptProbeDeps:realTranscriptProbeDeps};
 runCli(dirOption.rest,{

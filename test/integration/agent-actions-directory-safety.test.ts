@@ -81,23 +81,23 @@ describe("criterion 7 (corrected): nothing is written into the claimed directory
     if (!created.ok) throw new Error("create failed");
     await snap("1-after-create");
 
-    const onResult = await on(deps, key, created.agent.id); // already on — a deliberate no-op call
+    const onResult = await on(deps, { kind: "id", ref: created.agent.id }); // already on — a deliberate no-op call
     if (!onResult.ok) throw new Error("on failed");
     await snap("2-after-on-noop");
 
-    const offResult = await off(deps, key, created.agent.id);
+    const offResult = await off(deps, { kind: "id", ref: created.agent.id });
     if (!offResult.ok) throw new Error("off failed");
     await snap("3-after-off");
 
-    const archiveResult = await archive(deps, key, created.agent.id);
+    const archiveResult = await archive(deps, { kind: "id", ref: created.agent.id });
     if (!archiveResult.ok) throw new Error("archive failed");
     await snap("4-after-archive");
 
-    const unarchived = await unarchive(deps, key, created.agent.id);
+    const unarchived = await unarchive(deps, { kind: "id", ref: created.agent.id });
     if (!unarchived.ok) throw new Error("unarchive failed");
     await snap("5-after-unarchive");
 
-    const deleteResult = await deleteAgent(deps, key, created.agent.id);
+    const deleteResult = await deleteAgent(deps, { kind: "id", ref: created.agent.id });
     if (!deleteResult.ok) throw new Error("delete failed");
     await snap("6-after-delete");
 

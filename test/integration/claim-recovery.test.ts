@@ -95,7 +95,7 @@ describe("bakr create claims its directory", () => {
     const fake = makeFakeClaude();
     const cli = cliDeps(storeDir, workspace, fake.runCommand);
 
-    expect(await runCli(["create", "--name", "worker"], cli.deps)).toBe(0);
+    expect(await runCli(["create"], cli.deps)).toBe(0);
     expect(cli.err).toEqual([]);
 
     const proc = Bun.spawn(["bun", "run", join(import.meta.dir, "fixtures", "load-and-assert.ts"), paths(storeDir).claimsPath, workspace], { stdout: "pipe", stderr: "pipe" });
@@ -114,8 +114,13 @@ describe("bakr create claims its directory", () => {
     await saveClaims(paths(storeDir).claimsPath, claim(emptyStore(), key, 42).state);
     const fake = makeFakeClaude();
 
-    expect(await runCli(["create", "--name", "one"], cliDeps(storeDir, workspace, fake.runCommand).deps)).toBe(0);
-    expect(await runCli(["create", "--name", "two"], cliDeps(storeDir, workspace, fake.runCommand).deps)).toBe(0);
+    // BAKR-34/BAKR-42 R6: a second `create` in a directory already holding a
+    // non-archived agent is now refused outright (`directory-occupied`) —
+    // the claim's own unchanged-ness follows a fortiori from that refusal.
+    expect(await runCli(["create"], cliDeps(storeDir, workspace, fake.runCommand).deps)).toBe(0);
+    const second = cliDeps(storeDir, workspace, fake.runCommand);
+    expect(await runCli(["create"], second.deps)).toBe(1);
+    expect(second.err.join("")).toContain("directory-occupied");
 
     const claims = await loadClaims(paths(storeDir).claimsPath);
     expect(claims.status).toBe("loaded");

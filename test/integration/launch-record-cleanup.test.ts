@@ -186,7 +186,7 @@ describe("BAKR-33 fix 2: archive drops the archived agent's launch records, leav
     await saveAgents(join(dir, "agents.json"), state);
 
     const fake = makeFakeHost();
-    const result = await archive(actionDeps(dir, fake.runCommand), KEY, ARCHIVED);
+    const result = await archive(actionDeps(dir, fake.runCommand), { kind: "id", ref: ARCHIVED });
     expect(result.ok).toBe(true);
 
     const finalStore = await loadAgents(join(dir, "agents.json"));
@@ -207,7 +207,7 @@ describe("BAKR-33 fix 2: archive drops the archived agent's launch records, leav
     const fake = makeFakeHost();
     fake.addPane({ cwd: KEY, sessionId: "still-running-session" }); // mints as pane "w1:p1" (first pane) — the still-running session
 
-    const result = await archive(actionDeps(dir, fake.runCommand), KEY, ARCHIVED);
+    const result = await archive(actionDeps(dir, fake.runCommand), { kind: "id", ref: ARCHIVED });
     expect(result.ok).toBe(true);
     expect(fake.stops()).toEqual(["w1"]); // the still-running session was actually stopped, not just forgotten about
 
@@ -257,7 +257,7 @@ describe("BAKR-33 fix 1 (end-to-end via relaunch): a successful relaunch drops t
       resumeCwdDeps: { lastRecordedCwd: async () => undefined, isDirectory: async () => false },
     } as AgentActionDeps;
 
-    const result = await relaunch(deps, KEY, AGENT_ID);
+    const result = await relaunch(deps, { kind: "id", ref: AGENT_ID });
     expect(result.ok).toBe(true);
 
     const finalStore = await loadAgents(join(dir, "agents.json"));

@@ -82,9 +82,8 @@ async function main(): Promise<void> {
   if (agentId !== undefined) {
     // Restore path (BAKR-22: now `respawn <shortId>`, not `--resume <fullId>`) — the named agent must already exist, in THIS directory, with a restoreTarget.
     const decision = await withAgentStoreLock<{ ok: true; attemptId: string; shortId: string; sessionId: string } | { ok: false; error: string }>(path, (current) => {
-      const outcome = resolveAgent(current, key, agentId);
-      if (outcome.outcome === "not-found") return { state: current, result: { ok: false, error: `no agent "${agentId}" found in "${key}"` } };
-      if (outcome.outcome === "found-elsewhere") return { state: current, result: { ok: false, error: `agent "${agentId}" belongs to a different directory: "${outcome.directory}"` } };
+      const outcome = resolveAgent(current, { kind: "id", ref: agentId });
+      if (outcome.outcome !== "found") return { state: current, result: { ok: false, error: `no agent "${agentId}" found` } };
       const agent = outcome.agent;
       if (agent.restoreTarget === undefined) return { state: current, result: { ok: false, error: `agent "${agentId}" has no session yet — omit --agent to mint a fresh one` } };
       const newAttemptId = crypto.randomUUID();

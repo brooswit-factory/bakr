@@ -201,7 +201,7 @@ async function main(): Promise<void> {
 
     // --- THE STOP: turn agent A off ---
     log(`\n--- calling off() on agent A (${createdA.agent.id}) ---`);
-    const offResult = await off(deps, key, createdA.agent.id);
+    const offResult = await off(deps, { kind: "id", ref: createdA.agent.id });
     log(`off() result: ${JSON.stringify(offResult)}`);
     if (!offResult.ok || offResult.kind !== "turned-off" || offResult.stop.kind !== "stopped") {
       throw new Error(`off() did not report a clean stop: ${JSON.stringify(offResult)}`);
@@ -264,7 +264,7 @@ async function main(): Promise<void> {
 
     // --- cleanup: stop agent B too, so nothing is left running ---
     log(`\n--- cleanup: calling off() on agent B (${createdB.agent.id}) ---`);
-    const offB = await off(deps, key, createdB.agent.id);
+    const offB = await off(deps, { kind: "id", ref: createdB.agent.id });
     log(`off() result for B: ${JSON.stringify(offB)}`);
 
     await sleep(500);

@@ -64,7 +64,7 @@ describe("off and relaunch on a pane bakr started before drovr hosted it", () =>
     const bystander = legacyPane(host, "someone-else");
     const pane = legacyPane(host);
     const dir = await setup(pane.paneId);
-    const r = await off(actionDeps(dir, host), KEY, "rocketr");
+    const r = await off(actionDeps(dir, host), { kind: "id", ref: "@rocketr" });
     // FALSIFIER: a listing of drovr's residents alone finds no pane for SESSION, and off reports `already-gone` with the pane still running.
     if (!r.ok || r.kind !== "turned-off") throw new Error(JSON.stringify(r));
     expect(r.stop).toEqual({ kind: "stopped", shortId: pane.paneId });
@@ -76,7 +76,7 @@ describe("off and relaunch on a pane bakr started before drovr hosted it", () =>
     const host = makeFakeHost();
     const pane = legacyPane(host);
     const dir = await setup(pane.paneId);
-    const r = await relaunch(actionDeps(dir, host), KEY, "rocketr");
+    const r = await relaunch(actionDeps(dir, host), { kind: "id", ref: "@rocketr" });
     if (!r.ok) throw new Error(`${r.reason}: ${r.message}`);
     expect(r.resumed).toBe(true);
     expect(host.stops()).toEqual([pane.workspaceId]);
