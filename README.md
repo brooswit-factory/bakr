@@ -370,10 +370,17 @@ separate, explicit step, so "installed" and "running" stay observably
 distinct.
 
 **Works from any clone location, not only `~/code/brooswit-factory/bakr`** —
-including a clone or `bun` path containing whitespace, `%`, `&`, or `\`,
-each demonstrated with `systemd-analyze --user verify` on the actually
-installed unit — **except a path containing a literal `|`**, which the
-installer refuses outright (below). `systemd/bakr.service`'s `ExecStart` is
+including a clone path containing whitespace, `%`, `&`, or `\`, each
+demonstrated with `systemd-analyze --user verify` on the actually installed
+unit. The `bun` path tolerates whitespace, `%`, and `&` the same way, but
+**not** a literal `\`: `bun` is the `ExecStart` command itself (its first,
+unquoted-whitespace-delimited token), and systemd rejects a backslash there
+outright — `Executable name contains special characters` — so the verify
+guard below refuses loudly before anything is written. A `bun` installed
+under a path containing a backslash is a vanishingly rare case; the point
+is that it fails safely, not silently. Either path — clone or `bun` —
+**also refuses outright on a literal `|`** (below).
+`systemd/bakr.service`'s `ExecStart` is
 a template (`"@@BUN_PATH@@" run "@@REPO_ROOT@@/src/index.ts"`); the
 installer resolves `bun`'s real path (`command -v bun`) and this clone's
 real root, substitutes both into the copy it writes, and **refuses to
