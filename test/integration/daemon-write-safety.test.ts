@@ -64,9 +64,23 @@ async function seedClaimedDirContents(dir: string): Promise<void> {
   await writeFile(join(dir, "src", "index.ts"), "export {}\n", "utf8");
 }
 
-/** Content-sensitive: a diff with no details means not even an in-place content rewrite happened, not just that entries/mtimes look the same. */
+/**
+ * Content-sensitive AND mtime-sensitive: diffTreeSnapshots alone only compares
+ * content hashes and add/remove, not per-entry mtimes (a touch/utimes of an
+ * existing file or subdirectory, with no content or add/remove change, would
+ * pass it silently). The old local probe this test used to carry DID assert
+ * every entry's own mtime unchanged; rather than edit the shared fixture
+ * (fixtures/tree-snapshot.ts, also used by tree-snapshot.test.ts and
+ * elsewhere), assert those mtimes here too, on top of the content-hash diff.
+ */
 function expectUnchanged(before: Awaited<ReturnType<typeof snapshotTree>>, after: Awaited<ReturnType<typeof snapshotTree>>): void {
   expect(diffTreeSnapshots(before, after)).toEqual({ changed: false, details: [] });
+  for (const [rel, b] of before.files) {
+    expect(after.files.get(rel)?.mtimeMs).toBe(b.mtimeMs);
+  }
+  for (const [rel, b] of before.dirs) {
+    expect(after.dirs.get(rel)).toEqual(b);
+  }
 }
 
 /**
