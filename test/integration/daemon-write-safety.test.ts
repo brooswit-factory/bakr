@@ -12,8 +12,19 @@
 // trace in what that suite samples. This file stats the directory's own
 // mtime/ctime in addition to its entries, closing that specific hole for
 // the daemon's own cycle.
+//
+// FACTORY-150: the mtime-only probe this file used to carry (stat the
+// directory's own mtime/ctime, plus each entry's mtime) is itself measured
+// insufficient — rewriting an existing file's CONTENT under the same name
+// moves neither the parent directory's mtime nor necessarily the file's
+// own mtime (a rewrite can reset its mtime back to the original value).
+// BAKR-24 built a content-hashing instrument for exactly this
+// (fixtures/tree-snapshot.ts) with its own positive/negative controls
+// (tree-snapshot.test.ts) proving it catches that in-place rewrite where
+// the mtime-only probe stays blind. This file now uses that instrument
+// instead of its own weaker one.
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { claim, emptyStore } from "../../src/claim-model";
@@ -25,6 +36,7 @@ import { beginLaunch, emptySessionSlots, markLaunchStarted, resolveLaunch } from
 import { save as saveSlots } from "../../src/session-slots-store";
 import { initialDaemonState, runReconcileCycle, type DaemonDeps } from "../../src/daemon";
 import { makeFakeHost } from "../support/fake-host";
+import { snapshotTree, diffTreeSnapshots } from "./fixtures/tree-snapshot";
 
 const cleanupDirs: string[] = [];
 const pendingChmodRestores: Array<{ path: string; mode: number }> = [];
@@ -52,28 +64,22 @@ async function seedClaimedDirContents(dir: string): Promise<void> {
   await writeFile(join(dir, "src", "index.ts"), "export {}\n", "utf8");
 }
 
-interface Snapshot {
-  readonly ownStat: { readonly mtimeMs: number; readonly ctimeMs: number };
-  readonly entries: readonly string[];
-  readonly entryMtimes: ReadonlyMap<string, number>;
-}
-
-/** Stats the directory ITSELF (the gap this file exists to close) in addition to every entry within it. */
-async function snapshot(dir: string): Promise<Snapshot> {
-  const own = await stat(dir);
-  const entries = [...(await readdir(dir, { recursive: true }))].sort();
-  const entryMtimes = new Map<string, number>();
-  for (const rel of entries) {
-    entryMtimes.set(rel, (await stat(join(dir, rel))).mtimeMs);
+/**
+ * Content-sensitive AND mtime-sensitive: diffTreeSnapshots alone only compares
+ * content hashes and add/remove, not per-entry mtimes (a touch/utimes of an
+ * existing file or subdirectory, with no content or add/remove change, would
+ * pass it silently). The old local probe this test used to carry DID assert
+ * every entry's own mtime unchanged; rather than edit the shared fixture
+ * (fixtures/tree-snapshot.ts, also used by tree-snapshot.test.ts and
+ * elsewhere), assert those mtimes here too, on top of the content-hash diff.
+ */
+function expectUnchanged(before: Awaited<ReturnType<typeof snapshotTree>>, after: Awaited<ReturnType<typeof snapshotTree>>): void {
+  expect(diffTreeSnapshots(before, after)).toEqual({ changed: false, details: [] });
+  for (const [rel, b] of before.files) {
+    expect(after.files.get(rel)?.mtimeMs).toBe(b.mtimeMs);
   }
-  return { ownStat: { mtimeMs: own.mtimeMs, ctimeMs: own.ctimeMs }, entries, entryMtimes };
-}
-
-function expectUnchanged(before: Snapshot, after: Snapshot): void {
-  expect(after.ownStat).toEqual(before.ownStat);
-  expect(after.entries).toEqual(before.entries);
-  for (const rel of before.entries) {
-    expect(after.entryMtimes.get(rel)).toBe(before.entryMtimes.get(rel));
+  for (const [rel, b] of before.dirs) {
+    expect(after.dirs.get(rel)).toEqual(b);
   }
 }
 
@@ -132,11 +138,11 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
       probeDeps: realOrphanProbeDeps,
     };
 
-    const before = await snapshot(claimedDir);
+    const before = await snapshotTree(claimedDir);
     const result = await runReconcileCycle(initialDaemonState(), deps);
     expect(result.restored).toHaveLength(1); // confirms a restore genuinely happened, not a vacuous pass
     expectRestoredInto(host, resolved.key);
-    const after = await snapshot(claimedDir);
+    const after = await snapshotTree(claimedDir);
 
     expectUnchanged(before, after);
   });
@@ -165,7 +171,7 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     // Baseline taken AFTER chmod: chmod itself changes the directory's own
     // ctime, which is not bakr's doing — comparing from here isolates
     // exactly what the reconcile cycle itself does to the directory.
-    const before = await snapshot(claimedDir);
+    const before = await snapshotTree(claimedDir);
 
     const host = fakeHost();
     const deps: DaemonDeps = {
@@ -188,7 +194,7 @@ describe("nothing is written inside a claimed directory across a full daemon cyc
     // directory's own ctime, and that must not be mistaken for a write
     // bakr made. Permissions are restored afterward, purely for the
     // recursive rm in afterEach to succeed.
-    const after = await snapshot(claimedDir);
+    const after = await snapshotTree(claimedDir);
     await chmod(claimedDir, 0o755);
 
     expectUnchanged(before, after);
