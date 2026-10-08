@@ -133,17 +133,52 @@ fi
 # not otherwise parse the diagnostic text, so such a warning (if one
 # exists) would pass through undetected rather than being caught here.
 if command -v systemd-analyze >/dev/null 2>&1; then
-  VERIFY_TMP="$(mktemp "${TMPDIR:-/tmp}/bakr-verify-XXXXXX.service")"
-  printf '%s\n' "$RENDERED_UNIT" > "$VERIFY_TMP"
-  VERIFY_STATUS=0
-  VERIFY_OUTPUT="$(systemd-analyze --user verify "$VERIFY_TMP" 2>&1)" || VERIFY_STATUS=$?
-  rm -f "$VERIFY_TMP"
-  if [[ -n "$VERIFY_OUTPUT" ]]; then
-    printf '%s\n' "$VERIFY_OUTPUT" >&2
-  fi
-  if [[ "$VERIFY_STATUS" -ne 0 ]]; then
-    echo "error: systemd-analyze --user verify rejected the rendered unit (exit $VERIFY_STATUS) — refusing to install a unit systemd cannot start" >&2
-    exit 1
+  # FACTORY-149 (migrated from BAKR-15): `systemd-analyze --user verify`
+  # itself fails — "Failed to lookup RuntimeDirectory path" / "Failed to
+  # initialize manager", exit 1 — when the environment can't support a
+  # user manager at all (observed with no XDG_RUNTIME_DIR, e.g. under
+  # `env -i`), with no connection to anything about OUR rendered unit. The
+  # guard below used to treat that exit code exactly like a real rejection
+  # and blame the unit. Rather than pattern-match that diagnostic text —
+  # fragile, and the one thing this script already says it won't do with
+  # verify's output — this runs verify once against a minimal unit this
+  # script knows is valid. If THAT fails, the failure can only be the
+  # environment, because this one-line, no-placeholder unit has nothing
+  # for our own rendering, escaping, or substitution to have broken.
+  PREFLIGHT_TMP="$(mktemp "${TMPDIR:-/tmp}/bakr-preflight-XXXXXX.service")"
+  cat >"$PREFLIGHT_TMP" <<'EOF'
+[Unit]
+Description=bakr install.sh preflight check
+
+[Service]
+Type=simple
+ExecStart=/bin/true
+
+[Install]
+WantedBy=default.target
+EOF
+  PREFLIGHT_STATUS=0
+  PREFLIGHT_OUTPUT="$(systemd-analyze --user verify "$PREFLIGHT_TMP" 2>&1)" || PREFLIGHT_STATUS=$?
+  rm -f "$PREFLIGHT_TMP"
+
+  if [[ "$PREFLIGHT_STATUS" -ne 0 ]]; then
+    echo "warning: \`systemd-analyze --user verify\` cannot run in this environment (a known-good unit was rejected too) — skipping the verify guard; the quoting/escaping above is still applied. verify's own output:" >&2
+    if [[ -n "$PREFLIGHT_OUTPUT" ]]; then
+      printf '%s\n' "$PREFLIGHT_OUTPUT" >&2
+    fi
+  else
+    VERIFY_TMP="$(mktemp "${TMPDIR:-/tmp}/bakr-verify-XXXXXX.service")"
+    printf '%s\n' "$RENDERED_UNIT" > "$VERIFY_TMP"
+    VERIFY_STATUS=0
+    VERIFY_OUTPUT="$(systemd-analyze --user verify "$VERIFY_TMP" 2>&1)" || VERIFY_STATUS=$?
+    rm -f "$VERIFY_TMP"
+    if [[ -n "$VERIFY_OUTPUT" ]]; then
+      printf '%s\n' "$VERIFY_OUTPUT" >&2
+    fi
+    if [[ "$VERIFY_STATUS" -ne 0 ]]; then
+      echo "error: systemd-analyze --user verify rejected the rendered unit (exit $VERIFY_STATUS) — refusing to install a unit systemd cannot start" >&2
+      exit 1
+    fi
   fi
 else
   echo "warning: \`systemd-analyze\` not found on PATH — skipping the verify guard; the quoting/escaping above is still applied" >&2
